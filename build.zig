@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
     // `tigerclaw` module available for import.
     const integration_tests: []const []const u8 = &.{
         "settings_schema_test",
+        "settings_env_override_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});
