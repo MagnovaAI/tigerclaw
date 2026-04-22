@@ -22,6 +22,7 @@ pub const commands = struct {
     pub const channels = @import("commands/channels.zig");
     pub const cassette = @import("commands/cassette.zig");
     pub const providers = @import("commands/providers.zig");
+    pub const models = @import("commands/models.zig");
 };
 
 pub const version_string = version.string;
@@ -46,6 +47,7 @@ pub const Command = union(enum) {
     channels: commands.channels.Subcommand,
     cassette: commands.cassette.Subcommand,
     providers: commands.providers.Subcommand,
+    models: commands.models.Subcommand,
     unknown: []const u8,
 };
 
@@ -63,6 +65,9 @@ pub const ParseError = error{
     CassetteMissingPath,
     ProvidersMissingSubcommand,
     ProvidersUnknownSubcommand,
+    ModelsMissingSubcommand,
+    ModelsUnknownSubcommand,
+    ModelsMissingModel,
 };
 
 /// Top-level command table. Summaries feed the help screen and shell
@@ -72,6 +77,7 @@ pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "cassette", .summary = "Inspect and replay VCR cassettes" },
     .{ .name = "channels", .summary = "List, inspect, and probe configured channels" },
     .{ .name = "providers", .summary = "List LLM providers and probe reachability" },
+    .{ .name = "models", .summary = "List known models, show the default, override per session" },
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
     .{ .name = "doctor", .summary = "Print a short environment report" },
@@ -135,6 +141,16 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
             error.MissingPath => return error.CassetteMissingPath,
         };
         return .{ .cassette = sub };
+    }
+    if (std.mem.eql(u8, match.descriptor.name, "models")) {
+        const sub = commands.models.parse(match.argv[1..]) catch |err| switch (err) {
+            error.MissingSubcommand => return error.ModelsMissingSubcommand,
+            error.UnknownSubcommand => return error.ModelsUnknownSubcommand,
+            error.UnknownFlag => return error.UnknownFlag,
+            error.MissingFlagValue => return error.MissingFlagValue,
+            error.MissingPositional => return error.ModelsMissingModel,
+        };
+        return .{ .models = sub };
     }
 
     return .{ .unknown = first };
