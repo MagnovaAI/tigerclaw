@@ -13,7 +13,7 @@
 const std = @import("std");
 const types = @import("types");
 const turn_mod = @import("turn.zig");
-const channel_spec = @import("../channels/spec.zig");
+const channel_spec = @import("channels_spec");
 
 /// Current on-disk schema version. Bump on every breaking layout change.
 /// Files stamped with a different version are rejected at resume time —

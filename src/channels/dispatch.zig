@@ -33,7 +33,7 @@
 
 const std = @import("std");
 
-const spec = @import("spec.zig");
+const spec = @import("channels_spec");
 
 /// Tiny yielding spinlock. See the `Spinlock` in
 /// `src/cost/ledger.zig` for the rationale; this copy is kept local

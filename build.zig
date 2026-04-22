@@ -59,6 +59,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const channels_spec_mod = b.addModule("channels_spec", .{
+        .root_source_file = b.path("src/channels/spec.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The `tigerclaw` library module is built once and reused by the
     // executable, the unit-test runner, and every integration test. This
     // lets `tests/*_test.zig` say `@import("tigerclaw")` to reach the
@@ -71,6 +77,7 @@ pub fn build(b: *std.Build) void {
     tigerclaw_mod.addImport("types", types_mod);
     tigerclaw_mod.addImport("llm_provider", llm_provider_mod);
     tigerclaw_mod.addImport("llm_transport", llm_transport_mod);
+    tigerclaw_mod.addImport("channels_spec", channels_spec_mod);
     tigerclaw_mod.addImport("build_options", build_options_mod);
 
     var provider_anthropic_mod: ?*std.Build.Module = null;
@@ -132,6 +139,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         ext.addImport("build_options", build_options_mod);
+        ext.addImport("channels_spec", channels_spec_mod);
         tigerclaw_mod.addImport("channel_telegram", ext);
         channel_telegram_mod = ext;
     }
@@ -145,6 +153,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("types", types_mod);
     exe_mod.addImport("llm_provider", llm_provider_mod);
     exe_mod.addImport("llm_transport", llm_transport_mod);
+    exe_mod.addImport("channels_spec", channels_spec_mod);
     if (provider_anthropic_mod) |m| exe_mod.addImport("provider_anthropic", m);
     if (provider_openai_mod) |m| exe_mod.addImport("provider_openai", m);
     if (provider_bedrock_mod) |m| exe_mod.addImport("provider_bedrock", m);
@@ -174,6 +183,7 @@ pub fn build(b: *std.Build) void {
     unit_mod.addImport("types", types_mod);
     unit_mod.addImport("llm_provider", llm_provider_mod);
     unit_mod.addImport("llm_transport", llm_transport_mod);
+    unit_mod.addImport("channels_spec", channels_spec_mod);
     if (provider_anthropic_mod) |m| unit_mod.addImport("provider_anthropic", m);
     if (provider_openai_mod) |m| unit_mod.addImport("provider_openai", m);
     if (provider_bedrock_mod) |m| unit_mod.addImport("provider_bedrock", m);
@@ -191,6 +201,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(llm_provider_tests).step);
     const llm_transport_tests = b.addTest(.{ .root_module = llm_transport_mod });
     test_step.dependOn(&b.addRunArtifact(llm_transport_tests).step);
+    const channels_spec_tests = b.addTest(.{ .root_module = channels_spec_mod });
+    test_step.dependOn(&b.addRunArtifact(channels_spec_tests).step);
 
     if (provider_anthropic_mod) |m| {
         const t = b.addTest(.{ .root_module = m });
