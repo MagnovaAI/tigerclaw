@@ -1,12 +1,12 @@
 //! Anthropic provider.
 //!
 //! Parses Anthropic's messages streaming format into a `ChatResponse`.
-//! HTTP transport is not wired here — the provider takes its SSE bytes
-//! from a caller-provided `BytesSource` so tests can drive it with a
-//! literal slice and the harness can drive it from a VCR cassette
-//! later. Once the HTTP client plumbing lands the `Http` variant will
-//! become a real network source without changing the rest of the
-//! provider.
+//! Bytes feeding the parser come from a `BytesSource` union with two
+//! variants: `.literal` (cassette / unit-test bytes used verbatim) and
+//! `.http` (a real POST against `/v1/messages` whose response body is
+//! streamed into the same parser). The split keeps the SSE state
+//! machine identical between the two paths so cassette tests remain
+//! representative.
 //!
 //! Event surface covered:
 //!
@@ -21,6 +21,11 @@
 //! Anything else is silently skipped — the format has grown new event
 //! types historically, and we'd rather ignore unknowns than refuse to
 //! stream.
+//!
+//! Failure policy on the HTTP path: transport errors and non-2xx
+//! responses are surfaced as a `ChatResponse` with `stop_reason =
+//! .refusal` so the harness can decide whether to retry / fall back,
+//! rather than bubbling typed errors past the provider boundary.
 
 const std = @import("std");
 const provider_mod = @import("llm_provider");
@@ -31,10 +36,29 @@ const Provider = provider_mod.Provider;
 const ChatRequest = provider_mod.ChatRequest;
 const ChatResponse = provider_mod.ChatResponse;
 
+/// How the provider obtains the SSE byte stream.
 pub const BytesSource = union(enum) {
     /// The parser consumes these bytes verbatim. Useful for tests and
     /// for cassette-backed replay.
     literal: []const u8,
+    /// Drives the parser from a real Anthropic Messages API call.
+    http: HttpSource,
+};
+
+/// Configuration for a live Anthropic Messages API call. Caller owns
+/// every slice in here — the provider never frees them.
+pub const HttpSource = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    api_key: []const u8,
+    /// Defaults to "https://api.anthropic.com/v1/messages" — overridable
+    /// for tests that point at a mock server.
+    endpoint: []const u8 = "https://api.anthropic.com/v1/messages",
+    /// API version header. Default tracks the current stable release.
+    api_version: []const u8 = "2023-06-01",
+    /// Comma-separated `anthropic-beta` header values, or empty for none.
+    /// Used to opt into prompt caching, etc.
+    beta_features: []const u8 = "",
 };
 
 pub const AnthropicProvider = struct {
@@ -55,54 +79,13 @@ pub const AnthropicProvider = struct {
     fn doChat(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
-        _: ChatRequest,
+        request: ChatRequest,
     ) anyerror!ChatResponse {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
-        const bytes = switch (self.source) {
-            .literal => |b| b,
-        };
-
-        var parser = transport.sse.Parser.init();
-        defer parser.deinit(allocator);
-        try parser.feed(allocator, bytes);
-
-        var text: std.array_list.Aligned(u8, null) = .empty;
-        errdefer text.deinit(allocator);
-
-        var usage = types.TokenUsage{};
-        var stop: types.StopReason = .end_turn;
-        var err_text: ?[]const u8 = null;
-        defer if (err_text) |e| allocator.free(e);
-
-        while (try parser.nextEvent(allocator)) |ev| {
-            if (std.mem.eql(u8, ev.name, "content_block_delta")) {
-                try absorbDelta(allocator, &text, ev.data);
-            } else if (std.mem.eql(u8, ev.name, "message_delta")) {
-                try absorbMessageDelta(&usage, &stop, ev.data);
-            } else if (std.mem.eql(u8, ev.name, "message_start")) {
-                try absorbMessageStart(&usage, ev.data);
-            } else if (std.mem.eql(u8, ev.name, "error")) {
-                stop = .refusal;
-                err_text = try absorbError(allocator, ev.data);
-            }
-            // Unknown events: skip.
+        switch (self.source) {
+            .literal => |bytes| return parseStream(allocator, .{ .literal = bytes }),
+            .http => |cfg| return runHttp(allocator, cfg, request),
         }
-
-        if (err_text) |e| {
-            const owned = try allocator.dupe(u8, e);
-            text.deinit(allocator);
-            return .{
-                .text = owned,
-                .usage = usage,
-                .stop_reason = .refusal,
-            };
-        }
-
-        return .{
-            .text = try text.toOwnedSlice(allocator),
-            .usage = usage,
-            .stop_reason = stop,
-        };
     }
 
     fn supportsTools(_: *anyopaque) bool {
@@ -118,6 +101,243 @@ pub const AnthropicProvider = struct {
         .deinit = doDeinit,
     };
 };
+
+// ---------------------------------------------------------------------------
+// Stream-driven parsing (shared by literal and http paths)
+
+const StreamInput = union(enum) {
+    /// All bytes are already in memory; feed once.
+    literal: []const u8,
+    /// Pull bytes incrementally from this reader until EOF.
+    reader: *std.Io.Reader,
+};
+
+fn parseStream(allocator: std.mem.Allocator, input: StreamInput) !ChatResponse {
+    var parser = transport.sse.Parser.init();
+    defer parser.deinit(allocator);
+
+    var text: std.array_list.Aligned(u8, null) = .empty;
+    errdefer text.deinit(allocator);
+
+    var usage = types.TokenUsage{};
+    var stop: types.StopReason = .end_turn;
+    var err_text: ?[]const u8 = null;
+    defer if (err_text) |e| allocator.free(e);
+
+    switch (input) {
+        .literal => |bytes| try parser.feed(allocator, bytes),
+        .reader => |r| {
+            var buf: [4096]u8 = undefined;
+            while (true) {
+                const n = try r.readSliceShort(&buf);
+                if (n == 0) break;
+                try parser.feed(allocator, buf[0..n]);
+            }
+        },
+    }
+
+    while (try parser.nextEvent(allocator)) |ev| {
+        if (std.mem.eql(u8, ev.name, "content_block_delta")) {
+            try absorbDelta(allocator, &text, ev.data);
+        } else if (std.mem.eql(u8, ev.name, "message_delta")) {
+            try absorbMessageDelta(&usage, &stop, ev.data);
+        } else if (std.mem.eql(u8, ev.name, "message_start")) {
+            try absorbMessageStart(&usage, ev.data);
+        } else if (std.mem.eql(u8, ev.name, "error")) {
+            stop = .refusal;
+            err_text = try absorbError(allocator, ev.data);
+        }
+        // Unknown events: skip.
+    }
+
+    if (err_text) |e| {
+        const owned = try allocator.dupe(u8, e);
+        text.deinit(allocator);
+        return .{
+            .text = owned,
+            .usage = usage,
+            .stop_reason = .refusal,
+        };
+    }
+
+    return .{
+        .text = try text.toOwnedSlice(allocator),
+        .usage = usage,
+        .stop_reason = stop,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// HTTP path
+
+fn runHttp(
+    allocator: std.mem.Allocator,
+    cfg: HttpSource,
+    request: ChatRequest,
+) !ChatResponse {
+    const body = try buildRequestBody(allocator, request, 1024);
+    defer allocator.free(body);
+
+    const uri = std.Uri.parse(cfg.endpoint) catch
+        return refusal(allocator, "anthropic transport error: invalid endpoint", .{});
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = cfg.io };
+    defer client.deinit();
+
+    var extra_buf: [4]std.http.Header = undefined;
+    var extra_len: usize = 0;
+    extra_buf[extra_len] = .{ .name = "x-api-key", .value = cfg.api_key };
+    extra_len += 1;
+    extra_buf[extra_len] = .{ .name = "anthropic-version", .value = cfg.api_version };
+    extra_len += 1;
+    extra_buf[extra_len] = .{ .name = "content-type", .value = "application/json" };
+    extra_len += 1;
+    if (cfg.beta_features.len > 0) {
+        extra_buf[extra_len] = .{ .name = "anthropic-beta", .value = cfg.beta_features };
+        extra_len += 1;
+    }
+
+    var req = client.request(.POST, uri, .{
+        .keep_alive = false,
+        .extra_headers = extra_buf[0..extra_len],
+    }) catch |err| return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
+    defer req.deinit();
+
+    var send_buf: [1024]u8 = undefined;
+    req.transfer_encoding = .{ .content_length = body.len };
+    var body_writer = req.sendBodyUnflushed(&send_buf) catch |err|
+        return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
+    body_writer.writer.writeAll(body) catch |err|
+        return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
+    body_writer.end() catch |err|
+        return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
+    req.connection.?.flush() catch |err|
+        return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
+
+    var redirect_buf: [256]u8 = undefined;
+    var response = req.receiveHead(&redirect_buf) catch |err|
+        return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
+
+    const status_code: u16 = @intFromEnum(response.head.status);
+    if (status_code != 200) {
+        var transfer_buf: [4096]u8 = undefined;
+        const body_reader = response.reader(&transfer_buf);
+
+        var drained: std.array_list.Aligned(u8, null) = .empty;
+        defer drained.deinit(allocator);
+
+        var read_buf: [1024]u8 = undefined;
+        while (drained.items.len < 1024) {
+            const n = body_reader.readSliceShort(&read_buf) catch break;
+            if (n == 0) break;
+            const room = 1024 - drained.items.len;
+            const take = @min(n, room);
+            try drained.appendSlice(allocator, read_buf[0..take]);
+            if (take < n) break;
+        }
+
+        return refusal(
+            allocator,
+            "anthropic api error: {d} {s}",
+            .{ status_code, drained.items },
+        );
+    }
+
+    var transfer_buf: [4096]u8 = undefined;
+    const body_reader = response.reader(&transfer_buf);
+    return parseStream(allocator, .{ .reader = body_reader });
+}
+
+/// Render the Anthropic-shaped JSON request body. Extracted so tests
+/// can pin the wire format without exercising the HTTP client.
+///
+/// The system block always carries `cache_control: ephemeral` —
+/// gateways are short-lived in v0.1.0, so longer cache TTLs aren't
+/// worth the per-key bookkeeping yet.
+pub fn buildRequestBody(
+    allocator: std.mem.Allocator,
+    request: ChatRequest,
+    max_tokens_default: u32,
+) ![]u8 {
+    var buf: std.array_list.Aligned(u8, null) = .empty;
+    defer buf.deinit(allocator);
+
+    var aw: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    var stringify: std.json.Stringify = .{ .writer = &aw.writer };
+
+    try stringify.beginObject();
+
+    try stringify.objectField("model");
+    try stringify.write(request.model.model);
+
+    try stringify.objectField("max_tokens");
+    const max_tokens: u32 = request.max_output_tokens orelse max_tokens_default;
+    try stringify.write(max_tokens);
+
+    if (request.system) |sys_text| {
+        try stringify.objectField("system");
+        try stringify.beginArray();
+        try stringify.beginObject();
+        try stringify.objectField("type");
+        try stringify.write("text");
+        try stringify.objectField("text");
+        try stringify.write(sys_text);
+        try stringify.objectField("cache_control");
+        try stringify.beginObject();
+        try stringify.objectField("type");
+        try stringify.write("ephemeral");
+        try stringify.endObject();
+        try stringify.endObject();
+        try stringify.endArray();
+    }
+
+    try stringify.objectField("messages");
+    try stringify.beginArray();
+    for (request.messages) |msg| {
+        std.debug.assert(msg.role != .system);
+        try stringify.beginObject();
+        try stringify.objectField("role");
+        switch (msg.role) {
+            .user, .tool => try stringify.write("user"),
+            .assistant => try stringify.write("assistant"),
+            .system => unreachable,
+        }
+        try stringify.objectField("content");
+        try stringify.beginArray();
+        try stringify.beginObject();
+        try stringify.objectField("type");
+        try stringify.write("text");
+        try stringify.objectField("text");
+        try stringify.write(msg.content);
+        try stringify.endObject();
+        try stringify.endArray();
+        try stringify.endObject();
+    }
+    try stringify.endArray();
+
+    try stringify.objectField("stream");
+    try stringify.write(true);
+
+    try stringify.objectField("temperature");
+    try stringify.write(request.temperature);
+
+    try stringify.endObject();
+
+    return aw.toOwnedSlice();
+}
+
+fn refusal(
+    allocator: std.mem.Allocator,
+    comptime fmt: []const u8,
+    args: anytype,
+) !ChatResponse {
+    const text = try std.fmt.allocPrint(allocator, fmt, args);
+    return .{
+        .text = text,
+        .usage = .{},
+        .stop_reason = .refusal,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Event parsers
@@ -299,4 +519,79 @@ test "anthropic: supportsNativeTools is true" {
     const provider = p.provider();
     try testing.expect(provider.supportsNativeTools());
     try testing.expectEqualStrings("anthropic", provider.name());
+}
+
+test "anthropic: buildRequestBody renders canonical wire shape" {
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = "hi there" },
+    };
+    const req: ChatRequest = .{
+        .messages = &messages,
+        .model = .{ .provider = "anthropic", .model = "claude-opus-4-7" },
+        .system = "be brief",
+    };
+
+    const body = try buildRequestBody(testing.allocator, req, 1024);
+    defer testing.allocator.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":1024") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"system\":[{") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"content\":[{\"type\":\"text\",\"text\":\"hi there\"}]") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.699999988079071") != null);
+}
+
+const ServerArgs = struct {
+    io: std.Io,
+    server: *std.Io.net.Server,
+};
+
+fn serveOne401(args: *ServerArgs) void {
+    var stream = args.server.accept(args.io) catch return;
+    defer stream.close(args.io);
+    var write_buf: [256]u8 = undefined;
+    var w = stream.writer(args.io, &write_buf);
+    _ = w.interface.writeAll(
+        "HTTP/1.1 401 Unauthorized\r\ncontent-length: 16\r\nconnection: close\r\n\r\n{\"error\":\"oops\"}",
+    ) catch {};
+    _ = w.interface.flush() catch {};
+}
+
+test "anthropic: http error path surfaces refusal" {
+    const probe_addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
+    var server = try probe_addr.listen(testing.io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+
+    var args: ServerArgs = .{ .io = testing.io, .server = &server };
+    const thread = try std.Thread.spawn(.{}, serveOne401, .{&args});
+    defer {
+        thread.join();
+        server.deinit(testing.io);
+    }
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/v1/messages", .{port});
+
+    var p = makeProvider(.{ .http = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .api_key = "sk-test",
+        .endpoint = url,
+    } });
+    const provider = p.provider();
+
+    const msgs = [_]types.Message{
+        .{ .role = .user, .content = "hello" },
+    };
+    const resp = try provider.chat(testing.allocator, .{
+        .messages = &msgs,
+        .model = .{ .provider = "anthropic", .model = "claude-opus-4-7" },
+    });
+    defer if (resp.text) |t| testing.allocator.free(t);
+
+    try testing.expectEqual(types.StopReason.refusal, resp.stop_reason);
+    try testing.expect(resp.text != null);
+    try testing.expect(std.mem.indexOf(u8, resp.text.?, "401") != null);
 }
