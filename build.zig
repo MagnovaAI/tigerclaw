@@ -69,43 +69,43 @@ pub fn build(b: *std.Build) void {
     tigerclaw_mod.addImport("llm_transport", llm_transport_mod);
     tigerclaw_mod.addImport("build_options", build_options_mod);
 
-    var ext_anthropic_mod: ?*std.Build.Module = null;
-    var ext_openai_mod: ?*std.Build.Module = null;
-    var ext_bedrock_mod: ?*std.Build.Module = null;
+    var provider_anthropic_mod: ?*std.Build.Module = null;
+    var provider_openai_mod: ?*std.Build.Module = null;
+    var provider_bedrock_mod: ?*std.Build.Module = null;
     if (enable_anthropic) {
-        const ext = b.addModule("ext_anthropic", .{
-            .root_source_file = b.path("extensions/anthropic/root.zig"),
+        const ext = b.addModule("provider_anthropic", .{
+            .root_source_file = b.path("extensions/providers-anthropic/root.zig"),
             .target = target,
             .optimize = optimize,
         });
         ext.addImport("types", types_mod);
         ext.addImport("llm_provider", llm_provider_mod);
         ext.addImport("llm_transport", llm_transport_mod);
-        tigerclaw_mod.addImport("ext_anthropic", ext);
-        ext_anthropic_mod = ext;
+        tigerclaw_mod.addImport("provider_anthropic", ext);
+        provider_anthropic_mod = ext;
     }
     if (enable_openai) {
-        const ext = b.addModule("ext_openai", .{
-            .root_source_file = b.path("extensions/openai/root.zig"),
+        const ext = b.addModule("provider_openai", .{
+            .root_source_file = b.path("extensions/providers-openai/root.zig"),
             .target = target,
             .optimize = optimize,
         });
         ext.addImport("types", types_mod);
         ext.addImport("llm_provider", llm_provider_mod);
         ext.addImport("llm_transport", llm_transport_mod);
-        tigerclaw_mod.addImport("ext_openai", ext);
-        ext_openai_mod = ext;
+        tigerclaw_mod.addImport("provider_openai", ext);
+        provider_openai_mod = ext;
     }
     if (enable_bedrock) {
-        const ext = b.addModule("ext_bedrock", .{
-            .root_source_file = b.path("extensions/bedrock/root.zig"),
+        const ext = b.addModule("provider_bedrock", .{
+            .root_source_file = b.path("extensions/providers-bedrock/root.zig"),
             .target = target,
             .optimize = optimize,
         });
         ext.addImport("types", types_mod);
         ext.addImport("llm_provider", llm_provider_mod);
-        tigerclaw_mod.addImport("ext_bedrock", ext);
-        ext_bedrock_mod = ext;
+        tigerclaw_mod.addImport("provider_bedrock", ext);
+        provider_bedrock_mod = ext;
     }
 
     const exe_mod = b.createModule(.{
@@ -117,9 +117,9 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("types", types_mod);
     exe_mod.addImport("llm_provider", llm_provider_mod);
     exe_mod.addImport("llm_transport", llm_transport_mod);
-    if (ext_anthropic_mod) |m| exe_mod.addImport("ext_anthropic", m);
-    if (ext_openai_mod) |m| exe_mod.addImport("ext_openai", m);
-    if (ext_bedrock_mod) |m| exe_mod.addImport("ext_bedrock", m);
+    if (provider_anthropic_mod) |m| exe_mod.addImport("provider_anthropic", m);
+    if (provider_openai_mod) |m| exe_mod.addImport("provider_openai", m);
+    if (provider_bedrock_mod) |m| exe_mod.addImport("provider_bedrock", m);
     const exe = b.addExecutable(.{
         .name = "tigerclaw",
         .root_module = exe_mod,
@@ -144,9 +144,9 @@ pub fn build(b: *std.Build) void {
     unit_mod.addImport("types", types_mod);
     unit_mod.addImport("llm_provider", llm_provider_mod);
     unit_mod.addImport("llm_transport", llm_transport_mod);
-    if (ext_anthropic_mod) |m| unit_mod.addImport("ext_anthropic", m);
-    if (ext_openai_mod) |m| unit_mod.addImport("ext_openai", m);
-    if (ext_bedrock_mod) |m| unit_mod.addImport("ext_bedrock", m);
+    if (provider_anthropic_mod) |m| unit_mod.addImport("provider_anthropic", m);
+    if (provider_openai_mod) |m| unit_mod.addImport("provider_openai", m);
+    if (provider_bedrock_mod) |m| unit_mod.addImport("provider_bedrock", m);
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
@@ -160,15 +160,15 @@ pub fn build(b: *std.Build) void {
     const llm_transport_tests = b.addTest(.{ .root_module = llm_transport_mod });
     test_step.dependOn(&b.addRunArtifact(llm_transport_tests).step);
 
-    if (ext_anthropic_mod) |m| {
+    if (provider_anthropic_mod) |m| {
         const t = b.addTest(.{ .root_module = m });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
-    if (ext_openai_mod) |m| {
+    if (provider_openai_mod) |m| {
         const t = b.addTest(.{ .root_module = m });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
-    if (ext_bedrock_mod) |m| {
+    if (provider_bedrock_mod) |m| {
         const t = b.addTest(.{ .root_module = m });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
