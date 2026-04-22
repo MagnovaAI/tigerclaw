@@ -12,6 +12,7 @@ pub const presentation = @import("presentation.zig");
 pub const commands = struct {
     pub const doctor = @import("commands/doctor.zig");
     pub const completion = @import("commands/completion.zig");
+    pub const agent_selector = @import("commands/agent_selector.zig");
 };
 
 pub const version_string = version.string;
