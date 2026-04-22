@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
         "cost_ledger_test",
         "diagnostics_buffer_test",
         "e2e_run_with_mock_test",
+        "react_loop_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});

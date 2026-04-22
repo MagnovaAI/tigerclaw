@@ -5,6 +5,7 @@
 //! (log, clock, determinism, errors); subsystems must not import across
 //! each other.
 
+pub const agent = @import("agent/root.zig");
 pub const cli = @import("cli.zig");
 pub const clock = @import("clock.zig");
 pub const constants = @import("constants/root.zig");
