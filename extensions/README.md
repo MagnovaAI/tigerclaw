@@ -7,9 +7,9 @@ only when its name appears in the `-Dextensions=` selector.
 ## Build flag
 
 ```sh
-zig build                                  # default: anthropic,openai,bedrock
+zig build                                  # default: anthropic,openai,bedrock,openrouter
 zig build -Dextensions=anthropic           # only anthropic compiled in
-zig build -Dextensions=anthropic,openai    # subset
+zig build -Dextensions=anthropic,openai,bedrock,openrouter  # subset
 zig build -Dextensions=all                 # explicit "all known"
 zig build -Dextensions=""                  # zero extensions (mock-only)
 ```
