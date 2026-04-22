@@ -45,6 +45,18 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: flag requires a value\n");
             return 64;
         },
+        error.ChannelsMissingSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: channels requires a subcommand (list|status|telegram)\n");
+            return 64;
+        },
+        error.ChannelsUnknownSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown channels subcommand\n");
+            return 64;
+        },
+        error.ChannelsTelegramTestMissingFields => {
+            try stderr_w.interface.writeAll("tigerclaw: channels telegram test requires --to and --text\n");
+            return 64;
+        },
     };
 
     switch (cmd) {
@@ -91,6 +103,38 @@ pub fn main(init: std.process.Init) !u8 {
                     return 64;
                 },
                 error.OutOfMemory => return error.OutOfMemory,
+            };
+        },
+        .channels => |sub| {
+            cli.commands.channels.run(
+                arena,
+                io,
+                sub,
+                &stdout_w.interface,
+                &stderr_w.interface,
+            ) catch |err| switch (err) {
+                error.GatewayDown => return 1,
+                error.Unauthorized => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway rejected credentials\n");
+                    return 77;
+                },
+                error.BadRequest => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway rejected the request\n");
+                    return 65;
+                },
+                error.InternalError => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway internal error\n");
+                    return 70;
+                },
+                error.InvalidResponse => {
+                    try stderr_w.interface.writeAll("tigerclaw: invalid gateway response\n");
+                    return 70;
+                },
+                error.UrlTooLong, error.BodyTooLarge => {
+                    try stderr_w.interface.writeAll("tigerclaw: request payload too large\n");
+                    return 64;
+                },
+                error.OutOfMemory, error.WriteFailed => return err,
             };
         },
         .unknown => |flag| {

@@ -19,6 +19,7 @@ pub const commands = struct {
     pub const config = @import("commands/config.zig");
     pub const http_client = @import("commands/http_client.zig");
     pub const agent = @import("commands/agent.zig");
+    pub const channels = @import("commands/channels.zig");
 };
 
 pub const version_string = version.string;
@@ -40,6 +41,7 @@ pub const Command = union(enum) {
     doctor,
     completion: commands.completion.Shell,
     agent: AgentArgs,
+    channels: commands.channels.Subcommand,
     unknown: []const u8,
 };
 
@@ -49,12 +51,16 @@ pub const ParseError = error{
     CompletionUnknownShell,
     UnknownFlag,
     MissingFlagValue,
+    ChannelsMissingSubcommand,
+    ChannelsUnknownSubcommand,
+    ChannelsTelegramTestMissingFields,
 };
 
 /// Top-level command table. Summaries feed the help screen and shell
 /// completion generators.
 pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "agent", .summary = "Stream a turn from the local gateway and render tokens" },
+    .{ .name = "channels", .summary = "List, inspect, and probe configured channels" },
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
     .{ .name = "doctor", .summary = "Print a short environment report" },
@@ -89,6 +95,16 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
     }
     if (std.mem.eql(u8, match.descriptor.name, "agent")) {
         return parseAgent(match.argv[1..]);
+    }
+    if (std.mem.eql(u8, match.descriptor.name, "channels")) {
+        const sub = commands.channels.parse(match.argv[1..]) catch |err| switch (err) {
+            error.MissingSubcommand => return error.ChannelsMissingSubcommand,
+            error.UnknownSubcommand => return error.ChannelsUnknownSubcommand,
+            error.UnknownFlag => return error.UnknownFlag,
+            error.MissingFlagValue => return error.MissingFlagValue,
+            error.TelegramTestMissingFields => return error.ChannelsTelegramTestMissingFields,
+        };
+        return .{ .channels = sub };
     }
 
     return .{ .unknown = first };
@@ -257,6 +273,23 @@ test "parse: agent with all three flags set" {
 test "parse: agent with unknown flag returns UnknownFlag" {
     const argv = [_][]const u8{ "agent", "--nope" };
     try testing.expectError(error.UnknownFlag, parse(&argv));
+}
+
+test "parse: channels list → Command.channels{.list}" {
+    const argv = [_][]const u8{ "channels", "list" };
+    const cmd = try parse(&argv);
+    try testing.expectEqual(commands.channels.Subcommand.list, cmd.channels);
+}
+
+test "parse: channels telegram enable → Command.channels{.telegram_enable}" {
+    const argv = [_][]const u8{ "channels", "telegram", "enable" };
+    const cmd = try parse(&argv);
+    try testing.expectEqual(commands.channels.Subcommand.telegram_enable, cmd.channels);
+}
+
+test "parse: channels with no subcommand → ChannelsMissingSubcommand" {
+    const argv = [_][]const u8{"channels"};
+    try testing.expectError(error.ChannelsMissingSubcommand, parse(&argv));
 }
 
 test {
