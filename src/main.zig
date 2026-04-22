@@ -77,6 +77,18 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: unknown providers subcommand\n");
             return 64;
         },
+        error.ModelsMissingSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: models requires a subcommand (list|status|set)\n");
+            return 64;
+        },
+        error.ModelsUnknownSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown models subcommand\n");
+            return 64;
+        },
+        error.ModelsMissingModel => {
+            try stderr_w.interface.writeAll("tigerclaw: models set requires a <model> argument\n");
+            return 64;
+        },
     };
 
     switch (cmd) {
@@ -181,6 +193,42 @@ pub fn main(init: std.process.Init) !u8 {
                 &stderr_w.interface,
             ) catch |err| switch (err) {
                 error.DirNotFound, error.FileNotFound, error.InvalidCassette, error.ReadFailed => return 1,
+                error.OutOfMemory, error.WriteFailed => return err,
+            };
+        },
+        .models => |sub| {
+            cli.commands.models.run(
+                arena,
+                io,
+                sub,
+                &stdout_w.interface,
+                &stderr_w.interface,
+            ) catch |err| switch (err) {
+                error.NoSession, error.GatewayDoesNotSupport => return 1,
+                error.GatewayDown => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway unreachable\n");
+                    return 69;
+                },
+                error.Unauthorized => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway rejected credentials\n");
+                    return 77;
+                },
+                error.BadRequest => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway rejected the request\n");
+                    return 65;
+                },
+                error.InternalError => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway internal error\n");
+                    return 70;
+                },
+                error.InvalidResponse => {
+                    try stderr_w.interface.writeAll("tigerclaw: invalid gateway response\n");
+                    return 70;
+                },
+                error.UrlTooLong, error.BodyTooLarge, error.NoSpaceLeft => {
+                    try stderr_w.interface.writeAll("tigerclaw: request payload too large\n");
+                    return 64;
+                },
                 error.OutOfMemory, error.WriteFailed => return err,
             };
         },
