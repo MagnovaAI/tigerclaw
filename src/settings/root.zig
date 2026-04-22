@@ -8,6 +8,7 @@
 const std = @import("std");
 
 pub const schema = @import("schema.zig");
+pub const agents = @import("agents.zig");
 pub const validation = @import("validation.zig");
 pub const managed_path = @import("managed_path.zig");
 pub const env_overrides = @import("env_overrides.zig");
@@ -26,6 +27,7 @@ pub const Cache = cache.Cache;
 
 test {
     std.testing.refAllDecls(@import("schema.zig"));
+    std.testing.refAllDecls(@import("agents.zig"));
     std.testing.refAllDecls(@import("validation.zig"));
     std.testing.refAllDecls(@import("managed_path.zig"));
     std.testing.refAllDecls(@import("env_overrides.zig"));
