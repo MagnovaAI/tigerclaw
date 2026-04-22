@@ -7,6 +7,7 @@
 
 pub const agent = @import("agent/root.zig");
 pub const bench = @import("bench/root.zig");
+pub const channels = @import("channels/root.zig");
 pub const cli = @import("cli/root.zig");
 pub const clock = @import("clock.zig");
 pub const constants = @import("constants/root.zig");
