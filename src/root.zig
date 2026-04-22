@@ -11,6 +11,7 @@ pub const cli = @import("cli/root.zig");
 pub const clock = @import("clock.zig");
 pub const constants = @import("constants/root.zig");
 pub const cost = @import("cost/root.zig");
+pub const daemon = @import("daemon/root.zig");
 pub const determinism = @import("determinism.zig");
 pub const entrypoints = @import("entrypoints/root.zig");
 pub const errors = @import("errors.zig");
