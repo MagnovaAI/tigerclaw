@@ -21,6 +21,7 @@ pub const commands = struct {
     pub const agent = @import("commands/agent.zig");
     pub const channels = @import("commands/channels.zig");
     pub const cassette = @import("commands/cassette.zig");
+    pub const providers = @import("commands/providers.zig");
 };
 
 pub const version_string = version.string;
@@ -44,6 +45,7 @@ pub const Command = union(enum) {
     agent: AgentArgs,
     channels: commands.channels.Subcommand,
     cassette: commands.cassette.Subcommand,
+    providers: commands.providers.Subcommand,
     unknown: []const u8,
 };
 
@@ -59,6 +61,8 @@ pub const ParseError = error{
     CassetteMissingSubcommand,
     CassetteUnknownSubcommand,
     CassetteMissingPath,
+    ProvidersMissingSubcommand,
+    ProvidersUnknownSubcommand,
 };
 
 /// Top-level command table. Summaries feed the help screen and shell
@@ -67,6 +71,7 @@ pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "agent", .summary = "Stream a turn from the local gateway and render tokens" },
     .{ .name = "cassette", .summary = "Inspect and replay VCR cassettes" },
     .{ .name = "channels", .summary = "List, inspect, and probe configured channels" },
+    .{ .name = "providers", .summary = "List LLM providers and probe reachability" },
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
     .{ .name = "doctor", .summary = "Print a short environment report" },
@@ -111,6 +116,15 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
             error.TelegramTestMissingFields => return error.ChannelsTelegramTestMissingFields,
         };
         return .{ .channels = sub };
+    }
+    if (std.mem.eql(u8, match.descriptor.name, "providers")) {
+        const sub = commands.providers.parse(match.argv[1..]) catch |err| switch (err) {
+            error.MissingSubcommand => return error.ProvidersMissingSubcommand,
+            error.UnknownSubcommand => return error.ProvidersUnknownSubcommand,
+            error.UnknownFlag => return error.UnknownFlag,
+            error.MissingFlagValue => return error.MissingFlagValue,
+        };
+        return .{ .providers = sub };
     }
     if (std.mem.eql(u8, match.descriptor.name, "cassette")) {
         const sub = commands.cassette.parse(match.argv[1..]) catch |err| switch (err) {
