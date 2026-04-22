@@ -69,6 +69,14 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: cassette show/replay requires a path\n");
             return 64;
         },
+        error.ProvidersMissingSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: providers requires a subcommand (list|status)\n");
+            return 64;
+        },
+        error.ProvidersUnknownSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown providers subcommand\n");
+            return 64;
+        },
     };
 
     switch (cmd) {
@@ -144,6 +152,21 @@ pub fn main(init: std.process.Init) !u8 {
                 },
                 error.UrlTooLong, error.BodyTooLarge => {
                     try stderr_w.interface.writeAll("tigerclaw: request payload too large\n");
+                    return 64;
+                },
+                error.OutOfMemory, error.WriteFailed => return err,
+            };
+        },
+        .providers => |sub| {
+            cli.commands.providers.run(
+                arena,
+                io,
+                sub,
+                &stdout_w.interface,
+                &stderr_w.interface,
+            ) catch |err| switch (err) {
+                error.UrlTooLong => {
+                    try stderr_w.interface.writeAll("tigerclaw: provider base URL too long\n");
                     return 64;
                 },
                 error.OutOfMemory, error.WriteFailed => return err,
