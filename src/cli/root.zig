@@ -15,6 +15,8 @@ pub const commands = struct {
     pub const agent_selector = @import("commands/agent_selector.zig");
     pub const agents = @import("commands/agents.zig");
     pub const gateway = @import("commands/gateway.zig");
+    pub const sessions = @import("commands/sessions.zig");
+    pub const config = @import("commands/config.zig");
 };
 
 pub const version_string = version.string;
