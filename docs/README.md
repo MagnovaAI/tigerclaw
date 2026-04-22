@@ -10,6 +10,8 @@ Entry point for project documentation. Documents are added as the subsystems the
 - [TRACE_FORMAT.md](TRACE_FORMAT.md) — the on-disk format produced by the harness.
 - [VCR_FORMAT.md](VCR_FORMAT.md) — HTTP record/replay cassette format.
 - [BENCH_INVARIANTS.md](BENCH_INVARIANTS.md) — the four hashes every bench compare checks.
+- [MODE_POLICY.md](MODE_POLICY.md) — run/bench/replay/eval pinning and bench guards.
+- [BUDGET_LEDGER.md](BUDGET_LEDGER.md) — session budget and the two-phase cost ledger.
 
 ## Architecture decision records
 
@@ -21,6 +23,8 @@ ADRs live under [`adr/`](adr/) and are numbered as they are accepted. An ADR cap
 - [0006 — Determinism model](adr/0006_determinism_model.md)
 - [0007 — Settings layering](adr/0007_settings_layering.md)
 - [0009 — Bench invariants](adr/0009_bench_invariants.md)
+- [0012 — Bench guards](adr/0012_bench_guards.md)
+- [0017 — Budget and cost ledger](adr/0017_budget_ledger.md)
 - [0022 — Error taxonomy](adr/0022_error_taxonomy.md)
 
 ## Conventions
