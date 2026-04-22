@@ -22,6 +22,8 @@ pub const harness = @import("harness.zig");
 pub const budget = @import("budget.zig");
 pub const interrupt = @import("interrupt.zig");
 pub const respawn = @import("respawn.zig");
+pub const mode_policy = @import("mode_policy.zig");
+pub const bench_guards = @import("bench_guards.zig");
 
 pub const State = state.State;
 pub const Turn = turn.Turn;
@@ -33,6 +35,10 @@ pub const BudgetLimits = budget.Limits;
 pub const Interrupt = interrupt.Interrupt;
 pub const RespawnController = respawn.Controller;
 pub const RespawnPolicy = respawn.Policy;
+pub const Mode = mode_policy.Mode;
+pub const ModePolicy = mode_policy.Policy;
+pub const GuardedProvider = bench_guards.GuardedProvider;
+pub const BenchHarnessBuilder = bench_guards.BenchHarnessBuilder;
 
 test {
     std.testing.refAllDecls(@import("state.zig"));
@@ -42,4 +48,6 @@ test {
     std.testing.refAllDecls(@import("budget.zig"));
     std.testing.refAllDecls(@import("interrupt.zig"));
     std.testing.refAllDecls(@import("respawn.zig"));
+    std.testing.refAllDecls(@import("mode_policy.zig"));
+    std.testing.refAllDecls(@import("bench_guards.zig"));
 }
