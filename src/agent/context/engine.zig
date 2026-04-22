@@ -10,7 +10,7 @@
 //! sub-piece itself.
 
 const std = @import("std");
-const types = @import("../../types/root.zig");
+const types = @import("types");
 const window_mod = @import("window.zig");
 const compaction_mod = @import("compaction.zig");
 const feedback_mod = @import("compression_feedback.zig");

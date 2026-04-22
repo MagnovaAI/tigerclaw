@@ -15,7 +15,7 @@
 //! never a mutation of the caller's history.
 
 const std = @import("std");
-const types = @import("../../types/root.zig");
+const types = @import("types");
 const hints_mod = @import("hints.zig");
 
 pub const Policy = struct {

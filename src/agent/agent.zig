@@ -8,7 +8,7 @@
 //! hold on to for a session.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const llm = @import("../llm/root.zig");
 const state_mod = @import("state.zig");
 const vtable_mod = @import("vtable.zig");

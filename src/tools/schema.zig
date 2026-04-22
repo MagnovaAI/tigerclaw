@@ -7,7 +7,7 @@
 //! the raw JSON string in `ToolCall.arguments_json`.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 
 /// Tool category — drives both prompt-time selection and the
 /// Commit 41 "justification lint" that ensures every registered

@@ -11,9 +11,9 @@
 //! reliability layer.
 
 const std = @import("std");
-const provider_mod = @import("../provider.zig");
-const transport = @import("../transport/root.zig");
-const types = @import("../../types/root.zig");
+const provider_mod = @import("llm_provider");
+const transport = @import("llm_transport");
+const types = @import("types");
 
 const Provider = provider_mod.Provider;
 const ChatRequest = provider_mod.ChatRequest;

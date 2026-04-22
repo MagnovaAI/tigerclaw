@@ -8,7 +8,7 @@
 //! model can parse it rather than pattern-matching prose.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const schema = @import("schema.zig");
 const harness = @import("../harness/root.zig");
 

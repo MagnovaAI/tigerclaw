@@ -11,7 +11,7 @@
 //! configuration.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const agent = @import("../agent/root.zig");
 const schema_mod = @import("schema.zig");
 

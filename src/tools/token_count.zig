@@ -3,7 +3,7 @@
 //! the agent to gate its own message size before sending.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const schema = @import("schema.zig");
 const token_estimator = @import("../llm/token_estimator.zig");
 

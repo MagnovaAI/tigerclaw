@@ -9,7 +9,7 @@
 //! Arguments: `{"argv": ["..."], "allow_shell_metachars": false?}`.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const schema = @import("schema.zig");
 const sandbox = @import("../sandbox/root.zig");
 

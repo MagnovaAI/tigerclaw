@@ -12,7 +12,7 @@
 //! may be freed or mutated afterwards.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 
 pub const AgentState = struct {
     allocator: std.mem.Allocator,

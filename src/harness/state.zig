@@ -11,7 +11,7 @@
 //! write so breaking changes are detectable.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const turn_mod = @import("turn.zig");
 
 /// Current on-disk schema version. Bump only on breaking layout changes;

@@ -15,7 +15,7 @@
 //! E2E test, or a CLI frontend, all without forking code paths.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const clock_mod = @import("../clock.zig");
 const llm = @import("../llm/root.zig");
 const harness = @import("../harness/root.zig");

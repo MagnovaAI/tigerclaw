@@ -14,7 +14,7 @@
 //! runtime refuses to send a request that will trip the cap.
 
 const std = @import("std");
-const types = @import("../../types/root.zig");
+const types = @import("types");
 const token_estimator = @import("../../llm/token_estimator.zig");
 
 pub const Window = struct {

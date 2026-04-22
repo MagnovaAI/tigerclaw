@@ -4,7 +4,7 @@
 //! ledger's arithmetic pure and the pricing table swappable.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const pricing = @import("pricing.zig");
 
 /// Result of pricing a single usage record.

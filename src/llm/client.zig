@@ -3,7 +3,7 @@
 //! provider — callers own both the impl and the client.
 
 const std = @import("std");
-const provider_mod = @import("provider.zig");
+const provider_mod = @import("llm_provider");
 const token_estimator = @import("token_estimator.zig");
 
 const Provider = provider_mod.Provider;
@@ -44,7 +44,7 @@ pub const Client = struct {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
-const types = @import("../types/root.zig");
+const types = @import("types");
 
 const MiniImpl = struct {
     canned: []const u8,

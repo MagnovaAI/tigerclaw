@@ -13,7 +13,7 @@
 //! waiting for the registry.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 
 pub const ToolExecutor = struct {
     ptr: *anyopaque,

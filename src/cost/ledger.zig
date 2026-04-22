@@ -28,7 +28,7 @@
 //! against the ceiling — that is what causes the race.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const pricing = @import("pricing.zig");
 const usage_pricing = @import("usage_pricing.zig");
 
