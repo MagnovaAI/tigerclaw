@@ -86,6 +86,9 @@ pub fn build(b: *std.Build) void {
         "eval_judge_test",
         "assertion_freeze_test",
         "witness_cardinality_test",
+        "e2e_replay_roundtrip_test",
+        "e2e_bench_full_run_test",
+        "e2e_eval_full_cycle_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});

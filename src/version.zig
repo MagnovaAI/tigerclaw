@@ -7,7 +7,7 @@
 
 const std = @import("std");
 
-pub const string = "0.0.0";
+pub const string = "0.1.0-alpha";
 
 // --- tests -----------------------------------------------------------------
 
