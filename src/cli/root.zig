@@ -20,6 +20,7 @@ pub const commands = struct {
     pub const http_client = @import("commands/http_client.zig");
     pub const agent = @import("commands/agent.zig");
     pub const channels = @import("commands/channels.zig");
+    pub const cassette = @import("commands/cassette.zig");
 };
 
 pub const version_string = version.string;
@@ -42,6 +43,7 @@ pub const Command = union(enum) {
     completion: commands.completion.Shell,
     agent: AgentArgs,
     channels: commands.channels.Subcommand,
+    cassette: commands.cassette.Subcommand,
     unknown: []const u8,
 };
 
@@ -54,12 +56,16 @@ pub const ParseError = error{
     ChannelsMissingSubcommand,
     ChannelsUnknownSubcommand,
     ChannelsTelegramTestMissingFields,
+    CassetteMissingSubcommand,
+    CassetteUnknownSubcommand,
+    CassetteMissingPath,
 };
 
 /// Top-level command table. Summaries feed the help screen and shell
 /// completion generators.
 pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "agent", .summary = "Stream a turn from the local gateway and render tokens" },
+    .{ .name = "cassette", .summary = "Inspect and replay VCR cassettes" },
     .{ .name = "channels", .summary = "List, inspect, and probe configured channels" },
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
@@ -105,6 +111,16 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
             error.TelegramTestMissingFields => return error.ChannelsTelegramTestMissingFields,
         };
         return .{ .channels = sub };
+    }
+    if (std.mem.eql(u8, match.descriptor.name, "cassette")) {
+        const sub = commands.cassette.parse(match.argv[1..]) catch |err| switch (err) {
+            error.MissingSubcommand => return error.CassetteMissingSubcommand,
+            error.UnknownSubcommand => return error.CassetteUnknownSubcommand,
+            error.UnknownFlag => return error.UnknownFlag,
+            error.MissingFlagValue => return error.MissingFlagValue,
+            error.MissingPath => return error.CassetteMissingPath,
+        };
+        return .{ .cassette = sub };
     }
 
     return .{ .unknown = first };
@@ -290,6 +306,23 @@ test "parse: channels telegram enable → Command.channels{.telegram_enable}" {
 test "parse: channels with no subcommand → ChannelsMissingSubcommand" {
     const argv = [_][]const u8{"channels"};
     try testing.expectError(error.ChannelsMissingSubcommand, parse(&argv));
+}
+
+test "parse: cassette list → Command.cassette{.list}" {
+    const argv = [_][]const u8{ "cassette", "list" };
+    const cmd = try parse(&argv);
+    try testing.expectEqualStrings("tests/cassettes", cmd.cassette.list.dir);
+}
+
+test "parse: cassette show <path> → Command.cassette{.show}" {
+    const argv = [_][]const u8{ "cassette", "show", "/tmp/x.jsonl" };
+    const cmd = try parse(&argv);
+    try testing.expectEqualStrings("/tmp/x.jsonl", cmd.cassette.show.path);
+}
+
+test "parse: cassette with no subcommand → CassetteMissingSubcommand" {
+    const argv = [_][]const u8{"cassette"};
+    try testing.expectError(error.CassetteMissingSubcommand, parse(&argv));
 }
 
 test {
