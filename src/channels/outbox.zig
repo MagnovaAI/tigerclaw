@@ -236,6 +236,57 @@ pub const Cursor = struct {
     }
 };
 
+/// Record a failed send attempt for the record named `id` on
+/// `channel_id`. Increments `attempts`, shifts `next_due_unix_ms`
+/// forward by `backoff(prior_attempts)` from the outbox's clock, and
+/// leaves `ack` unchanged so the record is re-yielded once the backoff
+/// window elapses.
+///
+/// Operates outside any open `Cursor`: it loads its own on-disk
+/// snapshot, mutates one record, and rewrites the file atomically. A
+/// caller holding a live cursor will see the pre-failure view until
+/// that cursor is reopened, which is the intended contract — the
+/// cursor is a point-in-time snapshot, not a live view.
+pub fn recordFailure(
+    outbox: *Outbox,
+    channel_id: spec.ChannelId,
+    id: []const u8,
+) AckError!void {
+    var arena = std.heap.ArenaAllocator.init(outbox.allocator);
+    defer arena.deinit();
+
+    const records = loadRecords(outbox, channel_id, arena.allocator()) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.IoFailure, error.CorruptRecord => return error.IoFailure,
+    };
+
+    var target_index: ?usize = null;
+    for (records, 0..) |r, i| {
+        if (std.mem.eql(u8, r.id, id)) {
+            target_index = i;
+            break;
+        }
+    }
+    const idx = target_index orelse return error.UnknownId;
+
+    const prior = records[idx].attempts;
+    records[idx].attempts = prior + 1;
+    records[idx].next_due_unix_ms = outbox.nowMs() + @as(i64, @intCast(backoff(prior)));
+
+    try rewriteFile(outbox, channel_id, records);
+}
+
+/// Exponential backoff schedule in milliseconds. `attempts == 0` is the
+/// delay applied after the first failure: 1 s. Each subsequent attempt
+/// doubles the wait, capped at 60 s so a dead channel doesn't push
+/// retries out to astronomical intervals.
+pub fn backoff(attempts: u32) u64 {
+    const cap: u64 = 60_000;
+    const shift: u6 = @intCast(@min(attempts, 16));
+    const ms: u64 = @as(u64, 1000) << shift;
+    return @min(ms, cap);
+}
+
 fn outboxFilePath(
     buf: []u8,
     channel_id: spec.ChannelId,
@@ -549,4 +600,100 @@ test "persisted line round-trips through std.json.parseFromSlice" {
     try testing.expect(parsed.value.thread_key != null);
     try testing.expectEqualStrings("topic-1", parsed.value.thread_key.?);
     try testing.expectEqualStrings("round trip", parsed.value.text);
+}
+
+test "backoff: doubles each attempt and caps at 60_000ms" {
+    try testing.expectEqual(@as(u64, 1000), backoff(0));
+    try testing.expectEqual(@as(u64, 2000), backoff(1));
+    try testing.expectEqual(@as(u64, 8000), backoff(3));
+    try testing.expectEqual(@as(u64, 60_000), backoff(20));
+}
+
+test "recordFailure bumps attempts and pushes next_due forward" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
+    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+
+    const id = try box.append(.telegram, .{ .conversation_key = "c", .text = "retry-me" });
+    defer testing.allocator.free(id);
+
+    const before_ms = box.nowMs();
+    try recordFailure(&box, .telegram, id);
+
+    const contents = try readAll(testing.io, tmp.dir, "outbox/telegram.jsonl", testing.allocator);
+    defer testing.allocator.free(contents);
+    const line = std.mem.trimEnd(u8, contents, "\n");
+    const parsed = try std.json.parseFromSlice(Record, testing.allocator, line, .{});
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(u32, 1), parsed.value.attempts);
+    try testing.expectEqual(before_ms + 1000, parsed.value.next_due_unix_ms);
+    try testing.expect(!parsed.value.ack);
+}
+
+test "cursor hides record until clock advances past backoff window" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
+    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+
+    const id = try box.append(.telegram, .{ .conversation_key = "c", .text = "retry-me" });
+    defer testing.allocator.free(id);
+
+    try recordFailure(&box, .telegram, id);
+
+    {
+        var c = try box.cursor(.telegram);
+        defer c.deinit();
+        try testing.expect((try c.next()) == null);
+    }
+
+    // Advance just past the 1s backoff window.
+    manual.value_ns += 1_001 * std.time.ns_per_ms;
+
+    var c = try box.cursor(.telegram);
+    defer c.deinit();
+    const p = (try c.next()) orelse return error.TestUnexpectedNull;
+    try testing.expectEqualStrings("retry-me", p.text);
+    try testing.expectEqual(@as(u32, 1), p.attempts);
+}
+
+test "recordFailure on an unknown id returns UnknownId" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
+    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    const id = try box.append(.telegram, .{ .conversation_key = "c", .text = "x" });
+    defer testing.allocator.free(id);
+
+    try testing.expectError(error.UnknownId, recordFailure(&box, .telegram, "not-a-real-id"));
+}
+
+test "bumped attempts survives reopening the outbox" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
+
+    const id = blk: {
+        var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+        const id = try box.append(.telegram, .{ .conversation_key = "c", .text = "persisted" });
+        try recordFailure(&box, .telegram, id);
+        break :blk id;
+    };
+    defer testing.allocator.free(id);
+
+    // Fresh Outbox on the same dir, clock advanced past backoff.
+    manual.value_ns += 2_000 * std.time.ns_per_ms;
+    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    var c = try box.cursor(.telegram);
+    defer c.deinit();
+
+    const p = (try c.next()) orelse return error.TestUnexpectedNull;
+    try testing.expectEqualStrings("persisted", p.text);
+    try testing.expectEqual(@as(u32, 1), p.attempts);
 }
