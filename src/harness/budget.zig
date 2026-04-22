@@ -98,6 +98,16 @@ pub const Budget = struct {
     pub fn isExhausted(self: *const Budget) bool {
         return self.exceeded() != .none;
     }
+
+    /// Snapshot-style gate used before handing a request to the
+    /// runner. This is deliberately *not* transactionally exact:
+    /// the underlying counters can advance between the check and
+    /// the runner accepting the turn, and that is fine — budget
+    /// enforcement is a coarse safety net, not a serialisability
+    /// invariant.
+    pub fn check(self: *const Budget) ExceededAxis {
+        return self.exceeded();
+    }
 };
 
 // --- tests -----------------------------------------------------------------
@@ -150,4 +160,30 @@ test "Budget: earliest-declared axis wins when multiple are over" {
     var b = Budget.init(.{ .turns = 1, .cost_micros = 1 });
     b.recordTurn(0, 0, 10);
     try testing.expectEqual(ExceededAxis.turns, b.exceeded());
+}
+
+test "Budget: check is an alias for exceeded" {
+    var b = Budget.init(.{ .turns = 1 });
+    try testing.expectEqual(ExceededAxis.none, b.check());
+    b.recordTurn(0, 0, 0);
+    try testing.expectEqual(ExceededAxis.turns, b.check());
+}
+
+fn bumpTurnsWorker(b: *Budget, n: u64) void {
+    var i: u64 = 0;
+    while (i < n) : (i += 1) b.recordTurn(0, 0, 0);
+}
+
+test "Budget: concurrent turn bumps trip the cap once observed" {
+    var b = Budget.init(.{ .turns = 250 });
+
+    const producers: usize = 4;
+    const per: u64 = 100;
+
+    var threads: [producers]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, bumpTurnsWorker, .{ &b, per });
+    for (threads) |t| t.join();
+
+    try testing.expectEqual(@as(u64, 400), b.snapshot().turns);
+    try testing.expectEqual(ExceededAxis.turns, b.check());
 }

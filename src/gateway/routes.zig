@@ -18,6 +18,12 @@ const harness = @import("../harness/root.zig");
 
 pub const Context = struct {
     runner: harness.AgentRunner,
+    /// Optional per-session budget consulted before each turn. When
+    /// populated, the turn handler rejects requests with 429 as soon
+    /// as any axis (turns / input_tokens / output_tokens / cost_micros)
+    /// hits its cap. Left null in tests that exercise the routing
+    /// surface without caring about budget policy.
+    budget: ?*harness.Budget = null,
 };
 
 /// Thread-local handler context. Zig does not expose a clean way to
@@ -165,6 +171,20 @@ fn sessionsTurnHandler(
 ) dispatcher.HandlerError!http.Response {
     const ctx = try contextOrInternal();
     const id = findParam(params, "id") orelse return error.BadRequest;
+
+    // Budget gate. This is a snapshot check — a concurrent streaming
+    // reader can push counters past a cap after we observe them, but
+    // the next turn will see the trip. The observable contract is
+    // "once the cap is hit, subsequent turns fail with 429 until the
+    // session is reset"; eventual consistency is enough for a spend
+    // safety net.
+    if (ctx.budget) |b| {
+        if (b.check() != .none) return .{
+            .status = .too_many_requests,
+            .headers = &json_headers,
+            .body = "{\"error\":\"budget_exceeded\"}",
+        };
+    }
 
     // The mock runner takes the session_id verbatim as its session
     // identifier and echoes the input back. Production will parse the
@@ -316,6 +336,28 @@ fn runTurn(runner: *harness.MockAgentRunner) anyerror!void {
 
 test "routes: POST /sessions/:id/turns round-trips the in-flight counter" {
     try withMockContext(runTurn);
+}
+
+test "routes: POST /sessions/:id/turns returns 429 when the budget is exhausted" {
+    var mock = harness.MockAgentRunner.init();
+    var budget = harness.Budget.init(.{ .turns = 1 });
+    budget.recordTurn(0, 0, 0);
+
+    var ctx: Context = .{ .runner = mock.runner(), .budget = &budget };
+    setContext(&ctx);
+    defer clearContext();
+
+    const req: http.Request = .{
+        .method = .POST,
+        .target = "/sessions/s1/turns",
+        .headers = &.{},
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    try testing.expectEqual(http.Status.too_many_requests, resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "budget_exceeded") != null);
+
+    // The runner must NOT have been called — in-flight stays at zero.
+    try testing.expect(mock.in_flight.isZero());
 }
 
 fn runTurnSse(runner: *harness.MockAgentRunner) anyerror!void {
