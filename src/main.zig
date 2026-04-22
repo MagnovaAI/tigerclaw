@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cli = @import("cli/root.zig");
 
 pub fn main(init: std.process.Init) !u8 {
@@ -28,11 +29,25 @@ pub fn main(init: std.process.Init) !u8 {
             try cli.printHelp(&stderr_w.interface);
             return 64;
         },
+        error.CompletionMissingShell => {
+            try stderr_w.interface.writeAll("tigerclaw: completion requires a shell (bash|zsh|fish)\n");
+            return 64;
+        },
+        error.CompletionUnknownShell => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown completion shell; expected bash|zsh|fish\n");
+            return 64;
+        },
     };
 
     switch (cmd) {
         .version => try cli.printVersion(&stdout_w.interface),
         .help => try cli.printHelp(&stdout_w.interface),
+        .doctor => try runDoctor(arena, init.environ_map, &stdout_w.interface),
+        .completion => |shell| try cli.commands.completion.write(
+            &stdout_w.interface,
+            shell,
+            &cli.command_table,
+        ),
         .unknown => |flag| {
             try stderr_w.interface.print("tigerclaw: unknown option '{s}'\n\n", .{flag});
             try cli.printHelp(&stderr_w.interface);
@@ -40,6 +55,21 @@ pub fn main(init: std.process.Init) !u8 {
         },
     }
     return 0;
+}
+
+fn runDoctor(
+    arena: std.mem.Allocator,
+    environ_map: *std.process.Environ.Map,
+    w: *std.Io.Writer,
+) !void {
+    try cli.commands.doctor.writeReport(arena, w, .{
+        .zig_version = builtin.zig_version_string,
+        .os_tag = @tagName(builtin.target.os.tag),
+        .arch_tag = @tagName(builtin.target.cpu.arch),
+        .env_config = environ_map.get("TIGERCLAW_CONFIG"),
+        .env_xdg = environ_map.get("XDG_CONFIG_HOME"),
+        .env_home = environ_map.get("HOME"),
+    });
 }
 
 test {

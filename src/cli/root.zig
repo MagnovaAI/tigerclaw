@@ -1,48 +1,45 @@
 //! CLI front door.
 //!
-//! Historically `src/cli.zig` owned argv parsing and help-text rendering
-//! as a flat if/else chain. This module keeps that public surface
-//! stable while moving the underlying machinery to a descriptor-driven
-//! dispatcher (`descriptor.zig`) and a presentation layer
-//! (`presentation.zig`). Concrete subcommands register into
-//! `command_table`; `parse` resolves argv[0] against the table and
-//! folds the result back into the legacy `Command` union so existing
-//! callers keep working.
-//!
-//! As verbs are ported over in later commits, they will attach real
-//! handlers via the descriptor table instead of growing the union.
+//! Routes top-level argv into either a legacy `Command` union value
+//! (for verbs whose behaviour is inlined in `main.zig`) or a typed
+//! handler call site (for verbs implemented in `src/cli/commands/*`).
 
 const std = @import("std");
 const version = @import("../version.zig");
 
 pub const descriptor = @import("descriptor.zig");
 pub const presentation = @import("presentation.zig");
+pub const commands = struct {
+    pub const doctor = @import("commands/doctor.zig");
+    pub const completion = @import("commands/completion.zig");
+};
 
 pub const version_string = version.string;
 
 pub const Command = union(enum) {
     version,
     help,
+    doctor,
+    completion: commands.completion.Shell,
     unknown: []const u8,
 };
 
 pub const ParseError = error{
     MissingCommand,
+    CompletionMissingShell,
+    CompletionUnknownShell,
 };
 
-/// Top-level command table. Kept minimal while individual verbs live
-/// in the legacy `Command` union; later commits grow this directly.
+/// Top-level command table. Summaries feed the help screen and shell
+/// completion generators.
 pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
+    .{ .name = "doctor", .summary = "Print a short environment report" },
+    .{ .name = "completion", .summary = "Print a shell completion script (bash|zsh|fish)" },
 };
 
 /// Parse argv[1..]. `argv` must not include the program name.
-///
-/// Legacy flag forms (`--version`, `-V`, `--help`, `-h`) are normalised
-/// into the same `Command` values the dispatcher produces for the
-/// equivalent verbs. Anything else falls through to `.unknown` so the
-/// caller can print a usage error with the offending token.
 pub fn parse(argv: []const []const u8) ParseError!Command {
     if (argv.len == 0) return error.MissingCommand;
 
@@ -62,11 +59,13 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
 
     if (std.mem.eql(u8, match.descriptor.name, "version")) return .version;
     if (std.mem.eql(u8, match.descriptor.name, "help")) return .help;
+    if (std.mem.eql(u8, match.descriptor.name, "doctor")) return .doctor;
+    if (std.mem.eql(u8, match.descriptor.name, "completion")) {
+        if (match.argv.len < 2) return error.CompletionMissingShell;
+        const shell = commands.completion.parseShell(match.argv[1]) catch return error.CompletionUnknownShell;
+        return .{ .completion = shell };
+    }
 
-    // A descriptor with no legacy mapping means the verb is expected
-    // to have its own handler attached; today there are none. Fall
-    // through to `.unknown` so callers surface a clear error rather
-    // than silently accepting the token.
     return .{ .unknown = first };
 }
 
@@ -131,6 +130,27 @@ test "parse: help verb via descriptor table" {
     try testing.expectEqual(Command.help, try parse(&argv));
 }
 
+test "parse: doctor verb via descriptor table" {
+    const argv = [_][]const u8{"doctor"};
+    try testing.expectEqual(Command.doctor, try parse(&argv));
+}
+
+test "parse: completion bash → Command.completion{.bash}" {
+    const argv = [_][]const u8{ "completion", "bash" };
+    const cmd = try parse(&argv);
+    try testing.expectEqual(commands.completion.Shell.bash, cmd.completion);
+}
+
+test "parse: completion without shell returns CompletionMissingShell" {
+    const argv = [_][]const u8{"completion"};
+    try testing.expectError(error.CompletionMissingShell, parse(&argv));
+}
+
+test "parse: completion with unknown shell returns CompletionUnknownShell" {
+    const argv = [_][]const u8{ "completion", "tcsh" };
+    try testing.expectError(error.CompletionUnknownShell, parse(&argv));
+}
+
 test "parse: unknown token returns .unknown" {
     const argv = [_][]const u8{"--nope"};
     const cmd = try parse(&argv);
@@ -151,16 +171,16 @@ test "printVersion writes the expected string" {
     try testing.expectEqualStrings(expected, w.buffered());
 }
 
-test "printHelp: mentions banner, both flags, and both table verbs" {
-    var buf: [1024]u8 = undefined;
+test "printHelp: mentions banner, both flags, and the verbs in the table" {
+    var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try printHelp(&w);
     const out = w.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "tigerclaw — agent runtime") != null);
     try testing.expect(std.mem.indexOf(u8, out, "--version") != null);
     try testing.expect(std.mem.indexOf(u8, out, "--help") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "version") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "help") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "doctor") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "completion") != null);
 }
 
 test {
