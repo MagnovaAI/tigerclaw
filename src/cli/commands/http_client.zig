@@ -111,7 +111,7 @@ fn doFetch(
 ) Error!Response {
     const result = fetchOnce(client, req, body_out) catch |err| switch (err) {
         error.ConnectionRefused => blk: {
-            std.Io.sleep(io, opts.retry_delay_ns) catch {};
+            std.Io.sleep(io, std.Io.Duration.fromNanoseconds(@intCast(opts.retry_delay_ns)), .awake) catch {};
             break :blk fetchOnce(client, req, body_out) catch |retry_err| switch (retry_err) {
                 error.ConnectionRefused => return error.GatewayDown,
                 else => return classifyTransport(retry_err),
