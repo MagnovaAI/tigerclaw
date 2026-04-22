@@ -8,6 +8,7 @@ const std = @import("std");
 
 pub const router = @import("router.zig");
 pub const http = @import("http.zig");
+pub const dispatcher = @import("dispatcher.zig");
 
 pub const Method = router.Method;
 pub const Route = router.Route;
@@ -21,4 +22,5 @@ pub const Header = http.Header;
 test {
     std.testing.refAllDecls(@import("router.zig"));
     std.testing.refAllDecls(@import("http.zig"));
+    std.testing.refAllDecls(@import("dispatcher.zig"));
 }
