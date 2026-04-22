@@ -333,6 +333,49 @@ pub fn main(init: std.process.Init) !u8 {
                 error.OutOfMemory, error.WriteFailed => return e,
             };
         },
+        .uninstall => |a| {
+            // Resolve $HOME/.tigerclaw if the parser didn't get an
+            // override (it never does from argv; this is the prod
+            // path). Tests call run() directly with a tmpdir-backed
+            // state_dir.
+            var resolved = a;
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (resolved.state_dir == null) {
+                const home = init.environ_map.get("HOME") orelse "";
+                resolved.state_dir = try std.fmt.bufPrint(
+                    &path_buf,
+                    "{s}/.tigerclaw",
+                    .{home},
+                );
+            }
+
+            var stdin_buf: [256]u8 = undefined;
+            var stdin_r = std.Io.File.stdin().reader(io, &stdin_buf);
+
+            cli.commands.uninstall.run(
+                arena,
+                io,
+                resolved,
+                &stdin_r.interface,
+                &stdout_w.interface,
+                &stderr_w.interface,
+            ) catch |e| switch (e) {
+                error.Aborted => return 1,
+                error.PermissionDenied => {
+                    try stderr_w.interface.writeAll("tigerclaw: permission denied removing state directory\n");
+                    return 77;
+                },
+                error.StateRemovalFailed => {
+                    try stderr_w.interface.writeAll("tigerclaw: failed to remove state directory\n");
+                    return 1;
+                },
+                error.PromptReadFailed => {
+                    try stderr_w.interface.writeAll("tigerclaw: failed to read confirmation from stdin\n");
+                    return 1;
+                },
+                error.OutOfMemory, error.WriteFailed => return e,
+            };
+        },
         .unknown => |flag| {
             try stderr_w.interface.print("tigerclaw: unknown option '{s}'\n\n", .{flag});
             try cli.printHelp(&stderr_w.interface);

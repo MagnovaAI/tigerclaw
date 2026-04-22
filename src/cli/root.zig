@@ -25,6 +25,7 @@ pub const commands = struct {
     pub const providers = @import("commands/providers.zig");
     pub const models = @import("commands/models.zig");
     pub const diag = @import("commands/diag.zig");
+    pub const uninstall = @import("commands/uninstall.zig");
 };
 
 pub const version_string = version.string;
@@ -53,6 +54,7 @@ pub const Command = union(enum) {
     models: commands.models.Subcommand,
     diag: commands.diag.Subcommand,
     gateway_logs: commands.gateway.LogsOptions,
+    uninstall: commands.uninstall.Args,
     unknown: []const u8,
 };
 
@@ -95,6 +97,7 @@ pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "models", .summary = "List known models, show the default, override per session" },
     .{ .name = "diag", .summary = "Inspect recent diagnostic events" },
     .{ .name = "gateway", .summary = "Gateway daemon controls (logs in v0.1.0)" },
+    .{ .name = "uninstall", .summary = "Remove the binary and the local state directory" },
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
     .{ .name = "doctor", .summary = "Print a short environment report" },
@@ -206,6 +209,13 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
             .logs => |opts| return .{ .gateway_logs = opts },
             else => return .{ .unknown = "gateway" },
         }
+    }
+
+    if (std.mem.eql(u8, match.descriptor.name, "uninstall")) {
+        const a = commands.uninstall.parse(match.argv[1..]) catch |err| switch (err) {
+            error.UnknownFlag => return error.UnknownFlag,
+        };
+        return .{ .uninstall = a };
     }
 
     return .{ .unknown = first };
