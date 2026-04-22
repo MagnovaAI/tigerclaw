@@ -57,6 +57,18 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: channels telegram test requires --to and --text\n");
             return 64;
         },
+        error.CassetteMissingSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: cassette requires a subcommand (list|show|replay)\n");
+            return 64;
+        },
+        error.CassetteUnknownSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown cassette subcommand\n");
+            return 64;
+        },
+        error.CassetteMissingPath => {
+            try stderr_w.interface.writeAll("tigerclaw: cassette show/replay requires a path\n");
+            return 64;
+        },
     };
 
     switch (cmd) {
@@ -134,6 +146,18 @@ pub fn main(init: std.process.Init) !u8 {
                     try stderr_w.interface.writeAll("tigerclaw: request payload too large\n");
                     return 64;
                 },
+                error.OutOfMemory, error.WriteFailed => return err,
+            };
+        },
+        .cassette => |sub| {
+            cli.commands.cassette.run(
+                arena,
+                io,
+                sub,
+                &stdout_w.interface,
+                &stderr_w.interface,
+            ) catch |err| switch (err) {
+                error.DirNotFound, error.FileNotFound, error.InvalidCassette, error.ReadFailed => return 1,
                 error.OutOfMemory, error.WriteFailed => return err,
             };
         },
