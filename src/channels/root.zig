@@ -6,7 +6,9 @@
 const std = @import("std");
 
 pub const spec = @import("spec.zig");
+pub const dispatch = @import("dispatch.zig");
 
 test {
     std.testing.refAllDecls(@import("spec.zig"));
+    std.testing.refAllDecls(@import("dispatch.zig"));
 }
