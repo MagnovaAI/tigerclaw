@@ -47,6 +47,8 @@ const spec = @import("channels_spec");
 
 const clock_mod = @import("../clock.zig");
 const drain_mod = @import("../daemon/drain.zig");
+const settings_mod = @import("../settings/root.zig");
+const env_overrides = @import("../settings/env_overrides.zig");
 
 pub const Options = struct {
     address: std.Io.net.IpAddress,
@@ -77,6 +79,11 @@ pub const Options = struct {
     /// TCP server knobs. Threaded through unchanged so callers can
     /// tune request caps without wedging another Options layer in.
     serve_options: tcp_server.ServeOptions = .{},
+    /// Path to the settings file, relative to `state_root`. Read once
+    /// at init and re-read on every `/config/reload`. Missing or
+    /// malformed files do not abort startup — the runtime begins on
+    /// defaults and the reload path logs the failure.
+    config_path: []const u8 = "config.json",
 };
 
 pub const Boot = struct {
@@ -94,6 +101,21 @@ pub const Boot = struct {
     outbox: outbox_mod.Outbox,
     allowlist: allowlist_mod.Allowlist,
 
+    state_root: std.Io.Dir,
+    config_path: []const u8,
+    /// Live settings value. Overwritten by `rebuild`; readers never
+    /// touch this field directly — they go through `active_snapshot`
+    /// so the pointer swap is the only synchronisation point.
+    current_settings: settings_mod.Settings,
+    /// Every published snapshot, in publish order. Each `rebuild`
+    /// heap-allocates a fresh `SettingsSnapshot` and appends it here
+    /// before swapping `active_snapshot` to its address. The reason
+    /// old snapshots stick around until `deinit` is that an in-flight
+    /// request may still be reading one — without RCU / hazard
+    /// pointers we cannot free eagerly, and the memory cost is
+    /// trivial (one small struct per reload).
+    snapshots: std.array_list.Aligned(*routes.SettingsSnapshot, null),
+
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -106,6 +128,19 @@ pub const Boot = struct {
         errdefer allowlist.deinit();
 
         const outbox = outbox_mod.Outbox.init(io, opts.state_root, allocator, opts.clock);
+
+        const initial_settings = loadSettings(allocator, io, opts.state_root, opts.config_path) orelse
+            settings_mod.schema.defaultSettings();
+
+        var snapshots: std.array_list.Aligned(*routes.SettingsSnapshot, null) = .empty;
+        errdefer snapshots.deinit(allocator);
+        const initial_snap = try allocator.create(routes.SettingsSnapshot);
+        errdefer allocator.destroy(initial_snap);
+        initial_snap.* = .{
+            .settings = initial_settings,
+            .generation = routes.reload_generation.load(.monotonic),
+        };
+        try snapshots.append(allocator, initial_snap);
 
         var boot: Boot = .{
             .allocator = allocator,
@@ -120,15 +155,58 @@ pub const Boot = struct {
             .manager = undefined,
             .outbox = outbox,
             .allowlist = allowlist,
+            .state_root = opts.state_root,
+            .config_path = opts.config_path,
+            .current_settings = initial_settings,
+            .snapshots = snapshots,
         };
         boot.manager = manager_mod.Manager.init(allocator, io, &boot.dispatch);
         return boot;
+    }
+
+    /// Re-read the settings file and publish a fresh snapshot. Best
+    /// effort: a missing or malformed file leaves the previously
+    /// published snapshot in place so an operator typo can't knock the
+    /// daemon off a valid config. Called synchronously from the
+    /// reload handler before the generation bump, so the generation
+    /// the new snapshot stamps matches what the HTTP client observes
+    /// on the next `/health` poll.
+    pub fn rebuild(self: *Boot) void {
+        const next = loadSettings(self.allocator, self.io, self.state_root, self.config_path) orelse {
+            std.debug.print(
+                "gateway: config reload failed (missing or invalid {s}); keeping previous settings\n",
+                .{self.config_path},
+            );
+            return;
+        };
+
+        const snap = self.allocator.create(routes.SettingsSnapshot) catch {
+            std.debug.print("gateway: config reload out of memory; keeping previous settings\n", .{});
+            return;
+        };
+        // The generation stamped here matches the value external
+        // pollers will see on the next `/health`: the route handler
+        // bumps the counter immediately after this callback returns.
+        snap.* = .{
+            .settings = next,
+            .generation = routes.reload_generation.load(.monotonic) + 1,
+        };
+        self.snapshots.append(self.allocator, snap) catch {
+            self.allocator.destroy(snap);
+            std.debug.print("gateway: config reload out of memory; keeping previous settings\n", .{});
+            return;
+        };
+
+        self.current_settings = next;
+        routes.setActiveSnapshot(snap);
     }
 
     pub fn deinit(self: *Boot) void {
         self.manager.deinit();
         self.allowlist.deinit();
         self.dispatch.deinit();
+        for (self.snapshots.items) |s| self.allocator.destroy(s);
+        self.snapshots.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -143,6 +221,16 @@ pub const Boot = struct {
     /// shared flag. Blocks the caller's thread for the duration.
     pub fn run(self: *Boot, ctx: *routes.Context) !void {
         tcp_server.installShutdownHandlers();
+
+        // Publish the initial snapshot and wire the rebuild callback
+        // before taking the accept loop. Tests that exercise the route
+        // handler directly go through the same path, so the snapshot
+        // is always present for an in-flight request.
+        routes.setActiveSnapshot(self.snapshots.items[self.snapshots.items.len - 1]);
+        defer routes.clearActiveSnapshot();
+        ctx.reload_callback = bootRebuildAdapter;
+        ctx.reload_userdata = self;
+
         routes.setContext(ctx);
         defer routes.clearContext();
 
@@ -204,6 +292,41 @@ const DrainCtx = struct {
 fn isInFlightZero(raw: ?*anyopaque) bool {
     const ctx: *DrainCtx = @ptrCast(@alignCast(raw.?));
     return ctx.counter.isZero();
+}
+
+fn bootRebuildAdapter(userdata: ?*anyopaque) void {
+    const self: *Boot = @ptrCast(@alignCast(userdata.?));
+    self.rebuild();
+}
+
+/// Read `config_path` under `state_root` and parse into a Settings
+/// value. Returns null on any failure (missing file, I/O error, parse
+/// error, validation failure) so callers can treat every non-success
+/// outcome uniformly. `Settings` holds no allocator-backed slices, so
+/// copying the parsed value out of the parse arena is safe.
+fn loadSettings(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_root: std.Io.Dir,
+    config_path: []const u8,
+) ?settings_mod.Settings {
+    const file = state_root.openFile(io, config_path, .{ .mode = .read_only }) catch return null;
+    defer file.close(io);
+
+    const len = file.length(io) catch return null;
+    if (len == 0) return settings_mod.schema.defaultSettings();
+
+    const bytes = allocator.alloc(u8, @intCast(len)) catch return null;
+    defer allocator.free(bytes);
+
+    var r_buf: [1024]u8 = undefined;
+    var r = file.reader(io, &r_buf);
+    r.interface.readSliceAll(bytes) catch return null;
+
+    var env: env_overrides.MapLookup = .{ .entries = &.{} };
+    var report = settings_mod.loader.loadFromBytes(allocator, bytes, env.lookup()) catch return null;
+    defer report.deinit();
+    return report.value();
 }
 
 // --- tests -----------------------------------------------------------------
@@ -384,4 +507,91 @@ test "Boot init/deinit owns its dispatch, manager, allowlist" {
 
     var boot = try Boot.init(testing.allocator, testing.io, bootTestOptions(tmp.dir));
     boot.deinit();
+}
+
+test "Boot.rebuild republishes the snapshot as the config file changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Settings A — non-default values so we can tell A apart from the
+    // built-in defaults and from B.
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{"log_level":"warn","mode":"bench","max_tool_iterations":7,"max_history_messages":42,"monthly_budget_cents":1000}
+        ,
+    });
+
+    var boot = try Boot.init(testing.allocator, testing.io, bootTestOptions(tmp.dir));
+    defer boot.deinit();
+
+    routes.clearActiveSnapshot();
+    defer routes.clearActiveSnapshot();
+
+    const gen_before = routes.reload_generation.load(.monotonic);
+
+    boot.rebuild();
+
+    const snap_a = routes.activeSnapshot() orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(settings_mod.schema.LogLevel.warn, snap_a.settings.log_level);
+    try testing.expectEqual(settings_mod.schema.Mode.bench, snap_a.settings.mode);
+    try testing.expectEqual(@as(u32, 7), snap_a.settings.max_tool_iterations);
+    try testing.expectEqual(gen_before + 1, snap_a.generation);
+
+    // Overwrite with Settings B.
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{"log_level":"debug","mode":"run","max_tool_iterations":3,"max_history_messages":11,"monthly_budget_cents":50}
+        ,
+    });
+
+    // Simulate the HTTP handler's post-callback counter bump so the
+    // second rebuild stamps a strictly-greater generation, mirroring
+    // production ordering where `configReloadHandler` bumps after the
+    // callback returns.
+    _ = routes.reload_generation.fetchAdd(1, .monotonic);
+    boot.rebuild();
+
+    const snap_b = routes.activeSnapshot() orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(settings_mod.schema.LogLevel.debug, snap_b.settings.log_level);
+    try testing.expectEqual(@as(u32, 3), snap_b.settings.max_tool_iterations);
+    try testing.expect(snap_b.generation > snap_a.generation);
+}
+
+test "Boot.rebuild leaves the previous snapshot alone on malformed config" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"log_level\":\"warn\",\"max_tool_iterations\":5}",
+    });
+
+    var boot = try Boot.init(testing.allocator, testing.io, bootTestOptions(tmp.dir));
+    defer boot.deinit();
+
+    routes.clearActiveSnapshot();
+    defer routes.clearActiveSnapshot();
+
+    boot.rebuild();
+    const good = routes.activeSnapshot() orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(settings_mod.schema.LogLevel.warn, good.settings.log_level);
+    const good_ptr = good;
+    const good_gen = good.generation;
+    const good_level = good.settings.log_level;
+
+    // Now corrupt the file. The reload should log (to stderr via
+    // std.debug.print) and leave `active_snapshot` pointing at the
+    // same snapshot object with the same contents.
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "config.json",
+        .data = "{not json at all",
+    });
+
+    boot.rebuild();
+    const after = routes.activeSnapshot() orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(good_ptr, after);
+    try testing.expectEqual(good_gen, after.generation);
+    try testing.expectEqual(good_level, after.settings.log_level);
 }
