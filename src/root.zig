@@ -15,6 +15,7 @@ pub const determinism = @import("determinism.zig");
 pub const entrypoints = @import("entrypoints/root.zig");
 pub const errors = @import("errors.zig");
 pub const eval = @import("eval/root.zig");
+pub const gateway = @import("gateway/root.zig");
 pub const globals = @import("globals.zig");
 pub const harness = @import("harness/root.zig");
 pub const llm = @import("llm/root.zig");
