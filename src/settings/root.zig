@@ -14,6 +14,10 @@ pub const env_overrides = @import("env_overrides.zig");
 pub const cache = @import("cache.zig");
 pub const apply_change = @import("apply_change.zig");
 pub const loader = @import("settings.zig");
+pub const internal_writes = @import("internal_writes.zig");
+pub const change_detector = @import("change_detector.zig");
+pub const secrets = @import("secrets.zig");
+pub const mdm = @import("mdm.zig");
 
 pub const Settings = schema.Settings;
 pub const LogLevel = schema.LogLevel;
@@ -28,4 +32,8 @@ test {
     std.testing.refAllDecls(@import("cache.zig"));
     std.testing.refAllDecls(@import("apply_change.zig"));
     std.testing.refAllDecls(@import("settings.zig"));
+    std.testing.refAllDecls(@import("internal_writes.zig"));
+    std.testing.refAllDecls(@import("change_detector.zig"));
+    std.testing.refAllDecls(@import("secrets.zig"));
+    std.testing.refAllDecls(@import("mdm.zig"));
 }
