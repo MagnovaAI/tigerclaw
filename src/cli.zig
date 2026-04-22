@@ -4,8 +4,9 @@
 //! `doctor`, `list`, etc.) are added as entrypoints land.
 
 const std = @import("std");
+const version = @import("version.zig");
 
-pub const version_string = "0.0.0";
+pub const version_string = version.string;
 
 pub const Command = union(enum) {
     version,
@@ -92,7 +93,9 @@ test "printVersion writes the expected string" {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try printVersion(&w);
-    try testing.expectEqualStrings("tigerclaw 0.0.0\n", w.buffered());
+    var expected_buf: [64]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, "tigerclaw {s}\n", .{version.string});
+    try testing.expectEqualStrings(expected, w.buffered());
 }
 
 test "printHelp starts with the expected banner and mentions both flags" {

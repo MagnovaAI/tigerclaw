@@ -6,3 +6,9 @@
 //! each other.
 
 pub const cli = @import("cli.zig");
+pub const clock = @import("clock.zig");
+pub const determinism = @import("determinism.zig");
+pub const errors = @import("errors.zig");
+pub const globals = @import("globals.zig");
+pub const log = @import("log.zig");
+pub const version = @import("version.zig");

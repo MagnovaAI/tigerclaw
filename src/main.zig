@@ -43,6 +43,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 test {
-    // Pull in tests from cli.zig so `zig build test` (rooted at main.zig) sees them.
-    std.testing.refAllDecls(@import("cli.zig"));
+    // Pull in tests from the library surface so `zig build test`
+    // (rooted at main.zig) sees all of them.
+    std.testing.refAllDecls(@import("root.zig"));
 }
