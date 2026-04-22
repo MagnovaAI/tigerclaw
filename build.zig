@@ -4,6 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The `tigerclaw` library module is built once and reused by the
+    // executable, the unit-test runner, and every integration test. This
+    // lets `tests/*_test.zig` say `@import("tigerclaw")` to reach the
+    // library surface.
+    const tigerclaw_mod = b.addModule("tigerclaw", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "tigerclaw",
         .root_module = b.createModule(.{
@@ -33,18 +43,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
     // Integration / contract / e2e tests: each entry in `integration_tests`
-    // is a tests/<name>_test.zig file compiled as its own test binary.
-    // When adding a new integration test, add its filename (sans .zig) here.
-    const integration_tests: []const []const u8 = &.{};
+    // is a tests/<name>.zig file compiled as its own test binary with the
+    // `tigerclaw` module available for import.
+    const integration_tests: []const []const u8 = &.{
+        "settings_schema_test",
+    };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});
-        const t = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(rel),
-                .target = target,
-                .optimize = optimize,
-            }),
+        const mod = b.createModule(.{
+            .root_source_file = b.path(rel),
+            .target = target,
+            .optimize = optimize,
         });
+        mod.addImport("tigerclaw", tigerclaw_mod);
+        const t = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 }
