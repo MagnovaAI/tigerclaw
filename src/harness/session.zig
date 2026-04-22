@@ -37,9 +37,11 @@ pub const Turn = turn_mod.Turn;
 /// errors surface directly from the standard library; we only add one
 /// semantic code of our own.
 pub const ResumeError = error{
-    /// The loaded file's `schema_version` is newer than the running
-    /// binary understands. Callers should prompt the user to upgrade
-    /// rather than silently dropping fields.
+    /// The loaded file's `schema_version` does not match what this
+    /// binary writes. Older files require migration; newer files mean
+    /// the operator is running a downgraded binary. Either way we
+    /// refuse rather than silently reinterpret the layout. Callers
+    /// should surface `state_mod.migrationHint()` to the user.
     UnsupportedSchemaVersion,
 };
 
@@ -84,7 +86,7 @@ pub const Session = struct {
         var parsed = try state_mod.parse(allocator, bytes);
         defer parsed.deinit();
 
-        if (parsed.value.schema_version > state_mod.schema_version) {
+        if (parsed.value.schema_version != state_mod.schema_version) {
             return ResumeError.UnsupportedSchemaVersion;
         }
 

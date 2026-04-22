@@ -13,11 +13,12 @@
 const std = @import("std");
 const types = @import("types");
 const turn_mod = @import("turn.zig");
+const channel_spec = @import("../channels/spec.zig");
 
-/// Current on-disk schema version. Bump only on breaking layout changes;
-/// additive fields do not require a bump because `std.json` ignores
-/// unknown members when `ignore_unknown_fields = true`.
-pub const schema_version: u32 = 1;
+/// Current on-disk schema version. Bump on every breaking layout change.
+/// Files stamped with a different version are rejected at resume time —
+/// the runtime never silently drops fields, nor reads ambiguous layouts.
+pub const schema_version: u32 = 2;
 
 /// Snapshot of a session as persisted to disk.
 ///
@@ -39,7 +40,27 @@ pub const State = struct {
     /// Ordered conversation history. Each turn bundles the user input and
     /// the assistant response that followed it.
     turns: []const turn_mod.Turn = &.{},
+    /// Originating channel, when this session was created by the
+    /// dispatch layer from an inbound human message. Null for sessions
+    /// started by the CLI or other in-process callers.
+    channel_id: ?channel_spec.ChannelId = null,
+    /// Routing key the dispatch layer used to map an inbound message
+    /// to this session. Paired with `channel_id`; null together or
+    /// both populated.
+    conversation_key: ?[]const u8 = null,
+    /// Optional thread/topic distinguisher within `conversation_key`.
+    /// Null when the channel is single-threaded or the session has no
+    /// channel origin.
+    thread_key: ?[]const u8 = null,
 };
+
+/// Human-readable hint emitted alongside `UnsupportedSchemaVersion` so
+/// operators know their options. Kept as a static string so callers can
+/// print it without allocating.
+pub fn migrationHint() []const u8 {
+    return "session state on disk uses schema v1; v2 is required. " ++
+        "delete `state.json` to reset, or run `tigerclaw sessions migrate` (not yet implemented).";
+}
 
 /// Serialise `state` to `writer` as pretty-printed JSON.
 pub fn writeJson(state: State, writer: *std.Io.Writer) !void {
@@ -104,7 +125,7 @@ test "State: JSON roundtrip preserves identity and turns" {
 test "State: unknown fields are ignored on load" {
     const bytes =
         \\{
-        \\  "schema_version": 1,
+        \\  "schema_version": 2,
         \\  "id": "s1",
         \\  "turn_count": 0,
         \\  "created_at_ns": 0,
