@@ -105,14 +105,45 @@ pub const AnthropicProvider = struct {
 // ---------------------------------------------------------------------------
 // Stream-driven parsing (shared by literal and http paths)
 
-const StreamInput = union(enum) {
+pub const StreamInput = union(enum) {
     /// All bytes are already in memory; feed once.
     literal: []const u8,
     /// Pull bytes incrementally from this reader until EOF.
     reader: *std.Io.Reader,
 };
 
+/// Callback fired once per text delta as the stream is decoded. Slice
+/// is borrowed for the duration of the call only; copy if the sink
+/// needs to outlive the callback. `ctx` carries caller state — the
+/// gateway passes its SSE writer here so each token forwards to the
+/// HTTP client without buffering the full reply first.
+pub const TokenSink = *const fn (ctx: ?*anyopaque, token: []const u8) void;
+
 fn parseStream(allocator: std.mem.Allocator, input: StreamInput) !ChatResponse {
+    return parseStreamInner(allocator, input, null, null);
+}
+
+/// Same as the internal `parseStream` but invokes `sink(ctx, token)` for
+/// every text delta seen on a `content_block_delta` event. The full
+/// reply is still accumulated and returned in the final `ChatResponse`
+/// so callers that only want streaming side effects can ignore it. On
+/// an `error` event the sink is NOT invoked with the error message —
+/// it still surfaces in `ChatResponse.text` as the final refusal.
+pub fn streamTokens(
+    allocator: std.mem.Allocator,
+    input: StreamInput,
+    sink: TokenSink,
+    sink_ctx: ?*anyopaque,
+) !ChatResponse {
+    return parseStreamInner(allocator, input, sink, sink_ctx);
+}
+
+fn parseStreamInner(
+    allocator: std.mem.Allocator,
+    input: StreamInput,
+    sink: ?TokenSink,
+    sink_ctx: ?*anyopaque,
+) !ChatResponse {
     var parser = transport.sse.Parser.init();
     defer parser.deinit(allocator);
 
@@ -138,7 +169,12 @@ fn parseStream(allocator: std.mem.Allocator, input: StreamInput) !ChatResponse {
 
     while (try parser.nextEvent(allocator)) |ev| {
         if (std.mem.eql(u8, ev.name, "content_block_delta")) {
+            const before = text.items.len;
             try absorbDelta(allocator, &text, ev.data);
+            if (sink) |s| {
+                const fragment = text.items[before..];
+                if (fragment.len > 0) s(sink_ctx, fragment);
+            }
         } else if (std.mem.eql(u8, ev.name, "message_delta")) {
             try absorbMessageDelta(&usage, &stop, ev.data);
         } else if (std.mem.eql(u8, ev.name, "message_start")) {
@@ -595,4 +631,74 @@ test "anthropic: http error path surfaces refusal" {
     try testing.expectEqual(types.StopReason.refusal, resp.stop_reason);
     try testing.expect(resp.text != null);
     try testing.expect(std.mem.indexOf(u8, resp.text.?, "401") != null);
+}
+
+const TokenCollector = struct {
+    fragments: std.array_list.Aligned([]u8, null) = .empty,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *TokenCollector) void {
+        for (self.fragments.items) |f| self.allocator.free(f);
+        self.fragments.deinit(self.allocator);
+    }
+
+    fn appendCb(ctx: ?*anyopaque, token: []const u8) void {
+        const self: *TokenCollector = @ptrCast(@alignCast(ctx.?));
+        const owned = self.allocator.dupe(u8, token) catch return;
+        self.fragments.append(self.allocator, owned) catch {
+            self.allocator.free(owned);
+        };
+    }
+};
+
+test "anthropic: streamTokens fires sink per content_block_delta and accumulates final text" {
+    const stream =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"lo \"}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n" ++
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" ++
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    var collector: TokenCollector = .{ .allocator = testing.allocator };
+    defer collector.deinit();
+
+    const resp = try streamTokens(
+        testing.allocator,
+        .{ .literal = stream },
+        TokenCollector.appendCb,
+        &collector,
+    );
+    defer if (resp.text) |t| testing.allocator.free(t);
+
+    try testing.expectEqual(@as(usize, 3), collector.fragments.items.len);
+    try testing.expectEqualStrings("Hel", collector.fragments.items[0]);
+    try testing.expectEqualStrings("lo ", collector.fragments.items[1]);
+    try testing.expectEqualStrings("world", collector.fragments.items[2]);
+
+    try testing.expectEqualStrings("Hello world", resp.text.?);
+    try testing.expectEqual(@as(u32, 7), resp.usage.input);
+    try testing.expectEqual(@as(u32, 3), resp.usage.output);
+    try testing.expectEqual(types.StopReason.end_turn, resp.stop_reason);
+}
+
+test "anthropic: streamTokens does not invoke sink on error events" {
+    const stream =
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"slow down\"}}\n\n";
+
+    var collector: TokenCollector = .{ .allocator = testing.allocator };
+    defer collector.deinit();
+
+    const resp = try streamTokens(
+        testing.allocator,
+        .{ .literal = stream },
+        TokenCollector.appendCb,
+        &collector,
+    );
+    defer if (resp.text) |t| testing.allocator.free(t);
+
+    try testing.expectEqual(@as(usize, 0), collector.fragments.items.len);
+    try testing.expectEqual(types.StopReason.refusal, resp.stop_reason);
+    try testing.expect(resp.text != null);
+    try testing.expect(std.mem.indexOf(u8, resp.text.?, "slow down") != null);
 }
