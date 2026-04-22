@@ -11,6 +11,7 @@ pub const token_estimator = @import("token_estimator.zig");
 pub const providers = @import("providers/root.zig");
 pub const transport = @import("transport/root.zig");
 pub const routing = @import("routing/root.zig");
+pub const reliability = @import("reliability/root.zig");
 
 pub const Provider = provider.Provider;
 pub const ChatRequest = provider.ChatRequest;
@@ -26,4 +27,5 @@ test {
     std.testing.refAllDecls(@import("providers/root.zig"));
     std.testing.refAllDecls(@import("transport/root.zig"));
     std.testing.refAllDecls(@import("routing/root.zig"));
+    std.testing.refAllDecls(@import("reliability/root.zig"));
 }
