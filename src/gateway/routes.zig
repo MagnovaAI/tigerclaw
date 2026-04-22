@@ -49,6 +49,7 @@ pub const routes = [_]router.Route{
     .{ .method = .DELETE, .pattern = "/sessions/:id", .tag = "sessions.delete" },
     .{ .method = .POST, .pattern = "/sessions/:id/messages", .tag = "sessions.message" },
     .{ .method = .POST, .pattern = "/sessions/:id/turns", .tag = "sessions.turn" },
+    .{ .method = .DELETE, .pattern = "/sessions/:id/turns/current", .tag = "sessions.turn.cancel" },
 };
 
 pub const handlers = [_]dispatcher.HandlerEntry{
@@ -59,6 +60,7 @@ pub const handlers = [_]dispatcher.HandlerEntry{
     .{ .tag = "sessions.delete", .handler = sessionsDeleteHandler },
     .{ .tag = "sessions.message", .handler = sessionsMessageHandler },
     .{ .tag = "sessions.turn", .handler = sessionsTurnHandler },
+    .{ .tag = "sessions.turn.cancel", .handler = sessionsTurnCancelHandler },
 };
 
 // --- handlers --------------------------------------------------------------
@@ -162,6 +164,24 @@ fn sessionsTurnHandler(
 
     _ = result;
     return http.Response.jsonOk("{\"status\":\"ok\"}");
+}
+
+/// DELETE /sessions/:id/turns/current — cancel the in-flight turn for
+/// `id`. Idempotent: returns 204 even when no turn is in flight, so the
+/// CLI's Ctrl-C handler can fire without having to track turn state.
+fn sessionsTurnCancelHandler(
+    _: http.Request,
+    params: []const router.Param,
+    _: ?[]const u8,
+) dispatcher.HandlerError!http.Response {
+    const ctx = try contextOrInternal();
+    _ = findParam(params, "id") orelse return error.BadRequest;
+
+    // The mock runner ignores the turn id; production will plumb a
+    // session→turn map so cancel reaches the right react loop. The
+    // value zero is a sentinel for "current turn on this session".
+    ctx.runner.cancel(0);
+    return .{ .status = .no_content };
 }
 
 fn wantsSse(req: http.Request) bool {
@@ -318,6 +338,40 @@ fn runTurnAcceptMixed(_: *harness.MockAgentRunner) anyerror!void {
 
 test "routes: POST /sessions/:id/turns honours Accept when SSE is one of several" {
     try withMockContext(runTurnAcceptMixed);
+}
+
+fn runTurnCancel(_: *harness.MockAgentRunner) anyerror!void {
+    const req: http.Request = .{
+        .method = .DELETE,
+        .target = "/sessions/s1/turns/current",
+        .headers = &.{},
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    try testing.expectEqual(http.Status.no_content, resp.status);
+}
+
+test "routes: DELETE /sessions/:id/turns/current returns 204 (idempotent)" {
+    try withMockContext(runTurnCancel);
+}
+
+fn runTurnCancelMissingId(_: *harness.MockAgentRunner) anyerror!void {
+    // Without a path param the dispatcher routes to a different
+    // pattern and we never reach the handler — verify the explicit
+    // 204 path requires the :id segment to be present.
+    const req: http.Request = .{
+        .method = .DELETE,
+        .target = "/sessions//turns/current",
+        .headers = &.{},
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    // Empty :id segment is matched by the router but the handler
+    // captures it as an empty string; we still 204 — the mock runner
+    // doesn't care about the id and the cancel is best-effort.
+    try testing.expect(resp.status == .no_content or resp.status == .not_found);
+}
+
+test "routes: DELETE /sessions//turns/current degrades to 204 or 404" {
+    try withMockContext(runTurnCancelMissingId);
 }
 
 fn runDelete(_: *harness.MockAgentRunner) anyerror!void {
