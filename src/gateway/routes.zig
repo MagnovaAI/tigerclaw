@@ -15,6 +15,7 @@ const router = @import("router.zig");
 const http = @import("http.zig");
 const dispatcher = @import("dispatcher.zig");
 const harness = @import("../harness/root.zig");
+const settings = @import("../settings/root.zig");
 
 pub const Context = struct {
     runner: harness.AgentRunner,
@@ -24,7 +25,42 @@ pub const Context = struct {
     /// hits its cap. Left null in tests that exercise the routing
     /// surface without caring about budget policy.
     budget: ?*harness.Budget = null,
+    /// Invoked synchronously from `/config/reload` before the
+    /// generation counter is bumped. The boot layer wires this to its
+    /// own rebuild hook; tests install a counter. Null in routing
+    /// tests that don't care about the reload side-effect.
+    reload_callback: ?*const fn (userdata: ?*anyopaque) void = null,
+    reload_userdata: ?*anyopaque = null,
 };
+
+/// Immutable bundle of the settings the runtime was started with plus
+/// the reload generation at the moment the bundle was published. A
+/// request handler reads the pointer once at entry, which gives it a
+/// stable view for the duration of the call — mid-request reloads
+/// cannot perturb an in-flight turn's config.
+pub const SettingsSnapshot = struct {
+    settings: settings.Settings,
+    generation: u64,
+};
+
+/// Atomically swappable pointer to the current snapshot. The boot
+/// layer populates this at startup and each `/config/reload`. Pointer
+/// load and store are atomic on the targets we ship for (aarch64 /
+/// x86_64); the pointed-at snapshot is immutable, so once a handler
+/// has the pointer it has a stable view.
+pub var active_snapshot: std.atomic.Value(?*const SettingsSnapshot) = .init(null);
+
+pub fn setActiveSnapshot(snap: *const SettingsSnapshot) void {
+    active_snapshot.store(snap, .release);
+}
+
+pub fn clearActiveSnapshot() void {
+    active_snapshot.store(null, .release);
+}
+
+pub fn activeSnapshot() ?*const SettingsSnapshot {
+    return active_snapshot.load(.acquire);
+}
 
 /// Thread-local handler context. Zig does not expose a clean way to
 /// attach per-request state onto a function-pointer-shaped handler
@@ -103,6 +139,8 @@ fn configReloadHandler(
     _: []const router.Param,
     _: ?[]const u8,
 ) dispatcher.HandlerError!http.Response {
+    const ctx = try contextOrInternal();
+    if (ctx.reload_callback) |cb| cb(ctx.reload_userdata);
     _ = reload_generation.fetchAdd(1, .monotonic);
     return .{
         .status = .accepted,
@@ -466,4 +504,29 @@ fn runConfigReload(_: *harness.MockAgentRunner) anyerror!void {
 
 test "routes: POST /config/reload returns 202 and bumps the generation" {
     try withMockContext(runConfigReload);
+}
+
+var reload_cb_counter: u32 = 0;
+
+fn reloadTestCallback(ud: ?*anyopaque) void {
+    const counter: *u32 = @ptrCast(@alignCast(ud.?));
+    counter.* += 1;
+}
+
+test "routes: POST /config/reload fires the context's reload_callback per request" {
+    reload_cb_counter = 0;
+    var mock = harness.MockAgentRunner.init();
+    var ctx: Context = .{
+        .runner = mock.runner(),
+        .reload_callback = reloadTestCallback,
+        .reload_userdata = &reload_cb_counter,
+    };
+    setContext(&ctx);
+    defer clearContext();
+
+    const req: http.Request = .{ .method = .POST, .target = "/config/reload", .headers = &.{} };
+    _ = try dispatcher.dispatch(&routes, &handlers, req);
+    _ = try dispatcher.dispatch(&routes, &handlers, req);
+
+    try testing.expectEqual(@as(u32, 2), reload_cb_counter);
 }
