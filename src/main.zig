@@ -89,6 +89,30 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: models set requires a <model> argument\n");
             return 64;
         },
+        error.DiagMissingSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: diag requires a subcommand (tail|show)\n");
+            return 64;
+        },
+        error.DiagUnknownSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown diag subcommand\n");
+            return 64;
+        },
+        error.DiagMissingEventId => {
+            try stderr_w.interface.writeAll("tigerclaw: diag show requires an <event-id> argument\n");
+            return 64;
+        },
+        error.DiagInvalidLineCount => {
+            try stderr_w.interface.writeAll("tigerclaw: diag --lines requires a non-negative integer\n");
+            return 64;
+        },
+        error.GatewayLogsInvalidTailCount => {
+            try stderr_w.interface.writeAll("tigerclaw: gateway logs --tail requires a non-negative integer\n");
+            return 64;
+        },
+        error.GatewayLogsConflictingFlags => {
+            try stderr_w.interface.writeAll("tigerclaw: gateway logs: conflicting flags\n");
+            return 64;
+        },
     };
 
     switch (cmd) {
@@ -230,6 +254,59 @@ pub fn main(init: std.process.Init) !u8 {
                     return 64;
                 },
                 error.OutOfMemory, error.WriteFailed => return err,
+            };
+        },
+        .diag => |sub| {
+            // Resolve $HOME → ~/.tigerclaw/state/diagnostics.jsonl and
+            // inject it as the path override. We do the path build in
+            // main so the diag command itself stays a pure reader with
+            // no environment coupling — which also makes it trivially
+            // testable.
+            var resolved = sub;
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const home = init.environ_map.get("HOME") orelse "";
+            const default_path = try std.fmt.bufPrint(
+                &path_buf,
+                "{s}/.tigerclaw/state/diagnostics.jsonl",
+                .{home},
+            );
+            switch (resolved) {
+                .tail => |*a| {
+                    if (a.path == null) a.path = default_path;
+                },
+                .show => |*a| {
+                    if (a.path == null) a.path = default_path;
+                },
+            }
+            cli.commands.diag.run(
+                arena,
+                io,
+                resolved,
+                &stdout_w.interface,
+                &stderr_w.interface,
+            ) catch |e| switch (e) {
+                error.NotFound, error.FileReadFailed => return 1,
+                error.OutOfMemory, error.WriteFailed => return e,
+            };
+        },
+        .gateway_logs => |opts| {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const home = init.environ_map.get("HOME") orelse "";
+            const path = try std.fmt.bufPrint(
+                &path_buf,
+                "{s}/.tigerclaw/logs/gateway.log",
+                .{home},
+            );
+            if (opts.follow) cli.commands.gateway.installInterruptHandler();
+            const tail_n: u32 = if (opts.tail == 0) 200 else opts.tail;
+            cli.commands.gateway.runLogs(arena, io, .{
+                .path = path,
+                .follow = opts.follow,
+                .tail = tail_n,
+            }, &stdout_w.interface, &stderr_w.interface) catch |e| switch (e) {
+                error.Interrupted => return 130,
+                error.FileReadFailed => return 1,
+                error.OutOfMemory, error.WriteFailed => return e,
             };
         },
         .unknown => |flag| {

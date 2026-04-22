@@ -23,6 +23,7 @@ pub const commands = struct {
     pub const cassette = @import("commands/cassette.zig");
     pub const providers = @import("commands/providers.zig");
     pub const models = @import("commands/models.zig");
+    pub const diag = @import("commands/diag.zig");
 };
 
 pub const version_string = version.string;
@@ -48,6 +49,8 @@ pub const Command = union(enum) {
     cassette: commands.cassette.Subcommand,
     providers: commands.providers.Subcommand,
     models: commands.models.Subcommand,
+    diag: commands.diag.Subcommand,
+    gateway_logs: commands.gateway.LogsOptions,
     unknown: []const u8,
 };
 
@@ -68,6 +71,12 @@ pub const ParseError = error{
     ModelsMissingSubcommand,
     ModelsUnknownSubcommand,
     ModelsMissingModel,
+    DiagMissingSubcommand,
+    DiagUnknownSubcommand,
+    DiagMissingEventId,
+    DiagInvalidLineCount,
+    GatewayLogsInvalidTailCount,
+    GatewayLogsConflictingFlags,
 };
 
 /// Top-level command table. Summaries feed the help screen and shell
@@ -78,6 +87,8 @@ pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "channels", .summary = "List, inspect, and probe configured channels" },
     .{ .name = "providers", .summary = "List LLM providers and probe reachability" },
     .{ .name = "models", .summary = "List known models, show the default, override per session" },
+    .{ .name = "diag", .summary = "Inspect recent diagnostic events" },
+    .{ .name = "gateway", .summary = "Gateway daemon controls (logs in v0.1.0)" },
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
     .{ .name = "doctor", .summary = "Print a short environment report" },
@@ -151,6 +162,34 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
             error.MissingPositional => return error.ModelsMissingModel,
         };
         return .{ .models = sub };
+    }
+    if (std.mem.eql(u8, match.descriptor.name, "diag")) {
+        const sub = commands.diag.parse(match.argv[1..]) catch |err| switch (err) {
+            error.MissingSubcommand => return error.DiagMissingSubcommand,
+            error.UnknownSubcommand => return error.DiagUnknownSubcommand,
+            error.UnknownFlag => return error.UnknownFlag,
+            error.MissingFlagValue => return error.MissingFlagValue,
+            error.MissingEventId => return error.DiagMissingEventId,
+            error.InvalidLineCount => return error.DiagInvalidLineCount,
+        };
+        return .{ .diag = sub };
+    }
+    if (std.mem.eql(u8, match.descriptor.name, "gateway")) {
+        // v0.1.0 only wires up the `logs` sub-verb from the CLI. The
+        // daemon control verbs (start/stop/status/restart/serve) are
+        // parsed by `commands.gateway.parse` but not yet dispatched
+        // from main — flag them as unknown so users aren't misled.
+        const verb = commands.gateway.parse(match.argv[1..]) catch |err| switch (err) {
+            error.MissingSubVerb, error.UnknownSubVerb => return .{ .unknown = "gateway" },
+            error.UnknownFlag => return error.UnknownFlag,
+            error.MissingFlagValue => return error.MissingFlagValue,
+            error.InvalidTailCount => return error.GatewayLogsInvalidTailCount,
+            error.ConflictingFlags => return error.GatewayLogsConflictingFlags,
+        };
+        switch (verb) {
+            .logs => |opts| return .{ .gateway_logs = opts },
+            else => return .{ .unknown = "gateway" },
+        }
     }
 
     return .{ .unknown = first };
