@@ -13,5 +13,6 @@ pub const errors = @import("errors.zig");
 pub const globals = @import("globals.zig");
 pub const log = @import("log.zig");
 pub const settings = @import("settings/root.zig");
+pub const trace = @import("trace/root.zig");
 pub const types = @import("types/root.zig");
 pub const version = @import("version.zig");
