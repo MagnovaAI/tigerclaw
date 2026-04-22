@@ -69,6 +69,18 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: cassette show/replay requires a path\n");
             return 64;
         },
+        error.TraceMissingSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: trace requires a subcommand (list|show|diff)\n");
+            return 64;
+        },
+        error.TraceUnknownSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown trace subcommand\n");
+            return 64;
+        },
+        error.TraceMissingPath => {
+            try stderr_w.interface.writeAll("tigerclaw: trace show requires a path; trace diff requires two paths\n");
+            return 64;
+        },
         error.ProvidersMissingSubcommand => {
             try stderr_w.interface.writeAll("tigerclaw: providers requires a subcommand (list|status)\n");
             return 64;
@@ -217,6 +229,18 @@ pub fn main(init: std.process.Init) !u8 {
                 &stderr_w.interface,
             ) catch |err| switch (err) {
                 error.DirNotFound, error.FileNotFound, error.InvalidCassette, error.ReadFailed => return 1,
+                error.OutOfMemory, error.WriteFailed => return err,
+            };
+        },
+        .trace => |sub| {
+            cli.commands.trace.run(
+                arena,
+                io,
+                sub,
+                &stdout_w.interface,
+                &stderr_w.interface,
+            ) catch |err| switch (err) {
+                error.DirNotFound, error.FileNotFound, error.InvalidTrace, error.ReadFailed => return 1,
                 error.OutOfMemory, error.WriteFailed => return err,
             };
         },

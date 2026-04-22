@@ -21,6 +21,7 @@ pub const commands = struct {
     pub const agent = @import("commands/agent.zig");
     pub const channels = @import("commands/channels.zig");
     pub const cassette = @import("commands/cassette.zig");
+    pub const trace = @import("commands/trace.zig");
     pub const providers = @import("commands/providers.zig");
     pub const models = @import("commands/models.zig");
     pub const diag = @import("commands/diag.zig");
@@ -47,6 +48,7 @@ pub const Command = union(enum) {
     agent: AgentArgs,
     channels: commands.channels.Subcommand,
     cassette: commands.cassette.Subcommand,
+    trace: commands.trace.Subcommand,
     providers: commands.providers.Subcommand,
     models: commands.models.Subcommand,
     diag: commands.diag.Subcommand,
@@ -66,6 +68,9 @@ pub const ParseError = error{
     CassetteMissingSubcommand,
     CassetteUnknownSubcommand,
     CassetteMissingPath,
+    TraceMissingSubcommand,
+    TraceUnknownSubcommand,
+    TraceMissingPath,
     ProvidersMissingSubcommand,
     ProvidersUnknownSubcommand,
     ModelsMissingSubcommand,
@@ -85,6 +90,7 @@ pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "agent", .summary = "Stream a turn from the local gateway and render tokens" },
     .{ .name = "cassette", .summary = "Inspect and replay VCR cassettes" },
     .{ .name = "channels", .summary = "List, inspect, and probe configured channels" },
+    .{ .name = "trace", .summary = "List, inspect, and diff recorded traces" },
     .{ .name = "providers", .summary = "List LLM providers and probe reachability" },
     .{ .name = "models", .summary = "List known models, show the default, override per session" },
     .{ .name = "diag", .summary = "Inspect recent diagnostic events" },
@@ -152,6 +158,16 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
             error.MissingPath => return error.CassetteMissingPath,
         };
         return .{ .cassette = sub };
+    }
+    if (std.mem.eql(u8, match.descriptor.name, "trace")) {
+        const sub = commands.trace.parse(match.argv[1..]) catch |err| switch (err) {
+            error.MissingSubcommand => return error.TraceMissingSubcommand,
+            error.UnknownSubcommand => return error.TraceUnknownSubcommand,
+            error.UnknownFlag => return error.UnknownFlag,
+            error.MissingFlagValue => return error.MissingFlagValue,
+            error.MissingPath => return error.TraceMissingPath,
+        };
+        return .{ .trace = sub };
     }
     if (std.mem.eql(u8, match.descriptor.name, "models")) {
         const sub = commands.models.parse(match.argv[1..]) catch |err| switch (err) {
@@ -392,6 +408,23 @@ test "parse: cassette show <path> → Command.cassette{.show}" {
 test "parse: cassette with no subcommand → CassetteMissingSubcommand" {
     const argv = [_][]const u8{"cassette"};
     try testing.expectError(error.CassetteMissingSubcommand, parse(&argv));
+}
+
+test "parse: trace list → Command.trace{.list}" {
+    const argv = [_][]const u8{ "trace", "list" };
+    const cmd = try parse(&argv);
+    try testing.expectEqualStrings("~/.tigerclaw/traces", cmd.trace.list.dir);
+}
+
+test "parse: trace show <path> → Command.trace{.show}" {
+    const argv = [_][]const u8{ "trace", "show", "/tmp/x.jsonl" };
+    const cmd = try parse(&argv);
+    try testing.expectEqualStrings("/tmp/x.jsonl", cmd.trace.show.path);
+}
+
+test "parse: trace with no subcommand → TraceMissingSubcommand" {
+    const argv = [_][]const u8{"trace"};
+    try testing.expectError(error.TraceMissingSubcommand, parse(&argv));
 }
 
 test {
