@@ -1,0 +1,9 @@
+# tigerclaw.toml — project-level manifest (schema TBD)
+#
+# This file reserves the canonical location for project metadata that lives
+# outside of build.zig.zon (editor/tooling hints, agent configuration defaults,
+# scenario registries, etc.). The schema is not yet fixed and will be defined
+# alongside the settings subsystem.
+
+[project]
+name = "tigerclaw"

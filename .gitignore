@@ -1,9 +1,30 @@
+# Zig
 .zig-cache/
 zig-cache/
 zig-out/
-.DS_Store
 *.o
 *.a
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
 .env
 .env.local
+.env.*.local
+
+# Editors
+.idea/
+*.swp
+*.swo
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Node (for tooling only; not a runtime dep)
 node_modules/
+
+# Local agent workspaces
+.claude/
+runtime_sessions/

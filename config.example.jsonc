@@ -1,0 +1,8 @@
+// config.example.jsonc — reference config (schema TBD)
+//
+// The concrete schema lands with the settings subsystem. This file reserves
+// the canonical location and documents the layered precedence that settings
+// will follow: flag > env > file > default.
+{
+  // Placeholder. Fields will be documented as subsystems land.
+}
