@@ -60,6 +60,8 @@ pub fn build(b: *std.Build) void {
         "circuit_breaker_test",
         "fault_transport_test",
         "fault_policy_test",
+        "harness_test",
+        "session_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});

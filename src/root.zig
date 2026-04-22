@@ -11,6 +11,7 @@ pub const constants = @import("constants/root.zig");
 pub const determinism = @import("determinism.zig");
 pub const errors = @import("errors.zig");
 pub const globals = @import("globals.zig");
+pub const harness = @import("harness/root.zig");
 pub const llm = @import("llm/root.zig");
 pub const log = @import("log.zig");
 pub const settings = @import("settings/root.zig");
