@@ -10,12 +10,14 @@ pub const client = @import("client.zig");
 pub const token_estimator = @import("token_estimator.zig");
 pub const providers = @import("providers/root.zig");
 pub const transport = @import("transport/root.zig");
+pub const routing = @import("routing/root.zig");
 
 pub const Provider = provider.Provider;
 pub const ChatRequest = provider.ChatRequest;
 pub const ChatResponse = provider.ChatResponse;
 pub const Client = client.Client;
 pub const MockProvider = providers.MockProvider;
+pub const Router = routing.Router;
 
 test {
     std.testing.refAllDecls(@import("provider.zig"));
@@ -23,4 +25,5 @@ test {
     std.testing.refAllDecls(@import("token_estimator.zig"));
     std.testing.refAllDecls(@import("providers/root.zig"));
     std.testing.refAllDecls(@import("transport/root.zig"));
+    std.testing.refAllDecls(@import("routing/root.zig"));
 }
