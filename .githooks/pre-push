@@ -1,0 +1,10 @@
+#!/usr/bin/env sh
+# Blocks pushes when the full test suite fails.
+set -eu
+
+if ! command -v zig >/dev/null 2>&1; then
+    echo "pre-push: zig not on PATH; skipping test run"
+    exit 0
+fi
+
+zig build test --summary all

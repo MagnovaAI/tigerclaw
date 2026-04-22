@@ -1,0 +1,14 @@
+#!/usr/bin/env sh
+# Blocks commits whose staged files fail `zig fmt --check`.
+set -eu
+
+if ! command -v zig >/dev/null 2>&1; then
+    echo "pre-commit: zig not on PATH; skipping fmt check"
+    exit 0
+fi
+
+if ! zig fmt --check src/ tests/ build.zig; then
+    echo
+    echo "pre-commit: formatting check failed. Run 'zig fmt src/ tests/ build.zig' and retry."
+    exit 1
+fi

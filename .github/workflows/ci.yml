@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fmt-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: zig fmt --check
+        run: zig fmt --check src/ tests/ build.zig
+
+      - name: zig build
+        run: zig build
+
+      - name: zig build test
+        run: zig build test --summary all
