@@ -10,8 +10,10 @@ const std = @import("std");
 
 pub const pidfile = @import("pidfile.zig");
 pub const logfile = @import("logfile.zig");
+pub const drain = @import("drain.zig");
 
 test {
     std.testing.refAllDecls(@import("pidfile.zig"));
     std.testing.refAllDecls(@import("logfile.zig"));
+    std.testing.refAllDecls(@import("drain.zig"));
 }
