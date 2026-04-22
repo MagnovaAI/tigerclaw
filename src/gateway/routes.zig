@@ -41,8 +41,17 @@ fn contextOrInternal() dispatcher.HandlerError!*Context {
 
 // --- route table -----------------------------------------------------------
 
+/// Monotonic counter bumped every time `POST /config/reload` is
+/// accepted. External watchers (and a future in-process hot-reload)
+/// poll this to detect that a reload has been requested. The counter
+/// is process-wide because the route handler is stateless; the boot
+/// layer is the single writer of meaning here — it observes the
+/// change and decides what to do.
+pub var reload_generation: std.atomic.Value(u64) = .init(0);
+
 pub const routes = [_]router.Route{
     .{ .method = .GET, .pattern = "/health", .tag = "health" },
+    .{ .method = .POST, .pattern = "/config/reload", .tag = "config.reload" },
     .{ .method = .GET, .pattern = "/sessions", .tag = "sessions.list" },
     .{ .method = .POST, .pattern = "/sessions", .tag = "sessions.create" },
     .{ .method = .GET, .pattern = "/sessions/:id", .tag = "sessions.get" },
@@ -54,6 +63,7 @@ pub const routes = [_]router.Route{
 
 pub const handlers = [_]dispatcher.HandlerEntry{
     .{ .tag = "health", .handler = healthHandler },
+    .{ .tag = "config.reload", .handler = configReloadHandler },
     .{ .tag = "sessions.list", .handler = sessionsListHandler },
     .{ .tag = "sessions.create", .handler = sessionsCreateHandler },
     .{ .tag = "sessions.get", .handler = sessionsGetHandler },
@@ -74,6 +84,25 @@ fn healthHandler(
     // Surface the in-flight turn count so ops can watch drain.
     _ = ctx;
     return http.Response.jsonOk("{\"status\":\"ok\"}");
+}
+
+/// POST /config/reload — surface the wire shape for a hot-reload
+/// signal. This is a stub in v0.1.0: it bumps `reload_generation` and
+/// returns 202 so callers can confirm the request was accepted, but
+/// the process does not actually re-read settings or rebuild the
+/// channel manager yet. Wiring that up is a follow-up commit; here we
+/// pin the public surface so operators can script against it now.
+fn configReloadHandler(
+    _: http.Request,
+    _: []const router.Param,
+    _: ?[]const u8,
+) dispatcher.HandlerError!http.Response {
+    _ = reload_generation.fetchAdd(1, .monotonic);
+    return .{
+        .status = .accepted,
+        .headers = &json_headers,
+        .body = "{\"reload\":\"queued\"}",
+    };
 }
 
 fn sessionsListHandler(
@@ -382,4 +411,17 @@ fn runDelete(_: *harness.MockAgentRunner) anyerror!void {
 
 test "routes: DELETE /sessions/:id returns 204" {
     try withMockContext(runDelete);
+}
+
+fn runConfigReload(_: *harness.MockAgentRunner) anyerror!void {
+    const before = reload_generation.load(.monotonic);
+    const req: http.Request = .{ .method = .POST, .target = "/config/reload", .headers = &.{} };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    try testing.expectEqual(http.Status.accepted, resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"reload\":\"queued\"") != null);
+    try testing.expectEqual(before + 1, reload_generation.load(.monotonic));
+}
+
+test "routes: POST /config/reload returns 202 and bumps the generation" {
+    try withMockContext(runConfigReload);
 }

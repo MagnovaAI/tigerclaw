@@ -12,6 +12,7 @@ pub const dispatcher = @import("dispatcher.zig");
 pub const middleware = @import("middleware.zig");
 pub const routes = @import("routes.zig");
 pub const tcp_server = @import("tcp_server.zig");
+pub const boot = @import("boot.zig");
 
 pub const Method = router.Method;
 pub const Route = router.Route;
@@ -29,4 +30,5 @@ test {
     std.testing.refAllDecls(@import("middleware.zig"));
     std.testing.refAllDecls(@import("routes.zig"));
     std.testing.refAllDecls(@import("tcp_server.zig"));
+    std.testing.refAllDecls(@import("boot.zig"));
 }
