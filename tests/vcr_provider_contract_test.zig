@@ -154,60 +154,79 @@ fn recordCassette(
     var client: std.http.Client = .{ .allocator = a, .io = testing.io };
     defer client.deinit();
 
-    const target_info: struct {
-        url: []const u8,
-        method: std.http.Method,
-        body: []const u8,
-        auth_header: std.http.Header,
-        extra: ?std.http.Header,
-    } = switch (kind) {
-        .anthropic => .{
-            .url = "https://api.anthropic.com/v1/messages",
-            .method = .POST,
+    // Up to 5 extra headers: auth, content-type, anthropic-version,
+    // anthropic-beta (OAuth only), user-agent (OAuth only).
+    var headers_buf: [5]std.http.Header = undefined;
+    var headers_len: usize = 0;
+    var url: []const u8 = undefined;
+    const method: std.http.Method = .POST;
+    var body: []const u8 = undefined;
+    // Anything we heap-alloc here gets freed at function exit.
+    var heap_owned: ?[]u8 = null;
+    defer if (heap_owned) |h| a.free(h);
+
+    switch (kind) {
+        .anthropic => {
+            // Anthropic OAuth tokens (sk-ant-oat01-...) speak the same
+            // /v1/messages endpoint as standard API keys, but auth via
+            // Authorization: Bearer + a `?beta=true` query + extra
+            // anthropic-beta + user-agent headers. Standard sk-ant-api03-
+            // keys use x-api-key with no extras. v1 mirrors this split.
+            const is_oauth = std.mem.startsWith(u8, api_key, "sk-ant-oat01-");
+            url = if (is_oauth)
+                "https://api.anthropic.com/v1/messages?beta=true"
+            else
+                "https://api.anthropic.com/v1/messages";
+
             // 5-message multi-turn so the recorded cassette exercises
             // history handling, not just a single round-trip.
-            .body =
-            \\{"model":"claude-haiku-4-5-20251001","max_tokens":256,"messages":[{"role":"user","content":[{"type":"text","text":"name three primary colors"}]},{"role":"assistant","content":[{"type":"text","text":"Red, blue, yellow."}]},{"role":"user","content":[{"type":"text","text":"and three secondary?"}]},{"role":"assistant","content":[{"type":"text","text":"Orange, green, purple."}]},{"role":"user","content":[{"type":"text","text":"give me one example object for each secondary"}]}],"stream":true}
-            ,
-            .auth_header = .{ .name = "x-api-key", .value = api_key },
-            .extra = .{ .name = "anthropic-version", .value = "2023-06-01" },
-        },
-        .openai => .{
-            .url = "https://api.openai.com/v1/chat/completions",
-            .method = .POST,
-            .body =
-            \\{"model":"gpt-4o-mini","max_tokens":256,"messages":[{"role":"user","content":"name three primary colors"},{"role":"assistant","content":"Red, blue, yellow."},{"role":"user","content":"and three secondary?"},{"role":"assistant","content":"Orange, green, purple."},{"role":"user","content":"give me one example object for each secondary"}],"stream":true}
-            ,
-            .auth_header = blk: {
-                var buf: [256]u8 = undefined;
-                const v = try std.fmt.bufPrint(&buf, "Bearer {s}", .{api_key});
-                // Heap-dupe so the slice survives past the bufPrint frame.
-                const owned = try a.dupe(u8, v);
-                break :blk .{ .name = "authorization", .value = owned };
-            },
-            .extra = null,
-        },
-    };
-    defer if (kind == .openai) a.free(target_info.auth_header.value);
+            body =
+                \\{"model":"claude-haiku-4-5-20251001","max_tokens":256,"messages":[{"role":"user","content":[{"type":"text","text":"name three primary colors"}]},{"role":"assistant","content":[{"type":"text","text":"Red, blue, yellow."}]},{"role":"user","content":[{"type":"text","text":"and three secondary?"}]},{"role":"assistant","content":[{"type":"text","text":"Orange, green, purple."}]},{"role":"user","content":[{"type":"text","text":"give me one example object for each secondary"}]}],"stream":true}
+            ;
 
-    var headers_buf: [3]std.http.Header = undefined;
-    var headers_len: usize = 0;
-    headers_buf[headers_len] = target_info.auth_header;
-    headers_len += 1;
-    headers_buf[headers_len] = .{ .name = "content-type", .value = "application/json" };
-    headers_len += 1;
-    if (target_info.extra) |h| {
-        headers_buf[headers_len] = h;
-        headers_len += 1;
+            if (is_oauth) {
+                var bearer_buf: [256]u8 = undefined;
+                const v = try std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{api_key});
+                heap_owned = try a.dupe(u8, v);
+                headers_buf[headers_len] = .{ .name = "authorization", .value = heap_owned.? };
+            } else {
+                headers_buf[headers_len] = .{ .name = "x-api-key", .value = api_key };
+            }
+            headers_len += 1;
+            headers_buf[headers_len] = .{ .name = "content-type", .value = "application/json" };
+            headers_len += 1;
+            headers_buf[headers_len] = .{ .name = "anthropic-version", .value = "2023-06-01" };
+            headers_len += 1;
+            if (is_oauth) {
+                headers_buf[headers_len] = .{ .name = "anthropic-beta", .value = "oauth-2025-04-20" };
+                headers_len += 1;
+                headers_buf[headers_len] = .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" };
+                headers_len += 1;
+            }
+        },
+        .openai => {
+            url = "https://api.openai.com/v1/chat/completions";
+            body =
+                \\{"model":"gpt-4o-mini","max_tokens":256,"messages":[{"role":"user","content":"name three primary colors"},{"role":"assistant","content":"Red, blue, yellow."},{"role":"user","content":"and three secondary?"},{"role":"assistant","content":"Orange, green, purple."},{"role":"user","content":"give me one example object for each secondary"}],"stream":true}
+            ;
+
+            var bearer_buf: [256]u8 = undefined;
+            const v = try std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{api_key});
+            heap_owned = try a.dupe(u8, v);
+            headers_buf[headers_len] = .{ .name = "authorization", .value = heap_owned.? };
+            headers_len += 1;
+            headers_buf[headers_len] = .{ .name = "content-type", .value = "application/json" };
+            headers_len += 1;
+        },
     }
 
     var captured: std.Io.Writer.Allocating = .init(a);
     defer captured.deinit();
 
     const result = try client.fetch(.{
-        .location = .{ .url = target_info.url },
-        .method = target_info.method,
-        .payload = target_info.body,
+        .location = .{ .url = url },
+        .method = method,
+        .payload = body,
         .keep_alive = false,
         .response_writer = &captured.writer,
         .extra_headers = headers_buf[0..headers_len],
@@ -236,12 +255,12 @@ fn recordCassette(
     };
     const interaction: vcr.cassette.Interaction = .{
         .request = .{
-            .method = @tagName(target_info.method),
-            .url = target_info.url,
+            .method = @tagName(method),
+            .url = url,
             // Keep the canned request body in the cassette so a future
             // diff catches drift; api_key is in headers not body, so
             // nothing secret leaks into the persisted file.
-            .body = target_info.body,
+            .body = body,
         },
         .response = .{
             .status = @intFromEnum(result.status),
