@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
         "trace_roundtrip_test",
         "trace_diff_test",
         "trace_redact_test",
+        "vcr_roundtrip_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});
