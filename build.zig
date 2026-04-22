@@ -83,6 +83,9 @@ pub fn build(b: *std.Build) void {
         "hash_guard_test",
         "eval_golden_test",
         "eval_bless_test",
+        "eval_judge_test",
+        "assertion_freeze_test",
+        "witness_cardinality_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});
