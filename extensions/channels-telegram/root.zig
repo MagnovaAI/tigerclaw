@@ -4,6 +4,7 @@
 //! public entry point mirrors the other extensions in this tree.
 
 pub const api = @import("api.zig");
+pub const channel = @import("channel.zig");
 
 pub const Bot = api.Bot;
 pub const Update = api.Update;
@@ -13,3 +14,4 @@ pub const User = api.User;
 pub const Command = api.Command;
 pub const Updates = api.Updates;
 pub const SendError = api.SendError;
+pub const TelegramChannel = channel.TelegramChannel;

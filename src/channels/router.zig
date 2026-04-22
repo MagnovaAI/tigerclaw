@@ -12,7 +12,7 @@
 //! the stored `std.Io.Dir` to open or create the file.
 
 const std = @import("std");
-const spec = @import("spec.zig");
+const spec = @import("channels_spec");
 
 pub const Router = struct {
     /// Root directory for session state on disk. Paths returned by
