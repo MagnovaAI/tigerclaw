@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
         "prompt_cache_test",
         "context_window_test",
         "compaction_test",
+        "tool_contract_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});
