@@ -14,6 +14,7 @@ pub const globals = @import("globals.zig");
 pub const harness = @import("harness/root.zig");
 pub const llm = @import("llm/root.zig");
 pub const log = @import("log.zig");
+pub const permissions = @import("permissions/root.zig");
 pub const sandbox = @import("sandbox/root.zig");
 pub const settings = @import("settings/root.zig");
 pub const trace = @import("trace/root.zig");
