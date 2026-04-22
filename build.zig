@@ -1,8 +1,59 @@
 const std = @import("std");
 
+fn hasToken(spec: []const u8, token: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, spec, ", ");
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, "all")) return true;
+        if (std.mem.eql(u8, tok, token)) return true;
+    }
+    return false;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // -Dextensions=<csv>. "all" enables every known extension; "" enables
+    // none. Default ships every extension so plain `zig build` matches
+    // the historical behaviour.
+    const extensions_spec = b.option(
+        []const u8,
+        "extensions",
+        "Comma-separated provider extensions to compile in (anthropic,openai,bedrock,all). Default: all.",
+    ) orelse "anthropic,openai,bedrock";
+
+    const enable_anthropic = hasToken(extensions_spec, "anthropic");
+    const enable_openai = hasToken(extensions_spec, "openai");
+    const enable_bedrock = hasToken(extensions_spec, "bedrock");
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "enable_anthropic", enable_anthropic);
+    build_options.addOption(bool, "enable_openai", enable_openai);
+    build_options.addOption(bool, "enable_bedrock", enable_bedrock);
+    const build_options_mod = build_options.createModule();
+
+    // Named modules carved out of the `tigerclaw` source tree so that
+    // extension code (in its own module) can reach exactly these three
+    // surfaces and nothing else. The Amendment A allowlist is enforced
+    // by the explicit `addImport` chain below.
+    const types_mod = b.addModule("types", .{
+        .root_source_file = b.path("src/types/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const llm_provider_mod = b.addModule("llm_provider", .{
+        .root_source_file = b.path("src/llm/provider.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    llm_provider_mod.addImport("types", types_mod);
+
+    const llm_transport_mod = b.addModule("llm_transport", .{
+        .root_source_file = b.path("src/llm/transport/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // The `tigerclaw` library module is built once and reused by the
     // executable, the unit-test runner, and every integration test. This
@@ -13,14 +64,65 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    tigerclaw_mod.addImport("types", types_mod);
+    tigerclaw_mod.addImport("llm_provider", llm_provider_mod);
+    tigerclaw_mod.addImport("llm_transport", llm_transport_mod);
+    tigerclaw_mod.addImport("build_options", build_options_mod);
 
-    const exe = b.addExecutable(.{
-        .name = "tigerclaw",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+    var ext_anthropic_mod: ?*std.Build.Module = null;
+    var ext_openai_mod: ?*std.Build.Module = null;
+    var ext_bedrock_mod: ?*std.Build.Module = null;
+    if (enable_anthropic) {
+        const ext = b.addModule("ext_anthropic", .{
+            .root_source_file = b.path("extensions/anthropic/root.zig"),
             .target = target,
             .optimize = optimize,
-        }),
+        });
+        ext.addImport("types", types_mod);
+        ext.addImport("llm_provider", llm_provider_mod);
+        ext.addImport("llm_transport", llm_transport_mod);
+        tigerclaw_mod.addImport("ext_anthropic", ext);
+        ext_anthropic_mod = ext;
+    }
+    if (enable_openai) {
+        const ext = b.addModule("ext_openai", .{
+            .root_source_file = b.path("extensions/openai/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        ext.addImport("types", types_mod);
+        ext.addImport("llm_provider", llm_provider_mod);
+        ext.addImport("llm_transport", llm_transport_mod);
+        tigerclaw_mod.addImport("ext_openai", ext);
+        ext_openai_mod = ext;
+    }
+    if (enable_bedrock) {
+        const ext = b.addModule("ext_bedrock", .{
+            .root_source_file = b.path("extensions/bedrock/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        ext.addImport("types", types_mod);
+        ext.addImport("llm_provider", llm_provider_mod);
+        tigerclaw_mod.addImport("ext_bedrock", ext);
+        ext_bedrock_mod = ext;
+    }
+
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exe_mod.addImport("build_options", build_options_mod);
+    exe_mod.addImport("types", types_mod);
+    exe_mod.addImport("llm_provider", llm_provider_mod);
+    exe_mod.addImport("llm_transport", llm_transport_mod);
+    if (ext_anthropic_mod) |m| exe_mod.addImport("ext_anthropic", m);
+    if (ext_openai_mod) |m| exe_mod.addImport("ext_openai", m);
+    if (ext_bedrock_mod) |m| exe_mod.addImport("ext_bedrock", m);
+    const exe = b.addExecutable(.{
+        .name = "tigerclaw",
+        .root_module = exe_mod,
     });
     b.installArtifact(exe);
 
@@ -33,14 +135,43 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests (unit + integration)");
 
     // Unit tests: live at the bottom of source files, discovered via src/main.zig.
-    const unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const unit_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    unit_mod.addImport("build_options", build_options_mod);
+    unit_mod.addImport("types", types_mod);
+    unit_mod.addImport("llm_provider", llm_provider_mod);
+    unit_mod.addImport("llm_transport", llm_transport_mod);
+    if (ext_anthropic_mod) |m| unit_mod.addImport("ext_anthropic", m);
+    if (ext_openai_mod) |m| unit_mod.addImport("ext_openai", m);
+    if (ext_bedrock_mod) |m| unit_mod.addImport("ext_bedrock", m);
+    const unit_tests = b.addTest(.{ .root_module = unit_mod });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    // The three named modules (`types`, `llm_provider`, `llm_transport`)
+    // own their own subtrees and are compiled in isolation; their unit
+    // tests only run if we add dedicated test artifacts for them here.
+    const types_tests = b.addTest(.{ .root_module = types_mod });
+    test_step.dependOn(&b.addRunArtifact(types_tests).step);
+    const llm_provider_tests = b.addTest(.{ .root_module = llm_provider_mod });
+    test_step.dependOn(&b.addRunArtifact(llm_provider_tests).step);
+    const llm_transport_tests = b.addTest(.{ .root_module = llm_transport_mod });
+    test_step.dependOn(&b.addRunArtifact(llm_transport_tests).step);
+
+    if (ext_anthropic_mod) |m| {
+        const t = b.addTest(.{ .root_module = m });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    if (ext_openai_mod) |m| {
+        const t = b.addTest(.{ .root_module = m });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    if (ext_bedrock_mod) |m| {
+        const t = b.addTest(.{ .root_module = m });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
 
     // Integration / contract / e2e tests: each entry in `integration_tests`
     // is a tests/<name>.zig file compiled as its own test binary with the
@@ -100,6 +231,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         mod.addImport("tigerclaw", tigerclaw_mod);
+        mod.addImport("build_options", build_options_mod);
         const t = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }

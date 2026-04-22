@@ -18,7 +18,7 @@
 //!     noise.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 
 pub const IterationRecord = struct {
     iteration: u32,

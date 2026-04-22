@@ -27,7 +27,7 @@
 //! cap at that to keep this safe to hand to any backend.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 
 /// Where a breakpoint should be emitted, expressed in terms the
 /// provider adapter can act on.

@@ -10,7 +10,7 @@
 //! `error.NoProvider`.
 
 const std = @import("std");
-const provider_mod = @import("../provider.zig");
+const provider_mod = @import("llm_provider");
 const policy_mod = @import("policy.zig");
 const fallback = @import("fallback.zig");
 
@@ -67,7 +67,7 @@ pub const Router = struct {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
-const types = @import("../../types/root.zig");
+const types = @import("types");
 
 const Always = struct {
     reply: []const u8,

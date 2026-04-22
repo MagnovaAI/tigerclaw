@@ -9,7 +9,7 @@
 //! Arguments: `{"items": [...]}` (any JSON shape).
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const schema = @import("schema.zig");
 const internal_writes = @import("../settings/internal_writes.zig");
 

@@ -12,7 +12,7 @@
 //! whatever spec list it is given and passes it through.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const llm = @import("../llm/root.zig");
 
 /// Inputs the caller supplies to `build`. Anything the provider

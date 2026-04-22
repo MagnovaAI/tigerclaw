@@ -7,7 +7,7 @@
 //! docs/ARCHITECTURE.md.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 
 pub const ChatRequest = struct {
     system: ?[]const u8 = null,

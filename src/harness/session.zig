@@ -24,7 +24,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const types = @import("../types/root.zig");
+const types = @import("types");
 const clock_mod = @import("../clock.zig");
 const internal_writes = @import("../settings/internal_writes.zig");
 const state_mod = @import("state.zig");

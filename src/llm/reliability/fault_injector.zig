@@ -7,7 +7,7 @@
 //! module is stochastic; determinism is a hard requirement.
 
 const std = @import("std");
-const provider_mod = @import("../provider.zig");
+const provider_mod = @import("llm_provider");
 
 const Provider = provider_mod.Provider;
 const ChatRequest = provider_mod.ChatRequest;
@@ -88,7 +88,7 @@ pub const Injector = struct {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
-const types = @import("../../types/root.zig");
+const types = @import("types");
 
 const Always = struct {
     reply: []const u8,

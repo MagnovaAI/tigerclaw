@@ -11,7 +11,7 @@
 //! Output: the decimal integer that was passed in.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 const schema = @import("schema.zig");
 
 pub const spec = schema.ToolSpec{

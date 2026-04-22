@@ -7,7 +7,7 @@
 //! the primary two-message shape.
 
 const std = @import("std");
-const types = @import("../types/root.zig");
+const types = @import("types");
 
 /// One user → assistant exchange.
 ///
