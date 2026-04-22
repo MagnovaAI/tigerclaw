@@ -80,6 +80,7 @@ pub fn build(b: *std.Build) void {
         "tool_justification_lint_test",
         "scenario_loader_test",
         "bench_concurrency_test",
+        "hash_guard_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});

@@ -12,8 +12,11 @@ pub const metrics = @import("metrics.zig");
 pub const aggregator = @import("aggregator.zig");
 pub const reporter = @import("reporter.zig");
 pub const compare = @import("compare.zig");
+pub const hash_guard = @import("hash_guard.zig");
 
 pub const Case = scenario.Case;
+pub const HashTuple = hash_guard.HashTuple;
+pub const Digest = hash_guard.Digest;
 pub const Executor = runner.Executor;
 pub const CaseMetric = metrics.CaseMetric;
 pub const RunSummary = metrics.RunSummary;
@@ -27,4 +30,5 @@ test {
     std.testing.refAllDecls(@import("aggregator.zig"));
     std.testing.refAllDecls(@import("reporter.zig"));
     std.testing.refAllDecls(@import("compare.zig"));
+    std.testing.refAllDecls(@import("hash_guard.zig"));
 }

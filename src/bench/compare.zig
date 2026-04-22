@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const metrics = @import("metrics.zig");
+const hash_guard = @import("hash_guard.zig");
 
 pub const Delta = struct {
     id: []const u8,
@@ -26,6 +27,8 @@ pub const Delta = struct {
 };
 
 pub const Kind = enum { both_pass, both_fail, improved, regressed };
+
+pub const Error = error{ UnpairedCase, HashMismatch } || std.mem.Allocator.Error;
 
 /// Pair metrics by `id`. Every id from the baseline must appear in
 /// the candidate; stragglers on either side are surfaced as
@@ -62,6 +65,22 @@ pub fn compare(
 fn findById(list: []const metrics.CaseMetric, id: []const u8) ?metrics.CaseMetric {
     for (list) |m| if (std.mem.eql(u8, m.id, id)) return m;
     return null;
+}
+
+/// Hash-guarded compare. Refuses to return a result when the two
+/// runs' hash tuples disagree — per ADR 0009 a comparison across
+/// divergent inputs is worse than no comparison at all.
+pub fn compareGuarded(
+    allocator: std.mem.Allocator,
+    baseline: []const metrics.CaseMetric,
+    baseline_hashes: hash_guard.HashTuple,
+    candidate: []const metrics.CaseMetric,
+    candidate_hashes: hash_guard.HashTuple,
+) Error![]Delta {
+    if (hash_guard.compareTuples(baseline_hashes, candidate_hashes) != .none) {
+        return Error.HashMismatch;
+    }
+    return compare(allocator, baseline, candidate);
 }
 
 // --- tests -----------------------------------------------------------------
