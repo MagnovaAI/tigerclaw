@@ -37,6 +37,14 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: unknown completion shell; expected bash|zsh|fish\n");
             return 64;
         },
+        error.UnknownFlag => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown flag\n");
+            return 64;
+        },
+        error.MissingFlagValue => {
+            try stderr_w.interface.writeAll("tigerclaw: flag requires a value\n");
+            return 64;
+        },
     };
 
     switch (cmd) {
@@ -48,6 +56,43 @@ pub fn main(init: std.process.Init) !u8 {
             shell,
             &cli.command_table,
         ),
+        .agent => |args| {
+            cli.commands.agent.installInterruptHandler();
+            const opts: cli.commands.agent.Options = .{
+                .base_url = args.base_url,
+                .session_id = args.session_id,
+                .bearer = args.bearer,
+                .out = &stdout_w.interface,
+            };
+            cli.commands.agent.run(arena, io, opts) catch |err| switch (err) {
+                error.Interrupted => return 130,
+                error.GatewayDown => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway unreachable\n");
+                    return 69; // EX_UNAVAILABLE
+                },
+                error.Unauthorized => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway rejected credentials\n");
+                    return 77; // EX_NOPERM
+                },
+                error.BadRequest => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway rejected the request\n");
+                    return 65; // EX_DATAERR
+                },
+                error.InternalError => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway internal error\n");
+                    return 70; // EX_SOFTWARE
+                },
+                error.InvalidResponse => {
+                    try stderr_w.interface.writeAll("tigerclaw: invalid gateway response\n");
+                    return 70;
+                },
+                error.UrlTooLong => {
+                    try stderr_w.interface.writeAll("tigerclaw: base_url + session id too long\n");
+                    return 64;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        },
         .unknown => |flag| {
             try stderr_w.interface.print("tigerclaw: unknown option '{s}'\n\n", .{flag});
             try cli.printHelp(&stderr_w.interface);

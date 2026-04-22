@@ -23,11 +23,23 @@ pub const commands = struct {
 
 pub const version_string = version.string;
 
+pub const AgentArgs = struct {
+    /// Defaults to "http://127.0.0.1:8765" — the canonical local
+    /// gateway address. Override via --base-url.
+    base_url: []const u8 = "http://127.0.0.1:8765",
+    /// Session id targeted by the turn. Defaults to the mock session
+    /// the gateway accepts in v0.1.0.
+    session_id: []const u8 = "mock-session",
+    /// Optional bearer token for gateway auth.
+    bearer: ?[]const u8 = null,
+};
+
 pub const Command = union(enum) {
     version,
     help,
     doctor,
     completion: commands.completion.Shell,
+    agent: AgentArgs,
     unknown: []const u8,
 };
 
@@ -35,11 +47,14 @@ pub const ParseError = error{
     MissingCommand,
     CompletionMissingShell,
     CompletionUnknownShell,
+    UnknownFlag,
+    MissingFlagValue,
 };
 
 /// Top-level command table. Summaries feed the help screen and shell
 /// completion generators.
 pub const command_table = [_]descriptor.CommandDescriptor{
+    .{ .name = "agent", .summary = "Stream a turn from the local gateway and render tokens" },
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
     .{ .name = "doctor", .summary = "Print a short environment report" },
@@ -72,8 +87,35 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
         const shell = commands.completion.parseShell(match.argv[1]) catch return error.CompletionUnknownShell;
         return .{ .completion = shell };
     }
+    if (std.mem.eql(u8, match.descriptor.name, "agent")) {
+        return parseAgent(match.argv[1..]);
+    }
 
     return .{ .unknown = first };
+}
+
+fn parseAgent(rest: []const []const u8) ParseError!Command {
+    var args: AgentArgs = .{};
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const flag = rest[i];
+        if (std.mem.eql(u8, flag, "--base-url")) {
+            if (i + 1 >= rest.len) return error.MissingFlagValue;
+            i += 1;
+            args.base_url = rest[i];
+        } else if (std.mem.eql(u8, flag, "--session")) {
+            if (i + 1 >= rest.len) return error.MissingFlagValue;
+            i += 1;
+            args.session_id = rest[i];
+        } else if (std.mem.eql(u8, flag, "--bearer")) {
+            if (i + 1 >= rest.len) return error.MissingFlagValue;
+            i += 1;
+            args.bearer = rest[i];
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    return .{ .agent = args };
 }
 
 pub fn printVersion(w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -188,6 +230,33 @@ test "printHelp: mentions banner, both flags, and the verbs in the table" {
     try testing.expect(std.mem.indexOf(u8, out, "--help") != null);
     try testing.expect(std.mem.indexOf(u8, out, "doctor") != null);
     try testing.expect(std.mem.indexOf(u8, out, "completion") != null);
+}
+
+test "parse: agent verb with no flags yields defaults" {
+    const argv = [_][]const u8{"agent"};
+    const cmd = try parse(&argv);
+    try testing.expectEqualStrings("http://127.0.0.1:8765", cmd.agent.base_url);
+    try testing.expectEqualStrings("mock-session", cmd.agent.session_id);
+    try testing.expect(cmd.agent.bearer == null);
+}
+
+test "parse: agent --session overrides session_id" {
+    const argv = [_][]const u8{ "agent", "--session", "abc" };
+    const cmd = try parse(&argv);
+    try testing.expectEqualStrings("abc", cmd.agent.session_id);
+}
+
+test "parse: agent with all three flags set" {
+    const argv = [_][]const u8{ "agent", "--base-url", "http://x:1", "--session", "s", "--bearer", "t" };
+    const cmd = try parse(&argv);
+    try testing.expectEqualStrings("http://x:1", cmd.agent.base_url);
+    try testing.expectEqualStrings("s", cmd.agent.session_id);
+    try testing.expectEqualStrings("t", cmd.agent.bearer.?);
+}
+
+test "parse: agent with unknown flag returns UnknownFlag" {
+    const argv = [_][]const u8{ "agent", "--nope" };
+    try testing.expectError(error.UnknownFlag, parse(&argv));
 }
 
 test {
