@@ -429,52 +429,46 @@ test "openrouter: buildRequestBody honours caller-provided max_tokens" {
 
 const FakeServerArgs = struct {
     io: std.Io,
-    address: *const std.Io.net.IpAddress,
-    response: []const u8,
+    server: *std.Io.net.Server,
+    status: std.http.Status,
+    body: []const u8,
 };
 
 fn fakeServerThread(args: *FakeServerArgs) void {
-    var server = args.address.listen(args.io, .{ .reuse_address = true }) catch return;
-    defer server.deinit(args.io);
-
-    var stream = server.accept(args.io) catch return;
+    var stream = args.server.accept(args.io) catch return;
     defer stream.close(args.io);
 
-    // Drain enough of the request to let the client finish writing its
-    // body before we reply. We do not parse it — we just need to keep
-    // the socket alive long enough for the kernel's send buffer to
-    // accept everything.
+    // Use std.http.Server so request framing is parsed correctly — the
+    // client will not finish its POST until the server has read the
+    // head, and a hand-rolled raw write would deadlock if the response
+    // arrived before the body fully flushed.
     var read_buf: [4096]u8 = undefined;
-    var s_reader = stream.reader(args.io, &read_buf);
-    // A single read is plenty for a small POST; ignore short reads.
-    _ = s_reader.interface.readSliceShort(&read_buf) catch {};
-
     var write_buf: [1024]u8 = undefined;
+    var s_reader = stream.reader(args.io, &read_buf);
     var s_writer = stream.writer(args.io, &write_buf);
-    s_writer.interface.writeAll(args.response) catch {};
-    s_writer.interface.flush() catch {};
+
+    var http_server = std.http.Server.init(&s_reader.interface, &s_writer.interface);
+    var request = http_server.receiveHead() catch return;
+    request.respond(args.body, .{
+        .status = args.status,
+        .keep_alive = false,
+    }) catch return;
 }
 
 test "openrouter: HTTP error path returns a refusal containing the status" {
-    const probe_addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
-    var probe = try probe_addr.listen(testing.io, .{ .reuse_address = true });
-    const port = probe.socket.address.getPort();
-    probe.deinit(testing.io);
-
-    const serve_addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
-
-    const canned_response =
-        "HTTP/1.1 402 Payment Required\r\n" ++
-        "content-type: application/json\r\n" ++
-        "content-length: 26\r\n" ++
-        "connection: close\r\n" ++
-        "\r\n" ++
-        "{\"error\":\"out_of_credits\"}";
+    // Bind once on the test thread so the listener is guaranteed live
+    // before the client connects; probe-then-rebind races the kernel
+    // and can leave the server stuck in accept().
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
+    var server = try addr.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    const port = server.socket.address.getPort();
 
     var args: FakeServerArgs = .{
         .io = testing.io,
-        .address = &serve_addr,
-        .response = canned_response,
+        .server = &server,
+        .status = .payment_required,
+        .body = "{\"error\":\"out_of_credits\"}",
     };
 
     const thread = try std.Thread.spawn(.{}, fakeServerThread, .{&args});
