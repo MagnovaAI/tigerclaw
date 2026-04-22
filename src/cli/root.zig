@@ -17,6 +17,7 @@ pub const commands = struct {
     pub const gateway = @import("commands/gateway.zig");
     pub const sessions = @import("commands/sessions.zig");
     pub const config = @import("commands/config.zig");
+    pub const http_client = @import("commands/http_client.zig");
 };
 
 pub const version_string = version.string;
