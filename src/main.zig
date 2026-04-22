@@ -75,6 +75,16 @@ pub fn main(init: std.process.Init) !u8 {
         },
         error.ProvidersUnknownSubcommand => {
             try stderr_w.interface.writeAll("tigerclaw: unknown providers subcommand\n");
+        error.ModelsMissingSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: models requires a subcommand (list|status|set)\n");
+            return 64;
+        },
+        error.ModelsUnknownSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown models subcommand\n");
+            return 64;
+        },
+        error.ModelsMissingModel => {
+            try stderr_w.interface.writeAll("tigerclaw: models set requires a <model> argument\n");
             return 64;
         },
         error.ModelsMissingSubcommand => {
