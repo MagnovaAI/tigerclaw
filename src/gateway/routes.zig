@@ -128,7 +128,7 @@ fn sessionsMessageHandler(
 }
 
 fn sessionsTurnHandler(
-    _: http.Request,
+    req: http.Request,
     params: []const router.Param,
     _: ?[]const u8,
 ) dispatcher.HandlerError!http.Response {
@@ -145,9 +145,42 @@ fn sessionsTurnHandler(
         else => return error.InternalServerError,
     };
 
+    // Content negotiation: a client asking for `text/event-stream`
+    // receives the same logical turn rendered as SSE token events.
+    // The mock runner returns a single-shot reply (no real streaming),
+    // so the body is a fixed sequence framed in the SSE wire format.
+    // Real streaming arrives once the runner is wired to the react
+    // loop and the dispatcher gains a streaming response shape.
+    if (wantsSse(req)) {
+        _ = result;
+        return .{
+            .status = .ok,
+            .headers = &sse_headers,
+            .body = mock_sse_body,
+        };
+    }
+
     _ = result;
     return http.Response.jsonOk("{\"status\":\"ok\"}");
 }
+
+fn wantsSse(req: http.Request) bool {
+    const accept = req.getHeader("accept") orelse return false;
+    return std.mem.indexOf(u8, accept, "text/event-stream") != null;
+}
+
+const mock_sse_body =
+    "event: token\n" ++
+    "data: ping\n" ++
+    "\n" ++
+    "event: done\n" ++
+    "data: {\"completed\":true}\n" ++
+    "\n";
+
+const sse_headers = [_]http.Header{
+    .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
+    .{ .name = "cache-control", .value = "no-cache" },
+};
 
 fn findParam(params: []const router.Param, name: []const u8) ?[]const u8 {
     for (params) |p| {
@@ -234,6 +267,57 @@ fn runTurn(runner: *harness.MockAgentRunner) anyerror!void {
 
 test "routes: POST /sessions/:id/turns round-trips the in-flight counter" {
     try withMockContext(runTurn);
+}
+
+fn runTurnSse(runner: *harness.MockAgentRunner) anyerror!void {
+    const accept = [_]http.Header{.{ .name = "accept", .value = "text/event-stream" }};
+    const req: http.Request = .{
+        .method = .POST,
+        .target = "/sessions/s1/turns",
+        .headers = &accept,
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    try testing.expectEqual(http.Status.ok, resp.status);
+    try testing.expect(runner.in_flight.isZero());
+
+    // Content-type must be SSE so a streaming client recognises it.
+    var ct_seen = false;
+    for (resp.headers) |h| {
+        if (std.mem.eql(u8, h.name, "content-type")) {
+            try testing.expect(std.mem.indexOf(u8, h.value, "text/event-stream") != null);
+            ct_seen = true;
+        }
+    }
+    try testing.expect(ct_seen);
+
+    // Body carries at least one token event followed by a done event.
+    try testing.expect(std.mem.indexOf(u8, resp.body, "event: token\ndata: ping") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "event: done") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "{\"completed\":true}") != null);
+}
+
+test "routes: POST /sessions/:id/turns with Accept: text/event-stream returns SSE" {
+    try withMockContext(runTurnSse);
+}
+
+fn runTurnAcceptMixed(_: *harness.MockAgentRunner) anyerror!void {
+    // Accept lists multiple types — SSE wins because the substring
+    // match in `wantsSse` ignores quality factors.
+    const accept = [_]http.Header{.{
+        .name = "accept",
+        .value = "application/json, text/event-stream;q=0.9",
+    }};
+    const req: http.Request = .{
+        .method = .POST,
+        .target = "/sessions/s1/turns",
+        .headers = &accept,
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "event: token") != null);
+}
+
+test "routes: POST /sessions/:id/turns honours Accept when SSE is one of several" {
+    try withMockContext(runTurnAcceptMixed);
 }
 
 fn runDelete(_: *harness.MockAgentRunner) anyerror!void {
