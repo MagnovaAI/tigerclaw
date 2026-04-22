@@ -15,6 +15,8 @@ pub const replayer = @import("replayer.zig");
 pub const diff = @import("diff.zig");
 pub const fixture = @import("fixture.zig");
 pub const exporter = @import("exporter.zig");
+pub const redact = @import("redact.zig");
+pub const tool_use_summary = @import("tool_use_summary.zig");
 
 pub const Envelope = schema.Envelope;
 pub const Mode = schema.Mode;
@@ -35,4 +37,6 @@ test {
     std.testing.refAllDecls(@import("diff.zig"));
     std.testing.refAllDecls(@import("fixture.zig"));
     std.testing.refAllDecls(@import("exporter.zig"));
+    std.testing.refAllDecls(@import("redact.zig"));
+    std.testing.refAllDecls(@import("tool_use_summary.zig"));
 }

@@ -51,6 +51,7 @@ pub fn build(b: *std.Build) void {
         "settings_change_detector_test",
         "trace_roundtrip_test",
         "trace_diff_test",
+        "trace_redact_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});
