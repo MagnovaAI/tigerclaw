@@ -107,3 +107,46 @@ test "contract: AnthropicProvider satisfies the provider invariants" {
         .backend_name = "anthropic",
     });
 }
+
+// ---------------------------------------------------------------------------
+// OpenAI provider harness.
+
+const _openai_stream =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"contract-reply\"}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+    "data: [DONE]\n\n";
+
+var _openai: llm.providers.OpenAIProvider = undefined;
+
+fn openaiReset() void {
+    _openai = llm.providers.OpenAIProvider.init(.{ .literal = _openai_stream });
+}
+
+test "contract: OpenAIProvider satisfies the provider invariants" {
+    openaiReset();
+    try runAll(_openai.provider(), .{
+        .reset = openaiReset,
+        .first_reply_text = "contract-reply",
+        .backend_name = "openai",
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Bedrock provider harness.
+
+const _bedrock_chunks = [_][]const u8{"contract-reply"};
+
+var _bedrock: llm.providers.BedrockProvider = undefined;
+
+fn bedrockReset() void {
+    _bedrock = llm.providers.BedrockProvider.init(.{ .text_chunks = &_bedrock_chunks });
+}
+
+test "contract: BedrockProvider satisfies the provider invariants" {
+    bedrockReset();
+    try runAll(_bedrock.provider(), .{
+        .reset = bedrockReset,
+        .first_reply_text = "contract-reply",
+        .backend_name = "bedrock",
+    });
+}
