@@ -85,3 +85,25 @@ test "contract: MockProvider satisfies the provider invariants" {
         .backend_name = "mock",
     });
 }
+
+// ---------------------------------------------------------------------------
+// Anthropic provider harness: same contract, different backend.
+
+const _anthropic_stream =
+    "event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"contract-reply\"}}\n\n" ++
+    "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+
+var _anthropic: llm.providers.AnthropicProvider = undefined;
+
+fn anthropicReset() void {
+    _anthropic = llm.providers.AnthropicProvider.init(.{ .literal = _anthropic_stream });
+}
+
+test "contract: AnthropicProvider satisfies the provider invariants" {
+    anthropicReset();
+    try runAll(_anthropic.provider(), .{
+        .reset = anthropicReset,
+        .first_reply_text = "contract-reply",
+        .backend_name = "anthropic",
+    });
+}
