@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
         "trace_redact_test",
         "vcr_roundtrip_test",
         "token_estimator_test",
+        "provider_contract_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});
