@@ -22,6 +22,7 @@ pub const prompt_builder = @import("prompt_builder.zig");
 pub const prompt_caching = @import("prompt_caching.zig");
 pub const tool_selection = @import("tool_selection.zig");
 pub const trajectory = @import("trajectory.zig");
+pub const context = @import("context/root.zig");
 
 pub const ToolExecutor = vtable.ToolExecutor;
 pub const DenyExecutor = vtable.DenyExecutor;
@@ -52,4 +53,5 @@ test {
     std.testing.refAllDecls(@import("prompt_caching.zig"));
     std.testing.refAllDecls(@import("tool_selection.zig"));
     std.testing.refAllDecls(@import("trajectory.zig"));
+    std.testing.refAllDecls(@import("context/root.zig"));
 }

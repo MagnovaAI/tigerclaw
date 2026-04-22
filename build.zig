@@ -74,6 +74,8 @@ pub fn build(b: *std.Build) void {
         "e2e_run_with_mock_test",
         "react_loop_test",
         "prompt_cache_test",
+        "context_window_test",
+        "compaction_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});
