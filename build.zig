@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         "trace_diff_test",
         "trace_redact_test",
         "vcr_roundtrip_test",
+        "vcr_provider_contract_test",
         "token_estimator_test",
         "provider_contract_test",
         "routing_test",
