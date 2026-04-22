@@ -1,0 +1,11 @@
+{
+  "scenario_id": "coding_refactor_rename",
+  "prompt": "Rename every occurrence of the identifier `foo` to `bar` in example.zig.",
+  "assertion_id": "file_contains",
+  "threshold": 1.0,
+  "artifacts_glob": "*.zig",
+  "tags": ["coding", "refactor"],
+  "expected_tool_names": ["read", "edit"],
+  "max_turns": 8,
+  "scenario_schema_version": 3
+}

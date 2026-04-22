@@ -19,6 +19,7 @@ pub const llm = @import("llm/root.zig");
 pub const log = @import("log.zig");
 pub const permissions = @import("permissions/root.zig");
 pub const sandbox = @import("sandbox/root.zig");
+pub const scenario = @import("scenario/root.zig");
 pub const settings = @import("settings/root.zig");
 pub const tools = @import("tools/root.zig");
 pub const trace = @import("trace/root.zig");

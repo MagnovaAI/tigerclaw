@@ -1,0 +1,11 @@
+{
+  "scenario_id": "nav_read_and_summarize",
+  "prompt": "List the files in the workspace and summarise each in one sentence.",
+  "assertion_id": "contains_summary",
+  "threshold": 0.9,
+  "artifacts_glob": "*.md",
+  "tags": ["navigation", "summarisation"],
+  "expected_tool_names": ["glob", "read"],
+  "max_turns": 6,
+  "scenario_schema_version": 3
+}

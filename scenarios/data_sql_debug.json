@@ -1,0 +1,12 @@
+{
+  "scenario_id": "data_sql_debug",
+  "prompt": "Given query.sql, identify the join that causes the incorrect row multiplication and explain the fix.",
+  "assertion_id": "mentions_token",
+  "threshold": 0.8,
+  "artifacts_glob": "*.sql",
+  "tags": ["data", "debug"],
+  "expected_tool_names": ["read", "grep"],
+  "forbid_tool_names": ["bash"],
+  "max_turns": 10,
+  "scenario_schema_version": 3
+}
