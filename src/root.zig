@@ -10,6 +10,7 @@ pub const clock = @import("clock.zig");
 pub const constants = @import("constants/root.zig");
 pub const cost = @import("cost/root.zig");
 pub const determinism = @import("determinism.zig");
+pub const entrypoints = @import("entrypoints/root.zig");
 pub const errors = @import("errors.zig");
 pub const globals = @import("globals.zig");
 pub const harness = @import("harness/root.zig");
