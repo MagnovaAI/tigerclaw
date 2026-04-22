@@ -17,14 +17,17 @@ pub const MockReply = mock.Reply;
 pub const anthropic = if (build_options.enable_anthropic) @import("provider_anthropic") else struct {};
 pub const openai = if (build_options.enable_openai) @import("provider_openai") else struct {};
 pub const bedrock = if (build_options.enable_bedrock) @import("provider_bedrock") else struct {};
+pub const openrouter = if (build_options.enable_openrouter) @import("provider_openrouter") else struct {};
 
 pub const AnthropicProvider = if (build_options.enable_anthropic) anthropic.AnthropicProvider else void;
 pub const OpenAIProvider = if (build_options.enable_openai) openai.OpenAIProvider else void;
 pub const BedrockProvider = if (build_options.enable_bedrock) bedrock.BedrockProvider else void;
+pub const OpenRouterProvider = if (build_options.enable_openrouter) openrouter.OpenRouterProvider else void;
 
 test {
     std.testing.refAllDecls(@import("mock.zig"));
     if (build_options.enable_anthropic) std.testing.refAllDecls(@import("provider_anthropic"));
     if (build_options.enable_openai) std.testing.refAllDecls(@import("provider_openai"));
     if (build_options.enable_bedrock) std.testing.refAllDecls(@import("provider_bedrock"));
+    if (build_options.enable_openrouter) std.testing.refAllDecls(@import("provider_openrouter"));
 }
