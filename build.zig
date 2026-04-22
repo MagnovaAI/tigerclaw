@@ -70,6 +70,7 @@ pub fn build(b: *std.Build) void {
         "sandbox_exec_test",
         "permissions_test",
         "cost_ledger_test",
+        "diagnostics_buffer_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});

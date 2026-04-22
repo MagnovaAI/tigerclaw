@@ -20,5 +20,6 @@ pub const sandbox = @import("sandbox/root.zig");
 pub const settings = @import("settings/root.zig");
 pub const trace = @import("trace/root.zig");
 pub const types = @import("types/root.zig");
+pub const util = @import("util/root.zig");
 pub const vcr = @import("vcr/root.zig");
 pub const version = @import("version.zig");
