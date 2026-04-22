@@ -24,6 +24,7 @@ pub const interrupt = @import("interrupt.zig");
 pub const respawn = @import("respawn.zig");
 pub const mode_policy = @import("mode_policy.zig");
 pub const bench_guards = @import("bench_guards.zig");
+pub const shared_ledger = @import("shared_ledger.zig");
 
 pub const State = state.State;
 pub const Turn = turn.Turn;
@@ -39,6 +40,8 @@ pub const Mode = mode_policy.Mode;
 pub const ModePolicy = mode_policy.Policy;
 pub const GuardedProvider = bench_guards.GuardedProvider;
 pub const BenchHarnessBuilder = bench_guards.BenchHarnessBuilder;
+pub const SharedLedger = shared_ledger.SharedLedger;
+pub const HeldReservation = shared_ledger.Held;
 
 test {
     std.testing.refAllDecls(@import("state.zig"));
@@ -50,4 +53,5 @@ test {
     std.testing.refAllDecls(@import("respawn.zig"));
     std.testing.refAllDecls(@import("mode_policy.zig"));
     std.testing.refAllDecls(@import("bench_guards.zig"));
+    std.testing.refAllDecls(@import("shared_ledger.zig"));
 }
