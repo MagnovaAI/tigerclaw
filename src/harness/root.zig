@@ -25,6 +25,7 @@ pub const respawn = @import("respawn.zig");
 pub const mode_policy = @import("mode_policy.zig");
 pub const bench_guards = @import("bench_guards.zig");
 pub const shared_ledger = @import("shared_ledger.zig");
+pub const agent_runner = @import("agent_runner.zig");
 
 pub const State = state.State;
 pub const Turn = turn.Turn;
@@ -42,6 +43,9 @@ pub const GuardedProvider = bench_guards.GuardedProvider;
 pub const BenchHarnessBuilder = bench_guards.BenchHarnessBuilder;
 pub const SharedLedger = shared_ledger.SharedLedger;
 pub const HeldReservation = shared_ledger.Held;
+pub const AgentRunner = agent_runner.AgentRunner;
+pub const InFlightCounter = agent_runner.InFlightCounter;
+pub const MockAgentRunner = agent_runner.MockAgentRunner;
 
 test {
     std.testing.refAllDecls(@import("state.zig"));
@@ -54,4 +58,5 @@ test {
     std.testing.refAllDecls(@import("mode_policy.zig"));
     std.testing.refAllDecls(@import("bench_guards.zig"));
     std.testing.refAllDecls(@import("shared_ledger.zig"));
+    std.testing.refAllDecls(@import("agent_runner.zig"));
 }
