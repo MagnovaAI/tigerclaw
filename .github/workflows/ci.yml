@@ -10,15 +10,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            zig_arch: x86_64-linux
+          - os: macos-latest
+            zig_arch: aarch64-macos
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Zig 0.16.0
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+        # mlugg/setup-zig is broken for 0.16.0 — its mirror list 404s.
+        # Download direct from ziglang.org/download/0.16.0/.
+        run: |
+          set -eu
+          ARCHIVE="zig-${{ matrix.zig_arch }}-0.16.0.tar.xz"
+          curl -sSfLO "https://ziglang.org/download/0.16.0/$ARCHIVE"
+          mkdir -p "$HOME/.zig"
+          tar -xf "$ARCHIVE" -C "$HOME/.zig" --strip-components=1
+          echo "$HOME/.zig" >> "$GITHUB_PATH"
 
       - name: Verify Zig version
         run: zig version
