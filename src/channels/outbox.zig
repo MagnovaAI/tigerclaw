@@ -25,6 +25,19 @@
 //! (cursor, ack) are likewise expected to run on the same thread as
 //! the writer; this lets the implementation avoid any internal
 //! locking.
+//!
+//! # Cross-process exclusion
+//!
+//! The in-thread single-writer invariant above only covers threads
+//! inside ONE process. Two tigerclaw processes both pointing at the
+//! same `state_root/outbox/` would race on the same JSONL files and
+//! corrupt them — a dev run with the daemon already running is the
+//! obvious way to trip this.
+//!
+//! Guarded by an advisory flock on `state_root/outbox/.lock`, acquired
+//! in `Outbox.init` and released in `deinit` (implicitly on fd close).
+//! A second process attempting `init` on the same state root fails
+//! fast with `error.AlreadyLocked` instead of scribbling into the log.
 
 const std = @import("std");
 
@@ -32,6 +45,14 @@ const clock_mod = @import("../clock.zig");
 const spec = @import("channels_spec");
 
 pub const Clock = clock_mod.Clock;
+
+pub const InitError = error{
+    /// Another process already holds the outbox lock on this state
+    /// root. Caller should surface this as a user-facing "already
+    /// running" error, not retry.
+    AlreadyLocked,
+    IoFailure,
+};
 
 pub const AppendError = error{
     IoFailure,
@@ -69,19 +90,51 @@ pub const Outbox = struct {
     state_root: std.Io.Dir,
     allocator: std.mem.Allocator,
     clock: Clock,
+    /// Held for the lifetime of the Outbox. Its fd owns the advisory
+    /// flock; closing the fd releases the lock. See the file header
+    /// "Cross-process exclusion" section.
+    lock_file: std.Io.File,
 
     pub fn init(
         io: std.Io,
         state_root: std.Io.Dir,
         allocator: std.mem.Allocator,
         clock: Clock,
-    ) Outbox {
+    ) InitError!Outbox {
+        state_root.createDirPath(io, outbox_dir_name) catch return error.IoFailure;
+
+        const lock_path = outbox_dir_name ++ "/.lock";
+        const lock_file = state_root.createFile(io, lock_path, .{
+            .truncate = false,
+            .read = false,
+        }) catch return error.IoFailure;
+        errdefer lock_file.close(io);
+
+        // LOCK_EX | LOCK_NB — exclusive, non-blocking. A second holder
+        // sees EAGAIN (same value as EWOULDBLOCK on POSIX) and we
+        // translate that to AlreadyLocked.
+        const op: c_int = @intCast(std.posix.LOCK.EX | std.posix.LOCK.NB);
+        if (std.c.flock(lock_file.handle, op) != 0) {
+            const e = std.c.errno(@as(c_int, -1));
+            if (e == .AGAIN) return error.AlreadyLocked;
+            return error.IoFailure;
+        }
+
         return .{
             .io = io,
             .state_root = state_root,
             .allocator = allocator,
             .clock = clock,
+            .lock_file = lock_file,
         };
+    }
+
+    /// Close the lock fd (implicitly releases the flock) and invalidate
+    /// the Outbox. Required before a second process — or a second
+    /// in-process Outbox pointing at the same state root — can open it.
+    pub fn deinit(self: *Outbox) void {
+        self.lock_file.close(self.io);
+        self.* = undefined;
     }
 
     fn nowMs(self: *const Outbox) i64 {
@@ -426,7 +479,8 @@ test "append writes one newline-terminated JSON record" {
     defer tmp.cleanup();
 
     var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
-    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer box.deinit();
     const id = try box.append(.telegram, .{
         .conversation_key = "chat-42",
         .text = "hello",
@@ -454,7 +508,8 @@ test "two appends produce two distinct ids" {
     defer tmp.cleanup();
 
     var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
-    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer box.deinit();
     const id1 = try box.append(.telegram, .{ .conversation_key = "c", .text = "one" });
     defer testing.allocator.free(id1);
     const id2 = try box.append(.telegram, .{ .conversation_key = "c", .text = "two" });
@@ -480,13 +535,15 @@ test "reopening on an existing file appends rather than truncates" {
 
     {
         var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
-        var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+        var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+        defer box.deinit();
         const id = try box.append(.telegram, .{ .conversation_key = "c", .text = "first" });
         testing.allocator.free(id);
     }
     {
         var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
-        var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+        var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+        defer box.deinit();
         const id = try box.append(.telegram, .{ .conversation_key = "c", .text = "second" });
         testing.allocator.free(id);
     }
@@ -504,7 +561,8 @@ test "cursor returns 3 pending records in file order" {
     defer tmp.cleanup();
 
     var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
-    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer box.deinit();
 
     const id1 = try box.append(.telegram, .{ .conversation_key = "c", .text = "one" });
     defer testing.allocator.free(id1);
@@ -531,7 +589,8 @@ test "ack on middle record causes cursor to skip it afterwards" {
     defer tmp.cleanup();
 
     var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
-    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer box.deinit();
 
     const id1 = try box.append(.telegram, .{ .conversation_key = "c", .text = "one" });
     defer testing.allocator.free(id1);
@@ -561,7 +620,8 @@ test "cursor skips records with a future next_due_unix_ms" {
     defer tmp.cleanup();
 
     var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
-    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer box.deinit();
 
     const id = try box.append(.telegram, .{ .conversation_key = "c", .text = "future" });
     defer testing.allocator.free(id);
@@ -581,7 +641,8 @@ test "persisted line round-trips through std.json.parseFromSlice" {
     defer tmp.cleanup();
 
     var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
-    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer box.deinit();
     const id = try box.append(.telegram, .{
         .conversation_key = "room-7",
         .thread_key = "topic-1",
@@ -614,7 +675,8 @@ test "recordFailure bumps attempts and pushes next_due forward" {
     defer tmp.cleanup();
 
     var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
-    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer box.deinit();
 
     const id = try box.append(.telegram, .{ .conversation_key = "c", .text = "retry-me" });
     defer testing.allocator.free(id);
@@ -638,7 +700,8 @@ test "cursor hides record until clock advances past backoff window" {
     defer tmp.cleanup();
 
     var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
-    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer box.deinit();
 
     const id = try box.append(.telegram, .{ .conversation_key = "c", .text = "retry-me" });
     defer testing.allocator.free(id);
@@ -666,7 +729,8 @@ test "recordFailure on an unknown id returns UnknownId" {
     defer tmp.cleanup();
 
     var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
-    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer box.deinit();
     const id = try box.append(.telegram, .{ .conversation_key = "c", .text = "x" });
     defer testing.allocator.free(id);
 
@@ -680,7 +744,8 @@ test "bumped attempts survives reopening the outbox" {
     var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
 
     const id = blk: {
-        var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+        var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+        defer box.deinit();
         const id = try box.append(.telegram, .{ .conversation_key = "c", .text = "persisted" });
         try recordFailure(&box, .telegram, id);
         break :blk id;
@@ -689,11 +754,43 @@ test "bumped attempts survives reopening the outbox" {
 
     // Fresh Outbox on the same dir, clock advanced past backoff.
     manual.value_ns += 2_000 * std.time.ns_per_ms;
-    var box = Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    var box = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer box.deinit();
     var c = try box.cursor(.telegram);
     defer c.deinit();
 
     const p = (try c.next()) orelse return error.TestUnexpectedNull;
     try testing.expectEqualStrings("persisted", p.text);
     try testing.expectEqual(@as(u32, 1), p.attempts);
+}
+
+test "init: second Outbox on same state root fails with AlreadyLocked" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
+
+    var first = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer first.deinit();
+
+    // Same dir, lock still held — second init must refuse.
+    try testing.expectError(
+        error.AlreadyLocked,
+        Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock()),
+    );
+}
+
+test "init: reacquire after deinit succeeds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
+
+    {
+        var first = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+        first.deinit();
+    }
+    // Lock released — a fresh init on the same state root must succeed.
+    var second = try Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer second.deinit();
 }

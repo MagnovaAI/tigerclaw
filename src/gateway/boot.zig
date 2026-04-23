@@ -127,7 +127,8 @@ pub const Boot = struct {
         var allowlist = try allowlist_mod.Allowlist.init(allocator, opts.allowlist);
         errdefer allowlist.deinit();
 
-        const outbox = outbox_mod.Outbox.init(io, opts.state_root, allocator, opts.clock);
+        var outbox = try outbox_mod.Outbox.init(io, opts.state_root, allocator, opts.clock);
+        errdefer outbox.deinit();
 
         const initial_settings = loadSettings(allocator, io, opts.state_root, opts.config_path) orelse
             settings_mod.schema.defaultSettings();
@@ -205,6 +206,7 @@ pub const Boot = struct {
         self.manager.deinit();
         self.allowlist.deinit();
         self.dispatch.deinit();
+        self.outbox.deinit();
         for (self.snapshots.items) |s| self.allocator.destroy(s);
         self.snapshots.deinit(self.allocator);
         self.* = undefined;
