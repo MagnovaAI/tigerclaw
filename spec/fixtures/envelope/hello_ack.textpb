@@ -1,0 +1,9 @@
+envelope_v: 1
+verb: HELLO_ACK
+conversation_id: "handshake-01"
+in_reply_to: "env-hello-1"
+origin_channel_id: "chan-collab-http-a2a:remote"
+sender_id: "agent:tiger"
+sent_at_ms: 1745000000100
+body_mime: "application/json"
+body: "{\"vtable_version\":1,\"caps\":[\"persona\",\"channel\",\"tools\"]}"

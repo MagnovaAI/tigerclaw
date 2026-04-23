@@ -1,0 +1,120 @@
+// Envelope v1 — the canonical cross-boundary message shape.
+//
+// Every message crossing a process boundary (gateway <-> client, agent
+// <-> agent, gateway <-> sidecar) is a serialized Envelope. In-process
+// plug-to-plug calls use the Zig struct directly.
+//
+// Schema evolution rules:
+//   - Field numbers 1..15 are v1 core. Never reused, never retyped.
+//   - Field numbers 16..99 are RESERVED for v1 extensions without a
+//     breaking change. Only add under the reserved range.
+//   - Field numbers 100+ require a new envelope version (envelope_v=2).
+//   - Signing uses proto3 deterministic canonical encoding over every
+//     field EXCEPT sender_sig (field 7).
+//
+// Spec: docs/spec/agent-architecture-v3.yaml §architecture.envelope
+
+syntax = "proto3";
+package tigerclaw.envelope.v1;
+
+message Envelope {
+  // Schema version. Always 1 in v1; decoders reject any other value.
+  uint32 envelope_v = 1;
+
+  // What kind of message this is. See Verb enum below.
+  Verb verb = 2;
+
+  // Stable id for the conversation this envelope belongs to.
+  string conversation_id = 3;
+
+  // If this is a reply, the id of the envelope being replied to.
+  optional string in_reply_to = 4;
+
+  // Which channel the message came in on. For reactive turns, replies
+  // pin to the same origin. Format: "chan-<plug-id>:<scope>:<sub>".
+  string origin_channel_id = 5;
+
+  // Canonical peer id of the sender. Format: "<kind>:<identifier>".
+  // Example: "user:omkar", "agent:reviewer-01",
+  // "discord_user:112233445566".
+  string sender_id = 6;
+
+  // Ed25519 signature over the canonical bytes (every field EXCEPT
+  // this one). Presence is required for cross-process envelopes.
+  optional bytes sender_sig = 7;
+
+  // Wall-clock send timestamp in milliseconds since Unix epoch.
+  int64 sent_at_ms = 8;
+
+  // Optional nonce for replay protection.
+  optional bytes nonce = 9;
+
+  // MIME type of `body`. Almost always "application/json".
+  string body_mime = 10;
+
+  // Opaque payload; interpretation depends on verb + body_mime.
+  // Tool calls, LLM responses, channel messages all go here.
+  bytes body = 11;
+
+  // Optional caller-specified budget ceilings for this turn.
+  optional uint32 max_tokens = 12;
+  optional uint32 max_wall_ms = 13;
+  optional uint32 max_cost_usd_micros = 14;
+
+  // Optional attachments (images, files). Large blobs go by reference
+  // via content-addressed blob store (see WORKING_DIR_TREE.yaml).
+  repeated Attachment attachments = 15;
+
+  // Reserved field numbers for forward-compat extensions inside v1.
+  reserved 16 to 99;
+}
+
+// Kind of envelope. Defines the shape expected of `body` and who can
+// send/receive.
+enum Verb {
+  VERB_UNSPECIFIED = 0;
+
+  // A user or peer message inbound to the agent.
+  USER_MSG = 1;
+
+  // Agent asking a tool to execute.
+  TOOL_CALL = 2;
+
+  // Tool result returned to the agent.
+  TOOL_RESULT = 3;
+
+  // Agent reply to a user or peer.
+  REPLY = 4;
+
+  // Agent retracting a previously-streamed partial reply.
+  RETRACT = 5;
+
+  // Peer-to-peer handshake: introduce self + negotiate schema version.
+  HELLO = 6;
+
+  // Handshake acknowledgement.
+  HELLO_ACK = 7;
+
+  // Peer refuses to continue (usually on version mismatch or policy).
+  REFUSE = 8;
+
+  // Liveness beacon on a long-lived connection.
+  HEARTBEAT = 9;
+
+  // Reserved for future verbs.
+  reserved 10 to 99;
+}
+
+message Attachment {
+  // Filename or label for the attachment.
+  string name = 1;
+
+  // MIME type of the attachment bytes.
+  string mime = 2;
+
+  // Inline bytes. For large blobs (> 256 KB) prefer a content-addressed
+  // blob reference via body (mime "application/vnd.tigerclaw.blobref").
+  bytes data = 3;
+
+  reserved 4 to 99;
+}

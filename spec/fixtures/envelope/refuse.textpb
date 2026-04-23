@@ -1,0 +1,9 @@
+envelope_v: 1
+verb: REFUSE
+conversation_id: "handshake-01"
+in_reply_to: "env-hello-2"
+origin_channel_id: "chan-collab-http-a2a:remote"
+sender_id: "agent:tiger"
+sent_at_ms: 1745000000200
+body_mime: "application/json"
+body: "{\"reason\":\"vtable_version_mismatch\",\"want\":1,\"got\":2}"

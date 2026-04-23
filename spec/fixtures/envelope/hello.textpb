@@ -1,0 +1,8 @@
+envelope_v: 1
+verb: HELLO
+conversation_id: "handshake-01"
+origin_channel_id: "chan-collab-http-a2a:remote"
+sender_id: "agent:reviewer-01"
+sent_at_ms: 1745000000000
+body_mime: "application/json"
+body: "{\"vtable_version\":1,\"caps\":[\"persona\",\"channel\"]}"

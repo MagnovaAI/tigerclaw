@@ -1,0 +1,8 @@
+envelope_v: 1
+verb: HEARTBEAT
+conversation_id: "handshake-01"
+origin_channel_id: "chan-collab-http-a2a:remote"
+sender_id: "agent:tiger"
+sent_at_ms: 1745000030000
+body_mime: "application/octet-stream"
+body: ""

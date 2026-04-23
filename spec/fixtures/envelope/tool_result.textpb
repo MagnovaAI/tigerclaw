@@ -1,0 +1,9 @@
+envelope_v: 1
+verb: TOOL_RESULT
+conversation_id: "conv-01"
+in_reply_to: "env-2"
+origin_channel_id: "chan-cli:local"
+sender_id: "tool:tigerclaw"
+sent_at_ms: 1745000001500
+body_mime: "application/json"
+body: "{\"output\":\"# README\\n\"}"

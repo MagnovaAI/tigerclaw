@@ -1,0 +1,8 @@
+envelope_v: 1
+verb: USER_MSG
+conversation_id: "conv-01"
+origin_channel_id: "chan-cli:local"
+sender_id: "user:omkar"
+sent_at_ms: 1745000000000
+body_mime: "application/json"
+body: "{\"text\":\"hi\"}"
