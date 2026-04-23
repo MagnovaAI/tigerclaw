@@ -13,6 +13,7 @@ pub const middleware = @import("middleware.zig");
 pub const routes = @import("routes.zig");
 pub const tcp_server = @import("tcp_server.zig");
 pub const boot = @import("boot.zig");
+pub const startup_log = @import("startup_log.zig");
 
 pub const Method = router.Method;
 pub const Route = router.Route;

@@ -1,6 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli/root.zig");
+const log_formatter = @import("gateway/log_formatter.zig");
+
+/// Route all `std.log` calls through the gateway log formatter. The
+/// formatter gates `.debug` on a runtime flag so `--verbose` can
+/// flip debug on without recompilation.
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = log_formatter.logFn,
+};
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -327,6 +336,7 @@ pub fn main(init: std.process.Init) !u8 {
                 try stderr_w.interface.print("tigerclaw: invalid bind {s}:{d}\n", .{ opts.host, opts.port });
                 return 64;
             };
+            const want_color = shouldEnableColor(init.environ_map, opts.force_color);
             cli.commands.gateway.runGateway(arena, io, .{
                 .address = addr,
                 .state_dir_path = state_path,
@@ -335,6 +345,9 @@ pub fn main(init: std.process.Init) !u8 {
                 // Per-request agent dispatch flips on with the runner
                 // registry in v0.2.0.
                 .agent_name = "tiger",
+                .verbose = opts.verbose,
+                .color = want_color,
+                .host_str = opts.host,
             }, &stdout_w.interface, &stderr_w.interface) catch |e| {
                 try stderr_w.interface.print("tigerclaw: gateway failed: {s}\n", .{@errorName(e)});
                 return 1;
@@ -412,6 +425,24 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
+/// Decide whether to emit ANSI colour. Honours `NO_COLOR` (any
+/// non-empty value disables colour per the informal standard at
+/// no-color.org) and the common `TERM=dumb` marker. On non-POSIX
+/// targets we currently stay monochrome.
+fn shouldEnableColor(env: *std.process.Environ.Map, force: bool) bool {
+    if (force) return true;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return false;
+    // NO_COLOR wins over FORCE_COLOR per the informal standard.
+    if (env.get("NO_COLOR")) |v| if (v.len > 0) return false;
+    // FORCE_COLOR=1 / any non-empty value opts in even without a TTY.
+    // Useful when piping into pagers that do grok ANSI (e.g. `less -R`).
+    if (env.get("FORCE_COLOR")) |v| if (v.len > 0) return true;
+    if (env.get("TERM")) |t| if (std.mem.eql(u8, t, "dumb")) return false;
+    // Zig 0.16 dropped std.posix.isatty; use libc directly. stdout is
+    // the banner sink, so we probe fd 1 rather than fd 2 here.
+    return std.c.isatty(1) != 0;
+}
+
 fn runDoctor(
     arena: std.mem.Allocator,
     environ_map: *std.process.Environ.Map,
@@ -431,4 +462,74 @@ test {
     // Pull in tests from the library surface so `zig build test`
     // (rooted at main.zig) sees all of them.
     std.testing.refAllDecls(@import("root.zig"));
+}
+
+// ── shouldEnableColor tests ──────────────────────────────────
+//
+// Pure-function coverage for the env-driven color policy. We
+// cannot assert the isatty-backed "no env, is TTY" branch here
+// reliably — the test runner may or may not be attached to one —
+// so these tests only cover the early-return paths.
+
+fn makeEnvMap(
+    allocator: std.mem.Allocator,
+    entries: []const [2][]const u8,
+) !std.process.Environ.Map {
+    var map = std.process.Environ.Map.init(allocator);
+    for (entries) |kv| try map.put(kv[0], kv[1]);
+    return map;
+}
+
+test "shouldEnableColor: force=true always wins" {
+    var map = try makeEnvMap(std.testing.allocator, &.{
+        .{ "NO_COLOR", "1" },
+        .{ "TERM", "dumb" },
+    });
+    defer map.deinit();
+    try std.testing.expect(shouldEnableColor(&map, true));
+}
+
+test "shouldEnableColor: NO_COLOR disables even with FORCE_COLOR" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    var map = try makeEnvMap(std.testing.allocator, &.{
+        .{ "NO_COLOR", "1" },
+        .{ "FORCE_COLOR", "1" },
+    });
+    defer map.deinit();
+    try std.testing.expect(!shouldEnableColor(&map, false));
+}
+
+test "shouldEnableColor: empty NO_COLOR does not disable" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    var map = try makeEnvMap(std.testing.allocator, &.{
+        .{ "NO_COLOR", "" },
+        .{ "FORCE_COLOR", "1" },
+    });
+    defer map.deinit();
+    try std.testing.expect(shouldEnableColor(&map, false));
+}
+
+test "shouldEnableColor: FORCE_COLOR beats missing TTY" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    var map = try makeEnvMap(std.testing.allocator, &.{
+        .{ "FORCE_COLOR", "1" },
+    });
+    defer map.deinit();
+    try std.testing.expect(shouldEnableColor(&map, false));
+}
+
+test "shouldEnableColor: TERM=dumb disables when nothing forces it" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    var map = try makeEnvMap(std.testing.allocator, &.{
+        .{ "TERM", "dumb" },
+    });
+    defer map.deinit();
+    try std.testing.expect(!shouldEnableColor(&map, false));
+}
+
+test "shouldEnableColor: windows/wasi stay monochrome without force" {
+    if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) return error.SkipZigTest;
+    var map = try makeEnvMap(std.testing.allocator, &.{});
+    defer map.deinit();
+    try std.testing.expect(!shouldEnableColor(&map, false));
 }

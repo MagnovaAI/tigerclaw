@@ -30,6 +30,11 @@ pub const RunOptions = struct {
     /// Bind port. 8765 is the canonical local default the CLI verbs
     /// (agent, sessions, providers status, etc.) probe by default.
     port: u16 = 8765,
+    /// Enable verbose/debug logging for gateway operations.
+    verbose: bool = false,
+    /// Force-enable ANSI colour even when stdout is not a TTY.
+    /// Equivalent to `FORCE_COLOR=1`.
+    force_color: bool = false,
 };
 
 pub const LogsOptions = struct {
@@ -84,6 +89,14 @@ fn parseRunOptions(argv: []const []const u8) ParseError!RunOptions {
             if (i + 1 >= argv.len) return error.MissingFlagValue;
             opts.host = argv[i + 1];
             i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
+            opts.verbose = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--color")) {
+            opts.force_color = true;
             continue;
         }
         return error.UnknownFlag;
@@ -272,6 +285,10 @@ const clock_mod = @import("../../clock.zig");
 const tcp_server = @import("../../gateway/tcp_server.zig");
 const live_runner = @import("live_runner.zig");
 const agent_registry = @import("agent_registry.zig");
+const startup_log = @import("../../gateway/startup_log.zig");
+const log_formatter = @import("../../gateway/log_formatter.zig");
+
+const gw_log = std.log.scoped(.gateway);
 
 pub const RunRunOptions = struct {
     /// Resolved bind. Production main resolves --host into an IpAddress;
@@ -289,6 +306,14 @@ pub const RunRunOptions = struct {
     /// v0.1.0. Per-request agent dispatch lands when the runner gets
     /// promoted from a single-agent shim to a registry.
     agent_name: []const u8 = "tiger",
+    /// Enable verbose/debug logging.
+    verbose: bool = false,
+    /// Enable ANSI colour in the banner and log lines. Caller
+    /// decides based on NO_COLOR / isatty / --color flags.
+    color: bool = false,
+    /// Pre-formatted host string for the banner (the IpAddress
+    /// union doesn't expose a cheap to_string in Zig 0.16).
+    host_str: []const u8 = "127.0.0.1",
 };
 
 pub const RunRunError = error{
@@ -316,6 +341,13 @@ pub fn runGateway(
     out: *std.Io.Writer,
     err_w: *std.Io.Writer,
 ) RunRunError!void {
+    _ = err_w;
+    // Wire runtime log state. `--verbose` bumps the logFn gate to
+    // emit `.debug`; colour is off unless the caller explicitly
+    // opted in via NO_COLOR / isatty logic at the main.zig layer.
+    log_formatter.setVerbose(opts.verbose);
+    log_formatter.setColor(opts.color);
+
     var state_dir = std.Io.Dir.cwd().openDir(io, opts.state_dir_path, .{}) catch |e| switch (e) {
         error.FileNotFound => blk: {
             std.Io.Dir.cwd().createDirPath(io, opts.state_dir_path) catch return error.StateDirOpenFailed;
@@ -339,34 +371,90 @@ pub fn runGateway(
     }) catch return error.BindFailed;
     defer boot.deinit();
 
-    // Pre-load every agent under ~/.tigerclaw/agents. The route
-    // handler routes turns by `req.session_id` (the CLI sets that to
-    // the agent name) and falls back to a mock when no live runner
-    // can be loaded so tests + bare boot still come up cleanly.
+    // Pre-load every agent under ~/.tigerclaw/agents. Registry
+    // load happens before the banner so the banner can show the
+    // final agent list; we therefore hold any per-agent debug
+    // output until after the banner prints (see below).
     var registry = agent_registry.AgentRegistry.init(allocator);
     defer registry.deinit();
+    var load_err: ?anyerror = null;
     if (opts.home_path.len > 0) {
         registry.loadAll(io, opts.home_path) catch |e| {
-            try err_w.print("tigerclaw: agent registry load warning: {s}\n", .{@errorName(e)});
+            load_err = e;
         };
-        try out.print("tigerclaw: loaded {d} live agent(s)\n", .{registry.entries.items.len});
-        for (registry.entries.items) |e| {
-            try out.print("  - {s} ({s} / {s})\n", .{
-                e.name,
-                @tagName(e.runner.provider_kind),
-                e.runner.model,
-            });
-        }
-    } else {
-        try err_w.writeAll("tigerclaw: no HOME — falling back to mock runner\n");
     }
     var ctx: gateway_root.routes.Context = .{ .runner = registry.runner() };
 
-    try out.print("tigerclaw gateway listening on {f}\n", .{opts.address});
-    try out.flush();
+    // Build the agent-name list for the banner without allocating
+    // in the banner path. The registry owns these slices for the
+    // duration of this function. Capped at 32 entries to keep the
+    // stack buffer tiny; we warn once if a deployment exceeds that.
+    var agent_names_buf: [32][]const u8 = undefined;
+    var agent_names_len: usize = 0;
+    for (registry.entries.items) |e| {
+        if (agent_names_len == agent_names_buf.len) break;
+        agent_names_buf[agent_names_len] = e.name;
+        agent_names_len += 1;
+    }
+    const agent_truncated = registry.entries.items.len > agent_names_buf.len;
+
+    // Pick a representative "agent model" for the banner line —
+    // the first entry's provider/model. When no agents are loaded
+    // the line is omitted entirely.
+    // Lifetime: `model_buf` is a stack var in runGateway and the
+    // `?[]const u8` slice below aliases it. That is safe because
+    // `printBanner` returns synchronously before this frame unwinds.
+    var model_buf: [128]u8 = undefined;
+    const agent_model: ?[]const u8 = if (registry.entries.items.len > 0) blk: {
+        const e = registry.entries.items[0];
+        break :blk std.fmt.bufPrint(&model_buf, "{s}/{s}", .{
+            @tagName(e.runner.provider_kind),
+            e.runner.model,
+        }) catch null;
+    } else null;
+
+    // Pretty banner on stdout (the CLI writer). Runtime log lines
+    // (warnings, debug, request traces) go to stderr via the
+    // std.log formatter. Version + commit come from build_options
+    // — the build step derives them from today's date and .git/HEAD
+    // unless overridden with `-Dversion=` / `-Dcommit=`.
+    const build_options = @import("build_options");
+    startup_log.printBanner(out, .{
+        .version = build_options.version,
+        .commit = build_options.commit,
+        .host = opts.host_str,
+        .port = opts.address.getPort(),
+        .agent_model = agent_model,
+        .loaded_agents = agent_names_buf[0..agent_names_len],
+        .verbose = opts.verbose,
+        .color = opts.color,
+    });
+
+    // Post-banner diagnostics. Warnings surface regardless of
+    // verbose; the per-agent dump only fires under `--verbose`
+    // because the banner already lists agent names.
+    if (load_err) |e| {
+        gw_log.warn("agent registry load warning: {s}", .{@errorName(e)});
+    }
+    if (agent_truncated) {
+        gw_log.warn(
+            "banner agent list truncated: {d} of {d} agents shown",
+            .{ agent_names_buf.len, registry.entries.items.len },
+        );
+    }
+    if (opts.home_path.len == 0) {
+        gw_log.debug("no HOME — falling back to mock runner", .{});
+    }
+    for (registry.entries.items) |e| {
+        gw_log.debug("agent {s} ({s}/{s})", .{
+            e.name,
+            @tagName(e.runner.provider_kind),
+            e.runner.model,
+        });
+    }
 
     boot.run(&ctx) catch |e| {
-        try err_w.print("tigerclaw: gateway exited with error: {s}\n", .{@errorName(e)});
+        gw_log.err("gateway exited with error: {s}", .{@errorName(e)});
         return;
     };
 

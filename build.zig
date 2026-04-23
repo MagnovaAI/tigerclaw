@@ -28,7 +28,30 @@ pub fn build(b: *std.Build) void {
     const enable_openrouter = hasToken(extensions_spec, "openrouter");
     const enable_telegram = hasToken(extensions_spec, "telegram");
 
+    // CalVer — YYYY.M.D. Release pipelines override with
+    // `-Dversion=2026.4.11`; local dev builds derive it from the
+    // current date so `tigerclaw gateway` shows something useful.
+    const default_version = calverToday(b.allocator) catch "dev";
+    const app_version = b.option(
+        []const u8,
+        "version",
+        "CalVer version string embedded in the binary (default: today)",
+    ) orelse default_version;
+
+    // Short git SHA for the working tree. Release pipelines pass
+    // `-Dcommit=769908e`; local dev builds read `.git/HEAD` directly
+    // via a small helper so the banner shows the live commit without
+    // requiring `git` on PATH.
+    const default_commit = gitShortSha(b.allocator) orelse "dev";
+    const app_commit = b.option(
+        []const u8,
+        "commit",
+        "Short git SHA embedded in the binary (default: HEAD)",
+    ) orelse default_commit;
+
     const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", app_version);
+    build_options.addOption([]const u8, "commit", app_commit);
     build_options.addOption(bool, "enable_anthropic", enable_anthropic);
     build_options.addOption(bool, "enable_openai", enable_openai);
     build_options.addOption(bool, "enable_bedrock", enable_bedrock);
@@ -294,4 +317,83 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+}
+
+/// Derive a CalVer string `YYYY.M.D` from the current wall clock.
+/// Used as the default for `-Dversion`. Returns a slice allocated
+/// on the build graph arena so the string outlives the build step.
+fn calverToday(allocator: std.mem.Allocator) ![]const u8 {
+    // Zig 0.16 removed std.time.timestamp; reach for libc directly.
+    var ts: std.c.timespec = undefined;
+    const rc = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const epoch_secs: u64 = if (rc == 0) @intCast(@max(@as(i64, 0), ts.sec)) else 0;
+    const day_secs: u64 = 86400;
+
+    // Days since 1970-01-01 via Euclidean date math (civil_from_days).
+    // Source: Howard Hinnant's "Ghost of Departed Proofs" Date
+    // Algorithms — correct for every day in the Gregorian calendar.
+    const days: i64 = @intCast(epoch_secs / day_secs);
+    const z: i64 = days + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: u64 = @intCast(z - era * 146097);
+    const yoe: u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const y: i64 = @as(i64, @intCast(yoe)) + era * 400;
+    const doy: u64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp: u64 = (5 * doy + 2) / 153;
+    const d: u64 = doy - (153 * mp + 2) / 5 + 1;
+    const m: u64 = if (mp < 10) mp + 3 else mp - 9;
+    const year: i64 = if (m <= 2) y + 1 else y;
+
+    return std.fmt.allocPrint(allocator, "{d}.{d}.{d}", .{ year, m, d });
+}
+
+/// Read the short (7-char) git SHA of the working-tree `HEAD` by
+/// parsing `.git/HEAD` via libc fopen/fread. We do not shell out to
+/// `git` so the build stays self-contained; we do not use the Zig
+/// 0.16 std.Io.Dir layer either because build.zig runs before the
+/// Io provider is wired. Returns null when the repo layout doesn't
+/// match (tarball build, shallow clone without `.git`, etc.);
+/// callers fall back to "dev".
+fn gitShortSha(allocator: std.mem.Allocator) ?[]const u8 {
+    const head_bytes = readSmallFile(allocator, ".git/HEAD") orelse return null;
+    defer allocator.free(head_bytes);
+
+    const trimmed = std.mem.trim(u8, head_bytes, " \t\r\n");
+
+    // Two forms:
+    //   (1) `ref: refs/heads/<branch>` — follow the ref to the SHA
+    //   (2) `<40-char sha>`             — detached HEAD, use directly
+    const ref_prefix = "ref: ";
+    if (std.mem.startsWith(u8, trimmed, ref_prefix)) {
+        const ref_path = trimmed[ref_prefix.len..];
+        const full_path = std.fmt.allocPrint(allocator, ".git/{s}", .{ref_path}) catch return null;
+        defer allocator.free(full_path);
+        const ref_bytes = readSmallFile(allocator, full_path) orelse return null;
+        defer allocator.free(ref_bytes);
+        const sha_hex = std.mem.trim(u8, ref_bytes, " \t\r\n");
+        if (sha_hex.len < 7) return null;
+        return allocator.dupe(u8, sha_hex[0..7]) catch null;
+    }
+
+    if (trimmed.len < 7) return null;
+    return allocator.dupe(u8, trimmed[0..7]) catch null;
+}
+
+/// Slurp a small text file via libc. Returns `null` on any failure;
+/// callers treat that as "not a git repo" and fall back.
+fn readSmallFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    // Build a NUL-terminated path for libc; fopen requires C strings.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len + 1 > path_buf.len) return null;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const c_path: [*:0]const u8 = @ptrCast(&path_buf);
+
+    const file = std.c.fopen(c_path, "rb") orelse return null;
+    defer _ = std.c.fclose(file);
+
+    var buf: [1024]u8 = undefined;
+    const n = std.c.fread(&buf, 1, buf.len, file);
+    if (n == 0) return null;
+    return allocator.dupe(u8, buf[0..n]) catch null;
 }
