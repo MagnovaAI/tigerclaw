@@ -214,21 +214,49 @@ fn runHttp(
     const body = try buildRequestBody(allocator, request, 1024);
     defer allocator.free(body);
 
-    const uri = std.Uri.parse(cfg.endpoint) catch
+    // Anthropic OAuth tokens (sk-ant-oat01-...) speak the same Messages
+    // endpoint but switch authentication: Bearer auth, ?beta=true on
+    // the URL, anthropic-beta: oauth-2025-04-20, and a Claude CLI
+    // user-agent. Standard sk-ant-api03- keys keep the x-api-key path.
+    const is_oauth = std.mem.startsWith(u8, cfg.api_key, "sk-ant-oat01-");
+
+    const oauth_url_buf_size = 256;
+    var oauth_url_buf: [oauth_url_buf_size]u8 = undefined;
+    const endpoint_str = if (is_oauth) blk: {
+        const sep: u8 = if (std.mem.indexOfScalar(u8, cfg.endpoint, '?') != null) '&' else '?';
+        const u = std.fmt.bufPrint(&oauth_url_buf, "{s}{c}beta=true", .{ cfg.endpoint, sep }) catch
+            return refusal(allocator, "anthropic transport error: endpoint too long", .{});
+        break :blk u;
+    } else cfg.endpoint;
+
+    const uri = std.Uri.parse(endpoint_str) catch
         return refusal(allocator, "anthropic transport error: invalid endpoint", .{});
 
     var client: std.http.Client = .{ .allocator = allocator, .io = cfg.io };
     defer client.deinit();
 
-    var extra_buf: [4]std.http.Header = undefined;
+    var auth_buf: [512]u8 = undefined;
+    var extra_buf: [6]std.http.Header = undefined;
     var extra_len: usize = 0;
-    extra_buf[extra_len] = .{ .name = "x-api-key", .value = cfg.api_key };
-    extra_len += 1;
+    if (is_oauth) {
+        const v = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{cfg.api_key}) catch
+            return refusal(allocator, "anthropic transport error: api_key too long", .{});
+        extra_buf[extra_len] = .{ .name = "authorization", .value = v };
+        extra_len += 1;
+    } else {
+        extra_buf[extra_len] = .{ .name = "x-api-key", .value = cfg.api_key };
+        extra_len += 1;
+    }
     extra_buf[extra_len] = .{ .name = "anthropic-version", .value = cfg.api_version };
     extra_len += 1;
     extra_buf[extra_len] = .{ .name = "content-type", .value = "application/json" };
     extra_len += 1;
-    if (cfg.beta_features.len > 0) {
+    if (is_oauth) {
+        extra_buf[extra_len] = .{ .name = "anthropic-beta", .value = "oauth-2025-04-20" };
+        extra_len += 1;
+        extra_buf[extra_len] = .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" };
+        extra_len += 1;
+    } else if (cfg.beta_features.len > 0) {
         extra_buf[extra_len] = .{ .name = "anthropic-beta", .value = cfg.beta_features };
         extra_len += 1;
     }
@@ -279,8 +307,14 @@ fn runHttp(
         );
     }
 
+    // Anthropic's HTTP layer auto-negotiates Accept-Encoding so the
+    // response body may arrive gzip- or zstd-compressed. Use the
+    // `readerDecompressing` variant so the parser sees plain SSE
+    // bytes regardless of what content-encoding the server picked.
     var transfer_buf: [4096]u8 = undefined;
-    const body_reader = response.reader(&transfer_buf);
+    var decompress: std.http.Decompress = undefined;
+    var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    const body_reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
     return parseStream(allocator, .{ .reader = body_reader });
 }
 
