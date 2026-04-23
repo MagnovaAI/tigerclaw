@@ -12,6 +12,7 @@ pub const context = @import("context.zig");
 pub const registry = @import("registry.zig");
 pub const manifest = @import("manifest.zig");
 pub const dep_graph = @import("dep_graph.zig");
+pub const lifecycle = @import("lifecycle.zig");
 pub const channels = @import("channels/root.zig");
 pub const cli = @import("cli/root.zig");
 pub const clock = @import("clock.zig");
