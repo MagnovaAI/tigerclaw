@@ -31,6 +31,14 @@ pub const commands = struct {
 pub const version_string = version.string;
 
 pub const AgentArgs = struct {
+    /// Positional agent name (e.g. `tigerclaw agent tiger -m "hi"`).
+    /// Required — the verb addresses a specific configured agent. The
+    /// session id derives from `(agent_name, "default")` when --session
+    /// is omitted.
+    agent_name: []const u8 = "",
+    /// User-facing message. When set, gets POSTed in the turn body.
+    /// Empty means "no payload" (the mock runner echoes regardless).
+    message: []const u8 = "",
     /// Defaults to "http://127.0.0.1:8765" — the canonical local
     /// gateway address. Override via --base-url.
     base_url: []const u8 = "http://127.0.0.1:8765",
@@ -53,6 +61,7 @@ pub const Command = union(enum) {
     providers: commands.providers.Subcommand,
     models: commands.models.Subcommand,
     diag: commands.diag.Subcommand,
+    gateway: commands.gateway.RunOptions,
     gateway_logs: commands.gateway.LogsOptions,
     uninstall: commands.uninstall.Args,
     unknown: []const u8,
@@ -83,7 +92,8 @@ pub const ParseError = error{
     DiagMissingEventId,
     DiagInvalidLineCount,
     GatewayLogsInvalidTailCount,
-    GatewayLogsConflictingFlags,
+    GatewayInvalidPort,
+    AgentMissingName,
 };
 
 /// Top-level command table. Summaries feed the help screen and shell
@@ -96,7 +106,7 @@ pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "providers", .summary = "List LLM providers and probe reachability" },
     .{ .name = "models", .summary = "List known models, show the default, override per session" },
     .{ .name = "diag", .summary = "Inspect recent diagnostic events" },
-    .{ .name = "gateway", .summary = "Gateway daemon controls (logs in v0.1.0)" },
+    .{ .name = "gateway", .summary = "Run the gateway daemon (or `gateway logs` to tail)" },
     .{ .name = "uninstall", .summary = "Remove the binary and the local state directory" },
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
@@ -194,21 +204,17 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
         return .{ .diag = sub };
     }
     if (std.mem.eql(u8, match.descriptor.name, "gateway")) {
-        // v0.1.0 only wires up the `logs` sub-verb from the CLI. The
-        // daemon control verbs (start/stop/status/restart/serve) are
-        // parsed by `commands.gateway.parse` but not yet dispatched
-        // from main — flag them as unknown so users aren't misled.
         const verb = commands.gateway.parse(match.argv[1..]) catch |err| switch (err) {
-            error.MissingSubVerb, error.UnknownSubVerb => return .{ .unknown = "gateway" },
+            error.UnknownSubVerb => return .{ .unknown = "gateway" },
             error.UnknownFlag => return error.UnknownFlag,
             error.MissingFlagValue => return error.MissingFlagValue,
             error.InvalidTailCount => return error.GatewayLogsInvalidTailCount,
-            error.ConflictingFlags => return error.GatewayLogsConflictingFlags,
+            error.InvalidPort => return error.GatewayInvalidPort,
         };
-        switch (verb) {
-            .logs => |opts| return .{ .gateway_logs = opts },
-            else => return .{ .unknown = "gateway" },
-        }
+        return switch (verb) {
+            .run => |opts| .{ .gateway = opts },
+            .logs => |opts| .{ .gateway_logs = opts },
+        };
     }
 
     if (std.mem.eql(u8, match.descriptor.name, "uninstall")) {
@@ -223,14 +229,29 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
 
 fn parseAgent(rest: []const []const u8) ParseError!Command {
     var args: AgentArgs = .{};
-    var i: usize = 0;
+    if (rest.len == 0) return error.AgentMissingName;
+    // Positional agent name comes first; everything after is flags.
+    // The name itself must not look like a flag — a leading dash means
+    // the user forgot to include it.
+    const name = rest[0];
+    if (name.len == 0 or name[0] == '-') return error.AgentMissingName;
+    args.agent_name = name;
+    // Default the session id to the agent's "default" session so two
+    // invocations of `tigerclaw agent tiger -m ...` share state.
+    args.session_id = name;
+
+    var i: usize = 1;
     while (i < rest.len) : (i += 1) {
         const flag = rest[i];
-        if (std.mem.eql(u8, flag, "--base-url")) {
+        if (std.mem.eql(u8, flag, "-m") or std.mem.eql(u8, flag, "--message")) {
+            if (i + 1 >= rest.len) return error.MissingFlagValue;
+            i += 1;
+            args.message = rest[i];
+        } else if (std.mem.eql(u8, flag, "--base-url")) {
             if (i + 1 >= rest.len) return error.MissingFlagValue;
             i += 1;
             args.base_url = rest[i];
-        } else if (std.mem.eql(u8, flag, "--session")) {
+        } else if (std.mem.eql(u8, flag, "-s") or std.mem.eql(u8, flag, "--session")) {
             if (i + 1 >= rest.len) return error.MissingFlagValue;
             i += 1;
             args.session_id = rest[i];
@@ -359,30 +380,52 @@ test "printHelp: mentions banner, both flags, and the verbs in the table" {
     try testing.expect(std.mem.indexOf(u8, out, "completion") != null);
 }
 
-test "parse: agent verb with no flags yields defaults" {
-    const argv = [_][]const u8{"agent"};
+test "parse: agent <name> with no flags yields defaults plus the name" {
+    const argv = [_][]const u8{ "agent", "tiger" };
     const cmd = try parse(&argv);
+    try testing.expectEqualStrings("tiger", cmd.agent.agent_name);
     try testing.expectEqualStrings("http://127.0.0.1:8765", cmd.agent.base_url);
-    try testing.expectEqualStrings("mock-session", cmd.agent.session_id);
+    // session_id defaults to the agent name so two invocations share state.
+    try testing.expectEqualStrings("tiger", cmd.agent.session_id);
+    try testing.expectEqualStrings("", cmd.agent.message);
     try testing.expect(cmd.agent.bearer == null);
 }
 
-test "parse: agent --session overrides session_id" {
-    const argv = [_][]const u8{ "agent", "--session", "abc" };
+test "parse: agent <name> -m \"hi\" sets the message" {
+    const argv = [_][]const u8{ "agent", "tiger", "-m", "hi" };
+    const cmd = try parse(&argv);
+    try testing.expectEqualStrings("tiger", cmd.agent.agent_name);
+    try testing.expectEqualStrings("hi", cmd.agent.message);
+}
+
+test "parse: agent --session overrides the per-agent session id" {
+    const argv = [_][]const u8{ "agent", "tiger", "--session", "abc" };
     const cmd = try parse(&argv);
     try testing.expectEqualStrings("abc", cmd.agent.session_id);
 }
 
-test "parse: agent with all three flags set" {
-    const argv = [_][]const u8{ "agent", "--base-url", "http://x:1", "--session", "s", "--bearer", "t" };
+test "parse: agent with every flag set" {
+    const argv = [_][]const u8{ "agent", "tiger", "-m", "hello", "--base-url", "http://x:1", "-s", "s", "--bearer", "t" };
     const cmd = try parse(&argv);
+    try testing.expectEqualStrings("tiger", cmd.agent.agent_name);
+    try testing.expectEqualStrings("hello", cmd.agent.message);
     try testing.expectEqualStrings("http://x:1", cmd.agent.base_url);
     try testing.expectEqualStrings("s", cmd.agent.session_id);
     try testing.expectEqualStrings("t", cmd.agent.bearer.?);
 }
 
-test "parse: agent with unknown flag returns UnknownFlag" {
-    const argv = [_][]const u8{ "agent", "--nope" };
+test "parse: agent with no name returns AgentMissingName" {
+    const argv = [_][]const u8{"agent"};
+    try testing.expectError(error.AgentMissingName, parse(&argv));
+}
+
+test "parse: agent --flag-first (no positional) returns AgentMissingName" {
+    const argv = [_][]const u8{ "agent", "--session", "abc" };
+    try testing.expectError(error.AgentMissingName, parse(&argv));
+}
+
+test "parse: agent <name> with unknown flag returns UnknownFlag" {
+    const argv = [_][]const u8{ "agent", "tiger", "--nope" };
     try testing.expectError(error.UnknownFlag, parse(&argv));
 }
 

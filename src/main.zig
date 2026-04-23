@@ -121,8 +121,12 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: gateway logs --tail requires a non-negative integer\n");
             return 64;
         },
-        error.GatewayLogsConflictingFlags => {
-            try stderr_w.interface.writeAll("tigerclaw: gateway logs: conflicting flags\n");
+        error.GatewayInvalidPort => {
+            try stderr_w.interface.writeAll("tigerclaw: gateway --port requires a valid 1-65535 integer\n");
+            return 64;
+        },
+        error.AgentMissingName => {
+            try stderr_w.interface.writeAll("tigerclaw: agent <name> [-m \"message\"]\n");
             return 64;
         },
     };
@@ -140,6 +144,8 @@ pub fn main(init: std.process.Init) !u8 {
             cli.commands.agent.installInterruptHandler();
             const opts: cli.commands.agent.Options = .{
                 .base_url = args.base_url,
+                .agent_name = args.agent_name,
+                .message = args.message,
                 .session_id = args.session_id,
                 .bearer = args.bearer,
                 .out = &stdout_w.interface,
@@ -311,6 +317,27 @@ pub fn main(init: std.process.Init) !u8 {
             ) catch |e| switch (e) {
                 error.NotFound, error.FileReadFailed => return 1,
                 error.OutOfMemory, error.WriteFailed => return e,
+            };
+        },
+        .gateway => |opts| {
+            const home = init.environ_map.get("HOME") orelse "";
+            var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const state_path = try std.fmt.bufPrint(&state_buf, "{s}/.tigerclaw/state", .{home});
+            const addr = std.Io.net.IpAddress.parse(opts.host, opts.port) catch {
+                try stderr_w.interface.print("tigerclaw: invalid bind {s}:{d}\n", .{ opts.host, opts.port });
+                return 64;
+            };
+            cli.commands.gateway.runGateway(arena, io, .{
+                .address = addr,
+                .state_dir_path = state_path,
+                .home_path = home,
+                // v0.1.0 single-agent: every turn goes through `tiger`.
+                // Per-request agent dispatch flips on with the runner
+                // registry in v0.2.0.
+                .agent_name = "tiger",
+            }, &stdout_w.interface, &stderr_w.interface) catch |e| {
+                try stderr_w.interface.print("tigerclaw: gateway failed: {s}\n", .{@errorName(e)});
+                return 1;
             };
         },
         .gateway_logs => |opts| {
