@@ -185,9 +185,12 @@ pub fn build(b: *std.Build) void {
     }
     if (enable_telegram) {
         const ext = b.addModule("channel_telegram", .{
-            .root_source_file = b.path("extensions/channels-telegram/root.zig"),
+            .root_source_file = b.path("extensions/channel-telegram/root.zig"),
             .target = target,
             .optimize = optimize,
+            // Bot.nowMs uses std.c.clock_gettime now that
+            // std.time.milliTimestamp is gone in 0.16.
+            .link_libc = true,
         });
         ext.addImport("build_options", build_options_mod);
         ext.addImport("channels_spec", channels_spec_mod);

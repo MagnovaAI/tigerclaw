@@ -15,6 +15,7 @@ pub const router = @import("router.zig");
 pub const outbox = @import("outbox.zig");
 pub const manager = @import("manager.zig");
 pub const allowlist = @import("allowlist.zig");
+pub const startup = @import("startup.zig");
 
 /// Comptime-gated re-export of the Telegram extension. Replaced by
 /// an empty struct when the extension was disabled at build time so
@@ -31,4 +32,5 @@ test {
     std.testing.refAllDecls(@import("outbox.zig"));
     std.testing.refAllDecls(@import("manager.zig"));
     std.testing.refAllDecls(@import("allowlist.zig"));
+    std.testing.refAllDecls(@import("startup.zig"));
 }

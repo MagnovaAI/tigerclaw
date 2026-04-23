@@ -110,7 +110,12 @@ pub const Bot = struct {
             touched_ms: i64,
         };
 
-        mutex: std.Thread.Mutex = .{},
+        /// Atomic spinlock. Zig 0.16 dropped std.Thread.Mutex and
+        /// std.Io.Mutex requires an Io parameter on lock/unlock, which
+        /// would force the Bot-level Io down into the limiter for no
+        /// real benefit — the critical section is a few arithmetic
+        /// ops over a fixed-size buffer, shorter than a single syscall.
+        lock_state: std.atomic.Value(u8) = .init(0),
 
         global_tokens: f64 = global_burst,
         global_last_refill_ms: i64 = 0,
@@ -119,13 +124,22 @@ pub const Bot = struct {
         chats: [lru_capacity]ChatBucket = undefined,
         chats_len: usize = 0,
 
+        fn acquire(self: *RateLimiter) void {
+            while (self.lock_state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+                std.atomic.spinLoopHint();
+            }
+        }
+        fn release(self: *RateLimiter) void {
+            self.lock_state.store(0, .release);
+        }
+
         /// Returns 0 if a token was taken from both buckets, or the
         /// number of milliseconds the caller must sleep before retrying.
         /// Only decrements on success — callers can safely poll this in
         /// a sleep/retry loop.
         pub fn tryAcquire(self: *RateLimiter, chat_id: i64, now: i64) i64 {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.acquire();
+            defer self.release();
 
             if (!self.global_initialised) {
                 self.global_last_refill_ms = now;
@@ -284,6 +298,73 @@ pub const Bot = struct {
         return mid.integer;
     }
 
+    /// Minimal bot identity returned by `getMe`. Only the fields
+    /// startup actually uses — v1 carried a larger struct covering
+    /// first_name, can_join_groups, etc., which we don't need yet.
+    pub const Identity = struct {
+        id: i64,
+        /// Bot username without the leading `@`. Caller owns the slice.
+        username: []u8,
+
+        pub fn deinit(self: Identity, allocator: std.mem.Allocator) void {
+            allocator.free(self.username);
+        }
+    };
+
+    /// Confirm the token is valid and return the bot's username.
+    /// Startup uses this as a handshake — if it fails the daemon
+    /// refuses to register the channel rather than silently polling a
+    /// bad endpoint.
+    pub fn getMe(self: *Bot) !Identity {
+        const resp = self.postMethod("getMe", "{}", self.allocator) catch
+            return error.TransportFailure;
+        defer self.allocator.free(resp.body);
+
+        switch (resp.status) {
+            200 => {},
+            401, 403 => return error.Unauthorized,
+            else => return error.TransportFailure,
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp.body, .{}) catch
+            return error.TransportFailure;
+        defer parsed.deinit();
+
+        const ok = parsed.value.object.get("ok") orelse return error.TransportFailure;
+        if (ok != .bool or !ok.bool) return error.Unauthorized;
+
+        const result = parsed.value.object.get("result") orelse return error.TransportFailure;
+        if (result != .object) return error.TransportFailure;
+
+        const id_v = result.object.get("id") orelse return error.TransportFailure;
+        if (id_v != .integer) return error.TransportFailure;
+
+        const uname_v = result.object.get("username") orelse return error.TransportFailure;
+        if (uname_v != .string) return error.TransportFailure;
+
+        const uname_dup = self.allocator.dupe(u8, uname_v.string) catch
+            return error.OutOfMemory;
+        return .{ .id = id_v.integer, .username = uname_dup };
+    }
+
+    /// Clear any webhook Telegram currently holds for this bot without
+    /// dropping unacked updates. Telegram refuses `getUpdates` while a
+    /// webhook is active, so startup calls this unconditionally — it's
+    /// a no-op if no webhook is set.
+    pub fn deleteWebhookKeepPending(self: *Bot) !void {
+        const resp = self.postMethod(
+            "deleteWebhook",
+            "{\"drop_pending_updates\":false}",
+            self.allocator,
+        ) catch return error.TransportFailure;
+        defer self.allocator.free(resp.body);
+        switch (resp.status) {
+            200 => {},
+            401, 403 => return error.Unauthorized,
+            else => return error.TransportFailure,
+        }
+    }
+
     pub fn setMyCommands(self: *Bot, commands: []const Command) !void {
         var body_buf: std.array_list.Aligned(u8, null) = .empty;
         defer body_buf.deinit(self.allocator);
@@ -315,7 +396,14 @@ pub const Bot = struct {
 
     fn nowMs(self: *Bot) i64 {
         if (self.now_ms) |f| return f();
-        return std.time.milliTimestamp();
+        // std.time.milliTimestamp was dropped in Zig 0.16; go through
+        // libc clock_gettime and collapse to ms. link_libc is required
+        // on the extension module for this to resolve.
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+        const sec_ms: i64 = @divFloor(@as(i64, ts.sec) * std.time.ns_per_s, std.time.ns_per_ms);
+        const nsec_ms: i64 = @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
+        return sec_ms + nsec_ms;
     }
 
     const HttpResponse = struct {
@@ -332,14 +420,14 @@ pub const Bot = struct {
         body: []const u8,
         _: std.mem.Allocator,
     ) !HttpResponse {
-        var url_buf: std.array_list.Aligned(u8, null) = .empty;
-        defer url_buf.deinit(self.allocator);
-        try url_buf.writer(self.allocator).print(
+        const url = try std.fmt.allocPrint(
+            self.allocator,
             "{s}/bot{s}/{s}",
             .{ self.base_url, self.token, method },
         );
+        defer self.allocator.free(url);
 
-        const uri = try std.Uri.parse(url_buf.items);
+        const uri = try std.Uri.parse(url);
 
         var client: std.http.Client = .{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();

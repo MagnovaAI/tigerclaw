@@ -43,6 +43,8 @@ const allowlist_mod = @import("../channels/allowlist.zig");
 const dispatch_mod = @import("../channels/dispatch.zig");
 const manager_mod = @import("../channels/manager.zig");
 const outbox_mod = @import("../channels/outbox.zig");
+const startup_mod = @import("../channels/startup.zig");
+const agent_registry = @import("../harness/agent_registry.zig");
 const spec = @import("channels_spec");
 
 const clock_mod = @import("../clock.zig");
@@ -84,6 +86,15 @@ pub const Options = struct {
     /// malformed files do not abort startup — the runtime begins on
     /// defaults and the reload path logs the failure.
     config_path: []const u8 = "config.json",
+    /// Optional agent registry. When provided, Boot.init walks it and
+    /// opens one live channel per enabled agent (reading bot tokens
+    /// from env). Null means "no channels wired" — matches the old
+    /// behaviour, and is what tests use when they register channels
+    /// explicitly via `addChannel`.
+    agents: ?*const agent_registry.Registry = null,
+    /// Optional sink for startup log lines (e.g. "telegram: tiger
+    /// bound to @tobi374758_bot"). Null silences the messages.
+    startup_log: ?*std.Io.Writer = null,
 };
 
 pub const Boot = struct {
@@ -100,6 +111,10 @@ pub const Boot = struct {
     manager: manager_mod.Manager,
     outbox: outbox_mod.Outbox,
     allowlist: allowlist_mod.Allowlist,
+    /// Live channel set opened during init from opts.agents. When the
+    /// caller supplied no registry this stays at `.empty` and deinit
+    /// is a no-op.
+    channel_telegram: startup_mod.ChannelTelegram,
 
     state_root: std.Io.Dir,
     config_path: []const u8,
@@ -156,12 +171,35 @@ pub const Boot = struct {
             .manager = undefined,
             .outbox = outbox,
             .allowlist = allowlist,
+            .channel_telegram = startup_mod.ChannelTelegram.init(allocator),
             .state_root = opts.state_root,
             .config_path = opts.config_path,
             .current_settings = initial_settings,
             .snapshots = snapshots,
         };
         boot.manager = manager_mod.Manager.init(allocator, io, &boot.dispatch);
+
+        // Bring live channels online if the caller supplied a registry.
+        // Errors tear down everything we've built so far — no partial
+        // runtime state survives a failed bind.
+        if (opts.agents) |reg| {
+            boot.channel_telegram = startup_mod.bind(
+                allocator,
+                io,
+                reg,
+                &boot.manager,
+                opts.startup_log,
+            ) catch |err| {
+                boot.manager.deinit();
+                outbox.deinit();
+                allowlist.deinit();
+                dispatch.deinit();
+                for (snapshots.items) |s| allocator.destroy(s);
+                snapshots.deinit(allocator);
+                return err;
+            };
+        }
+
         return boot;
     }
 
@@ -204,6 +242,10 @@ pub const Boot = struct {
 
     pub fn deinit(self: *Boot) void {
         self.manager.deinit();
+        // channel_telegram holds the heap-allocated bots/channels the
+        // manager's vtable references; release AFTER manager.deinit
+        // so no receive thread is still reading them.
+        self.channel_telegram.deinit();
         self.allowlist.deinit();
         self.dispatch.deinit();
         self.outbox.deinit();
