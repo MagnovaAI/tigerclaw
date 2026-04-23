@@ -15,6 +15,7 @@ pub const dep_graph = @import("dep_graph.zig");
 pub const lifecycle = @import("lifecycle.zig");
 pub const hook_bus = @import("hook_bus.zig");
 pub const envelope = @import("envelope.zig");
+pub const envelope_codec = @import("envelope_codec.zig");
 pub const channels = @import("channels/root.zig");
 pub const cli = @import("cli/root.zig");
 pub const clock = @import("clock.zig");
