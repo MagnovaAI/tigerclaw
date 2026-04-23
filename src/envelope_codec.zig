@@ -714,6 +714,67 @@ test "canonicalBytes: all 9 fixture verbs produce deterministic output" {
     }
 }
 
+test "fixture: decode → canonicalBytes is idempotent per verb" {
+    // Stronger property than simple determinism: decoding each fixture
+    // and re-canonicalizing must produce bytes that re-decode to an
+    // envelope equal to the first decode. This is the contract used
+    // for signing: sig(canonical(decode(wire))) == sig(canonical(env)).
+    const cases = [_][]const u8{
+        fixtures.user_msg,    fixtures.tool_call,
+        fixtures.tool_result, fixtures.reply,
+        fixtures.retract,     fixtures.hello,
+        fixtures.hello_ack,   fixtures.refuse,
+        fixtures.heartbeat,
+    };
+
+    for (cases) |bytes| {
+        var decoded_a = try decode(bytes, testing.allocator);
+        defer deinitDecoded(&decoded_a, testing.allocator);
+
+        const canon = try canonicalBytes(&decoded_a, testing.allocator);
+        defer testing.allocator.free(canon);
+
+        var decoded_b = try decode(canon, testing.allocator);
+        defer deinitDecoded(&decoded_b, testing.allocator);
+
+        // Field-by-field equality (slices compared byte-wise).
+        try testing.expectEqual(decoded_a.envelope_v, decoded_b.envelope_v);
+        try testing.expectEqual(decoded_a.verb, decoded_b.verb);
+        try testing.expectEqualStrings(decoded_a.conversation_id, decoded_b.conversation_id);
+        try testing.expectEqualStrings(decoded_a.origin_channel_id, decoded_b.origin_channel_id);
+        try testing.expectEqualStrings(decoded_a.sender_id, decoded_b.sender_id);
+        try testing.expectEqual(decoded_a.sent_at_ms, decoded_b.sent_at_ms);
+        try testing.expectEqualStrings(decoded_a.body_mime, decoded_b.body_mime);
+        try testing.expectEqualStrings(decoded_a.body, decoded_b.body);
+    }
+}
+
+test "fixture: signing every verb fixture produces verifiable envelope" {
+    // End-to-end: decode fixture → sign → verify. Covers the full
+    // Phase 0.5 pipeline (decode, canonical, ed25519 sign, verify).
+    const sig = @import("envelope_sig.zig");
+    const kp = try sig.generate(std.testing.io);
+
+    const cases = [_][]const u8{
+        fixtures.user_msg,    fixtures.tool_call,
+        fixtures.tool_result, fixtures.reply,
+        fixtures.retract,     fixtures.hello,
+        fixtures.hello_ack,   fixtures.refuse,
+        fixtures.heartbeat,
+    };
+
+    for (cases) |bytes| {
+        var env = try decode(bytes, testing.allocator);
+        defer deinitDecoded(&env, testing.allocator);
+
+        try sig.signInPlace(&env, kp, testing.allocator);
+        defer if (env.sender_sig) |s| testing.allocator.free(s);
+
+        const ok = try sig.verify(&env, kp.public_key.toBytes(), testing.allocator);
+        try testing.expect(ok);
+    }
+}
+
 test "fixture: all 9 verb fixtures decode successfully" {
     const cases = [_]struct { bytes: []const u8, verb: Verb }{
         .{ .bytes = fixtures.user_msg, .verb = .user_msg },
