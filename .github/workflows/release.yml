@@ -17,23 +17,36 @@ jobs:
           - target: aarch64-macos
             artifact: tigerclaw-macos-arm64
             runs-on: macos-14
+            zig_arch: aarch64-macos
           - target: x86_64-macos
             artifact: tigerclaw-macos-x86_64
             runs-on: macos-13
+            zig_arch: x86_64-macos
           - target: x86_64-linux-musl
             artifact: tigerclaw-linux-x86_64
             runs-on: ubuntu-latest
+            zig_arch: x86_64-linux
           - target: aarch64-linux-musl
             artifact: tigerclaw-linux-arm64
             runs-on: ubuntu-latest
+            zig_arch: x86_64-linux
     runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Zig 0.16.0
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+        # mlugg/setup-zig is broken for 0.16.0 — its mirror list 404s.
+        # Download direct from ziglang.org/download/0.16.0/.
+        run: |
+          set -eu
+          ARCHIVE="zig-${{ matrix.zig_arch }}-0.16.0.tar.xz"
+          curl -sSfLO "https://ziglang.org/download/0.16.0/$ARCHIVE"
+          mkdir -p "$HOME/.zig"
+          tar -xf "$ARCHIVE" -C "$HOME/.zig" --strip-components=1
+          echo "$HOME/.zig" >> "$GITHUB_PATH"
+
+      - name: Verify Zig version
+        run: zig version
 
       - name: Build release binary
         run: zig build -Doptimize=ReleaseSmall -Dtarget=${{ matrix.target }}
