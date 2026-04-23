@@ -27,6 +27,7 @@ pub const budget_exhausted = "budget_exhausted";
 pub const rate_limited = "rate_limited";
 pub const mode_forbidden = "mode_forbidden";
 pub const interrupt_requested = "interrupt_requested";
+pub const internal = "internal";
 
 // --- tests -----------------------------------------------------------------
 
