@@ -48,8 +48,14 @@ pub const ChannelRef = struct {
     /// username; for `cli` it is fixed to `"stdin"`. The validator
     /// enforces non-empty.
     account: []const u8 = "",
+    /// Inline channel credential. Used when the workspace config is
+    /// the source of truth (the common case — workspace agent.json
+    /// is .gitignore'd, so putting the token there is fine). Takes
+    /// precedence over `token_env` when both are set.
+    token: ?[]const u8 = null,
     /// Environment variable name that holds the channel credential.
-    /// Optional for `cli`; required for real channels.
+    /// Used for CI-style deployments where the secret lives in the
+    /// process env, not on disk.
     token_env: ?[]const u8 = null,
 };
 
@@ -133,7 +139,7 @@ pub fn validate(cfg: AgentsConfig) ?ValidationResult {
         if (ch.account.len == 0) {
             return .{ .err = ValidationError.ChannelMissingAccount, .agent_index = i };
         }
-        if (ch.kind != .cli and ch.token_env == null) {
+        if (ch.kind != .cli and ch.token == null and ch.token_env == null) {
             return .{ .err = ValidationError.ChannelMissingTokenEnv, .agent_index = i };
         }
     }

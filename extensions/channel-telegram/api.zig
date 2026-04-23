@@ -414,6 +414,12 @@ pub const Bot = struct {
     /// POSTs `body` as JSON to `<base_url>/bot<token>/<method>` and
     /// returns the response status + body (caller owns `body`, allocated
     /// from `self.allocator`).
+    ///
+    /// Shells out to `curl` because std.http.Client on darwin with
+    /// Zig 0.16 busy-loops on long-lived TLS reads instead of
+    /// progressing. The subprocess is predictable on every platform
+    /// we target — cost is one fork per Bot API call, dominated by
+    /// Telegram round-trip time anyway.
     fn postMethod(
         self: *Bot,
         method: []const u8,
@@ -427,38 +433,75 @@ pub const Bot = struct {
         );
         defer self.allocator.free(url);
 
-        const uri = try std.Uri.parse(url);
-
-        var client: std.http.Client = .{ .allocator = self.allocator, .io = self.io };
-        defer client.deinit();
-
-        var headers_buf: [1]std.http.Header = .{
-            .{ .name = "content-type", .value = "application/json" },
+        // 60s --max-time: Telegram getUpdates uses a 30s server-side
+        // long-poll. 60s gives us a 2x safety margin for the full
+        // request including connect + TLS handshake.
+        const argv = [_][]const u8{
+            "curl",
+            "-s",
+            "--max-time",
+            "60",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+            "-w",
+            "\n%{http_code}",
+            url,
         };
 
-        var req = try client.request(.POST, uri, .{
-            .keep_alive = false,
-            .extra_headers = headers_buf[0..],
+        var child = try std.process.spawn(self.io, .{
+            .argv = &argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
         });
-        defer req.deinit();
 
-        const send_buf = try self.allocator.dupe(u8, body);
-        defer self.allocator.free(send_buf);
-        try req.sendBodyComplete(send_buf);
+        if (child.stdin) |stdin_file| {
+            var stdin_buf: [4096]u8 = undefined;
+            var stdin_writer = stdin_file.writer(self.io, &stdin_buf);
+            stdin_writer.interface.writeAll(body) catch {
+                stdin_file.close(self.io);
+                child.stdin = null;
+                child.kill(self.io);
+                _ = child.wait(self.io) catch {};
+                return error.TransportFailure;
+            };
+            stdin_writer.interface.flush() catch {};
+            stdin_file.close(self.io);
+            child.stdin = null;
+        }
 
-        var redirect_buf: [1024]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buf);
-        const code: u16 = @intFromEnum(response.head.status);
-
-        var transfer_buf: [8 * 1024]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
+        var stdout_buf: [8192]u8 = undefined;
+        var stdout_reader = child.stdout.?.reader(self.io, &stdout_buf);
 
         var collected: std.Io.Writer.Allocating = .init(self.allocator);
         defer collected.deinit();
-        _ = reader.streamRemaining(&collected.writer) catch {};
+        _ = stdout_reader.interface.streamRemaining(&collected.writer) catch {};
+        const stdout = collected.toOwnedSlice() catch return error.TransportFailure;
+        errdefer self.allocator.free(stdout);
 
-        const owned = try collected.toOwnedSlice();
-        return .{ .status = code, .body = owned };
+        const term = child.wait(self.io) catch return error.TransportFailure;
+        switch (term) {
+            .exited => |code| if (code != 0) return error.TransportFailure,
+            else => return error.TransportFailure,
+        }
+
+        // `-w "\n%{http_code}"` appends a newline-separated status at
+        // the end of stdout. Split it off; the part before the last
+        // newline is the real response body.
+        const sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.TransportFailure;
+        const status_raw = std.mem.trim(u8, stdout[sep + 1 ..], " \t\r\n");
+        if (status_raw.len != 3) return error.TransportFailure;
+        const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.TransportFailure;
+
+        const body_slice = stdout[0..sep];
+        const response_body = try self.allocator.dupe(u8, body_slice);
+        self.allocator.free(stdout);
+
+        return .{ .status = status_code, .body = response_body };
     }
 };
 

@@ -304,6 +304,11 @@ pub const RunRunOptions = struct {
     /// MockAgentRunner so the daemon still boots in places without a
     /// home directory (CI, tmpdirs, etc.).
     home_path: []const u8 = "",
+    /// Per-project override root. Resolved by main as the current
+    /// working directory; if `<workspace>/.tigerclaw/` exists its
+    /// agents override `<home>/.tigerclaw/agents/` by name. Empty
+    /// means "no workspace overlay" (the old global-only behaviour).
+    workspace_path: []const u8 = "",
     /// Name of the agent the live runner uses for every turn in
     /// v0.1.0. Per-request agent dispatch lands when the runner gets
     /// promoted from a single-agent shim to a registry.
@@ -373,17 +378,24 @@ pub fn runGateway(
     var harness_registry_opt: ?harness_agent_registry.Registry = null;
     defer if (loaded_agents_opt) |*l| l.deinit();
     defer if (harness_registry_opt) |*r| r.deinit();
-    if (opts.home_path.len > 0) {
-        if (agents_loader.loadFromHome(allocator, io, opts.home_path)) |loaded| {
+    if (opts.home_path.len > 0 or opts.workspace_path.len > 0) {
+        if (agents_loader.load(allocator, io, opts.workspace_path, opts.home_path)) |loaded| {
             loaded_agents_opt = loaded;
+            gw_log.info("agents loader: {d} agents loaded, default={s}", .{
+                loaded.config.entries.len,
+                loaded.config.default,
+            });
             if (harness_agent_registry.build(allocator, loaded.config)) |built| {
                 harness_registry_opt = built;
+                gw_log.info("agents registry built with {d} entries", .{built.entries.len});
             } else |err| {
                 gw_log.warn("agents registry build failed: {s}", .{@errorName(err)});
             }
         } else |err| {
             gw_log.warn("agents loader failed: {s}", .{@errorName(err)});
         }
+    } else {
+        gw_log.warn("home_path is empty — no agents loaded", .{});
     }
 
     var boot = gateway_root.boot.Boot.init(allocator, io, .{
@@ -393,7 +405,11 @@ pub fn runGateway(
         .handlers = &gateway_root.routes.handlers,
         .clock = clock_cb.clock(),
         .agents = if (harness_registry_opt) |*r| r else null,
-    }) catch return error.BindFailed;
+        .startup_log = out,
+    }) catch |boot_err| {
+        gw_log.warn("Boot.init failed: {s}", .{@errorName(boot_err)});
+        return error.BindFailed;
+    };
     defer boot.deinit();
 
     // Pre-load every agent under ~/.tigerclaw/agents. Registry
@@ -403,8 +419,8 @@ pub fn runGateway(
     var registry = agent_registry.AgentRegistry.init(allocator);
     defer registry.deinit();
     var load_err: ?anyerror = null;
-    if (opts.home_path.len > 0) {
-        registry.loadAll(io, opts.home_path) catch |e| {
+    if (opts.home_path.len > 0 or opts.workspace_path.len > 0) {
+        registry.loadAll(io, opts.workspace_path, opts.home_path) catch |e| {
             load_err = e;
         };
     }

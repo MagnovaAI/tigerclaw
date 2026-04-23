@@ -127,20 +127,26 @@ fn bindTelegram(
         return error.TelegramDisabled;
     }
 
-    const env_name = agent.channel.token_env orelse return error.MissingToken;
+    // Prefer the inline token from the workspace agent.json. Fall
+    // back to the named env var for CI-style deployments where the
+    // secret lives in the process environment, not on disk.
+    const token: []const u8 = blk: {
+        if (agent.channel.token) |t| {
+            if (t.len > 0) break :blk t;
+        }
+        const env_name = agent.channel.token_env orelse return error.MissingToken;
 
-    // libc getenv returns a pointer into the env block; the daemon
-    // never mutates the environment after boot, so borrowing it for
-    // the bot's lifetime is safe. Zig 0.16 removed std.posix.getenv.
-    var name_buf: [128]u8 = undefined;
-    if (env_name.len >= name_buf.len) return error.MissingToken;
-    @memcpy(name_buf[0..env_name.len], env_name);
-    name_buf[env_name.len] = 0;
-    const name_z: [*:0]const u8 = @ptrCast(&name_buf);
+        var name_buf: [128]u8 = undefined;
+        if (env_name.len >= name_buf.len) return error.MissingToken;
+        @memcpy(name_buf[0..env_name.len], env_name);
+        name_buf[env_name.len] = 0;
+        const name_z: [*:0]const u8 = @ptrCast(&name_buf);
 
-    const raw = std.c.getenv(name_z) orelse return error.MissingToken;
-    const token = std.mem.span(raw);
-    if (token.len == 0) return error.MissingToken;
+        const raw = std.c.getenv(name_z) orelse return error.MissingToken;
+        const from_env = std.mem.span(raw);
+        if (from_env.len == 0) return error.MissingToken;
+        break :blk from_env;
+    };
 
     const bot = try channels.allocator.create(telegram_ext.api.Bot);
     errdefer channels.allocator.destroy(bot);

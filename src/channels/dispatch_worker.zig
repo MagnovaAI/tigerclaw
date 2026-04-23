@@ -80,7 +80,7 @@ fn loop(self: *Worker) void {
     while (!self.cancel.load(.acquire)) {
         const msg = self.dispatch.dequeue(&self.cancel) orelse return;
         processOne(self, msg) catch |err| {
-            log.warn("dispatch: turn failed for agent={s}: {s}", .{
+            log.warn("turn failed for agent={s}: {s}", .{
                 msg.agent_name,
                 @errorName(err),
             });

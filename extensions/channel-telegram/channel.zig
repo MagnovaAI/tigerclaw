@@ -177,6 +177,8 @@ pub const TelegramChannel = struct {
 
         return .{
             .upstream_id = @intCast(@max(update_id, 0)),
+            .channel_id = .telegram,
+            .agent_name = "",
             .conversation_key = conv,
             .thread_key = thread,
             .sender_id = sender,

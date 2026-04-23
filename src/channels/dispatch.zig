@@ -35,21 +35,20 @@ const std = @import("std");
 
 const spec = @import("channels_spec");
 
-/// Tiny yielding spinlock. See the `Spinlock` in
-/// `src/cost/ledger.zig` for the rationale; this copy is kept local
-/// so `channels` does not reach into a peer subsystem.
+/// libc pthread mutex. The previous spinlock using
+/// `std.atomic.Value(bool).cmpxchgStrong` livelocked on darwin
+/// when the receive thread and the dispatch worker contended for
+/// the queue — both threads spun at 100% forever. pthread parks
+/// the loser on the kernel's wait queue instead.
 const Spinlock = struct {
-    state: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    inner: std.c.pthread_mutex_t = .{},
 
     fn lock(self: *Spinlock) void {
-        while (true) {
-            if (self.state.cmpxchgStrong(false, true, .acquire, .monotonic) == null) return;
-            std.Thread.yield() catch {};
-        }
+        _ = std.c.pthread_mutex_lock(&self.inner);
     }
 
     fn unlock(self: *Spinlock) void {
-        self.state.store(false, .release);
+        _ = std.c.pthread_mutex_unlock(&self.inner);
     }
 };
 

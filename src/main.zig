@@ -332,6 +332,12 @@ pub fn main(init: std.process.Init) !u8 {
             const home = init.environ_map.get("HOME") orelse "";
             var state_buf: [std.fs.max_path_bytes]u8 = undefined;
             const state_path = try std.fmt.bufPrint(&state_buf, "{s}/.tigerclaw/state", .{home});
+
+            // Resolve the current working directory so `<cwd>/.tigerclaw/`
+            // can override the global `<home>/.tigerclaw/`. A failure to
+            // resolve is non-fatal — we just lose the overlay.
+            const workspace = std.process.currentPathAlloc(io, arena) catch "";
+
             const addr = std.Io.net.IpAddress.parse(opts.host, opts.port) catch {
                 try stderr_w.interface.print("tigerclaw: invalid bind {s}:{d}\n", .{ opts.host, opts.port });
                 return 64;
@@ -341,6 +347,7 @@ pub fn main(init: std.process.Init) !u8 {
                 .address = addr,
                 .state_dir_path = state_path,
                 .home_path = home,
+                .workspace_path = workspace,
                 // v0.1.0 single-agent: every turn goes through `tiger`.
                 // Per-request agent dispatch flips on with the runner
                 // registry in v0.2.0.

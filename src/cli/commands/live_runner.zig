@@ -47,41 +47,63 @@ pub const LiveAgentRunner = struct {
     /// for the duration of the request; rotated on the next run().
     last_output: []u8 = &.{},
 
-    pub fn loadFromHome(
+    /// Load an agent config with workspace-then-global cascade.
+    /// For each file (agent.json, config.json, SOUL.md) tries
+    /// `<workspace>/.tigerclaw/…` first, falls back to
+    /// `<home>/.tigerclaw/…`. Either may be empty to skip its side.
+    pub fn load(
         allocator: std.mem.Allocator,
         io: std.Io,
         agent_name: []const u8,
+        workspace: []const u8,
         home: []const u8,
     ) LoadError!LiveAgentRunner {
-        if (home.len == 0) return error.HomeMissing;
+        if (workspace.len == 0 and home.len == 0) return error.HomeMissing;
 
-        // Load the agent's manifest first so we know which provider
-        // key to pluck out of config.json.
-        var agent_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const agent_json_path = std.fmt.bufPrint(&agent_path_buf, "{s}/.tigerclaw/agents/{s}/agent.json", .{ home, agent_name }) catch
-            return error.AgentMissing;
-        const agent_bytes = std.Io.Dir.cwd().readFileAlloc(io, agent_json_path, allocator, .limited(16 * 1024)) catch
-            return error.AgentMissing;
+        // agent.json: workspace wins, fall back to home.
+        const agent_bytes = try readCascade(
+            allocator,
+            io,
+            workspace,
+            home,
+            "agents",
+            agent_name,
+            "agent.json",
+            .limited(16 * 1024),
+            error.AgentMissing,
+        );
         defer allocator.free(agent_bytes);
 
         const manifest = try parseAgentManifest(allocator, agent_bytes);
         errdefer allocator.free(manifest.model);
 
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const config_path = std.fmt.bufPrint(&path_buf, "{s}/.tigerclaw/config.json", .{home}) catch
-            return error.ConfigMissing;
-
-        const config_bytes = std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(64 * 1024)) catch
-            return error.ConfigMissing;
+        // config.json: same cascade — lets an operator pin per-project
+        // provider keys without editing the global file.
+        const config_bytes = try readRootCascade(
+            allocator,
+            io,
+            workspace,
+            home,
+            "config.json",
+            .limited(64 * 1024),
+            error.ConfigMissing,
+        );
         defer allocator.free(config_bytes);
 
         const api_key = try parseProviderKey(allocator, config_bytes, manifest.provider);
 
-        // SOUL.md is optional — many agents won't have one yet.
-        var soul_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const soul_path = std.fmt.bufPrint(&soul_path_buf, "{s}/.tigerclaw/agents/{s}/SOUL.md", .{ home, agent_name }) catch
-            return error.AgentMissing;
-        const soul = std.Io.Dir.cwd().readFileAlloc(io, soul_path, allocator, .limited(32 * 1024)) catch null;
+        // SOUL.md is optional at both layers.
+        const soul = readCascade(
+            allocator,
+            io,
+            workspace,
+            home,
+            "agents",
+            agent_name,
+            "SOUL.md",
+            .limited(32 * 1024),
+            error.AgentMissing,
+        ) catch null;
 
         return .{
             .allocator = allocator,
@@ -92,6 +114,16 @@ pub const LiveAgentRunner = struct {
             .model = manifest.model,
             .system_prompt = soul,
         };
+    }
+
+    /// Back-compat shim — prefer `load(..., workspace, home)`.
+    pub fn loadFromHome(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        agent_name: []const u8,
+        home: []const u8,
+    ) LoadError!LiveAgentRunner {
+        return load(allocator, io, agent_name, "", home);
     }
 
     pub fn deinit(self: *LiveAgentRunner) void {
@@ -197,6 +229,61 @@ const AgentManifest = struct {
 };
 
 /// Parse `agent.json` for the agent's provider + model.
+/// Try `<workspace>/.tigerclaw/<sub>/<agent>/<file>` first, fall back
+/// to `<home>/.tigerclaw/<sub>/<agent>/<file>`. Returns caller-owned
+/// bytes. The supplied `missing_err` is raised iff both paths miss.
+fn readCascade(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace: []const u8,
+    home: []const u8,
+    sub: []const u8,
+    agent: []const u8,
+    file: []const u8,
+    limit: std.Io.Limit,
+    missing_err: LoadError,
+) LoadError![]u8 {
+    if (workspace.len > 0) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/.tigerclaw/{s}/{s}/{s}", .{ workspace, sub, agent, file }) catch
+            return missing_err;
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, limit)) |b| return b else |_| {}
+    }
+    if (home.len > 0) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/.tigerclaw/{s}/{s}/{s}", .{ home, sub, agent, file }) catch
+            return missing_err;
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, limit)) |b| return b else |_| {}
+    }
+    return missing_err;
+}
+
+/// Same cascade as `readCascade` but for root-level files
+/// (`<root>/.tigerclaw/<file>`, no agent sub-path).
+fn readRootCascade(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace: []const u8,
+    home: []const u8,
+    file: []const u8,
+    limit: std.Io.Limit,
+    missing_err: LoadError,
+) LoadError![]u8 {
+    if (workspace.len > 0) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/.tigerclaw/{s}", .{ workspace, file }) catch
+            return missing_err;
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, limit)) |b| return b else |_| {}
+    }
+    if (home.len > 0) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/.tigerclaw/{s}", .{ home, file }) catch
+            return missing_err;
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, limit)) |b| return b else |_| {}
+    }
+    return missing_err;
+}
+
 fn parseAgentManifest(allocator: std.mem.Allocator, bytes: []const u8) LoadError!AgentManifest {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch
         return error.AgentParseFailed;

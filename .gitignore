@@ -28,3 +28,6 @@ node_modules/
 # Local agent workspaces
 .claude/
 runtime_sessions/
+
+# Workspace agent state (contains API keys, state, outbox).
+.tigerclaw/

@@ -53,42 +53,63 @@ pub const AgentRegistry = struct {
         self.* = undefined;
     }
 
-    /// Load every agent directory under `<home>/.tigerclaw/agents/`.
+    /// Load every agent directory, cascading workspace over global.
+    /// An agent directory that appears in both places resolves against
+    /// the workspace overlay (`<workspace>/.tigerclaw/agents/<name>/`);
+    /// agents present only in `<home>/.tigerclaw/agents/` still load.
     /// A directory whose `agent.json` fails to parse is skipped with a
     /// warning rather than aborting the boot.
-    pub fn loadAll(self: *AgentRegistry, io: std.Io, home: []const u8) !void {
-        if (home.len == 0) return;
+    pub fn loadAll(
+        self: *AgentRegistry,
+        io: std.Io,
+        workspace: []const u8,
+        home: []const u8,
+    ) !void {
+        if (workspace.len == 0 and home.len == 0) return;
 
-        var dir_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const dir_path = std.fmt.bufPrint(&dir_path_buf, "{s}/.tigerclaw/agents", .{home}) catch return;
-        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
-        defer dir.close(io);
+        // Walk both candidate dirs; collect distinct agent names, with
+        // workspace appearing first so its name claim wins.
+        var seen = std.BufSet.init(self.allocator);
+        defer seen.deinit();
 
-        var it = dir.iterate();
-        while (try it.next(io)) |entry| {
-            if (entry.kind != .directory) continue;
-            // Skip dotfiles and synthetic entries (".", "..", ".DS_Store" etc.)
-            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        const roots: [2][]const u8 = .{ workspace, home };
+        for (roots) |root| {
+            if (root.len == 0) continue;
 
-            const owned_name = try self.allocator.dupe(u8, entry.name);
-            errdefer self.allocator.free(owned_name);
+            var dir_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const dir_path = std.fmt.bufPrint(&dir_path_buf, "{s}/.tigerclaw/agents", .{root}) catch continue;
+            var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch continue;
+            defer dir.close(io);
 
-            const loaded = live_runner.LiveAgentRunner.loadFromHome(
-                self.allocator,
-                io,
-                entry.name,
-                home,
-            ) catch |e| {
-                std.debug.print(
-                    "agent_registry: skipping '{s}' — {s}\n",
-                    .{ entry.name, @errorName(e) },
-                );
-                self.allocator.free(owned_name);
-                continue;
-            };
+            var it = dir.iterate();
+            while (try it.next(io)) |entry| {
+                if (entry.kind != .directory) continue;
+                if (entry.name.len == 0 or entry.name[0] == '.') continue;
+                if (seen.contains(entry.name)) continue; // workspace won earlier
 
-            try self.entries.append(self.allocator, .{ .name = owned_name, .runner = loaded });
-            if (self.default_index < 0) self.default_index = @intCast(self.entries.items.len - 1);
+                try seen.insert(entry.name);
+
+                const owned_name = try self.allocator.dupe(u8, entry.name);
+                errdefer self.allocator.free(owned_name);
+
+                const loaded = live_runner.LiveAgentRunner.load(
+                    self.allocator,
+                    io,
+                    entry.name,
+                    workspace,
+                    home,
+                ) catch |e| {
+                    std.debug.print(
+                        "agent_registry: skipping '{s}' — {s}\n",
+                        .{ entry.name, @errorName(e) },
+                    );
+                    self.allocator.free(owned_name);
+                    continue;
+                };
+
+                try self.entries.append(self.allocator, .{ .name = owned_name, .runner = loaded });
+                if (self.default_index < 0) self.default_index = @intCast(self.entries.items.len - 1);
+            }
         }
     }
 

@@ -91,6 +91,7 @@ pub fn build(
             .channel = .{
                 .kind = ch.kind,
                 .account = try aa.dupe(u8, ch.account),
+                .token = if (ch.token) |t| try aa.dupe(u8, t) else null,
                 .token_env = if (ch.token_env) |t| try aa.dupe(u8, t) else null,
             },
         };

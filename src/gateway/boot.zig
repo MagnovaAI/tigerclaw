@@ -190,24 +190,27 @@ pub const Boot = struct {
         boot.manager = manager_mod.Manager.init(allocator, io, &boot.dispatch);
 
         // Bring live channels online if the caller supplied a registry.
-        // Errors tear down everything we've built so far — no partial
-        // runtime state survives a failed bind.
+        // On error the outer errdefers handle tearing down dispatch /
+        // allowlist / outbox / snapshots / initial_snap — we just need
+        // to free the local manager + channel_telegram we already
+        // placed on the struct.
         if (opts.agents) |reg| {
-            boot.channel_telegram = startup_mod.bind(
+            const bound = startup_mod.bind(
                 allocator,
                 io,
                 reg,
                 &boot.manager,
                 opts.startup_log,
             ) catch |err| {
+                // startup.bind on error already freed whatever it
+                // allocated; the manager may have partial entries —
+                // drop them. The outer errdefers (dispatch, allowlist,
+                // outbox, snapshots, initial_snap) do the rest.
                 boot.manager.deinit();
-                outbox.deinit();
-                allowlist.deinit();
-                dispatch.deinit();
-                for (snapshots.items) |s| allocator.destroy(s);
-                snapshots.deinit(allocator);
+                boot.channel_telegram.deinit();
                 return err;
             };
+            boot.channel_telegram = bound;
         }
 
         return boot;
@@ -289,6 +292,12 @@ pub const Boot = struct {
 
         routes.setContext(ctx);
         defer routes.clearContext();
+
+        // Rebind the manager's dispatch pointer to THIS Boot's
+        // address. Boot.init set it to a stale pointer into the local
+        // `boot` value that Zig copied on return. Same for every
+        // other self-referential pointer we stored at init time.
+        self.manager.dispatch = &self.dispatch;
 
         try self.manager.start();
 

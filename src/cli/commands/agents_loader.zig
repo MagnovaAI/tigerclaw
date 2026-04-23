@@ -52,38 +52,60 @@ pub const Loaded = struct {
     }
 };
 
-pub fn loadFromHome(
+/// Load agents with workspace-then-global cascade. Workspace layout
+/// `<cwd>/.tigerclaw/agents/` overrides `<home>/.tigerclaw/agents/`
+/// on name collision — the workspace definition wins. Either side
+/// may be absent; if both are, returns an empty AgentsConfig.
+///
+/// Pass `workspace = ""` to disable workspace resolution (useful in
+/// tests or headless daemons). Pass `home = ""` to disable global.
+pub fn load(
     allocator: std.mem.Allocator,
     io: std.Io,
+    workspace: []const u8,
     home: []const u8,
 ) LoadError!Loaded {
-    if (home.len == 0) return error.HomeMissing;
-
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const aa = arena.allocator();
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const agents_dir_path = std.fmt.bufPrint(&path_buf, "{s}/.tigerclaw/agents", .{home}) catch
-        return error.AgentsDirMissing;
-
-    var dir = std.Io.Dir.cwd().openDir(io, agents_dir_path, .{ .iterate = true }) catch
-        return error.AgentsDirMissing;
-    defer dir.close(io);
-
     var entries: std.ArrayList(agents_cfg.AgentConfig) = .empty;
     defer entries.deinit(aa);
 
-    var it = dir.iterate();
-    while (it.next(io) catch null) |entry| {
-        if (entry.kind != .directory) continue;
-        if (entry.name.len == 0 or entry.name[0] == '.') continue;
-
-        const loaded = loadOne(aa, io, dir, entry.name) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => continue, // skip malformed agent dirs, keep going
+    // Workspace first — anything it defines wins.
+    if (workspace.len > 0) {
+        appendAgentsFromDir(&entries, aa, io, workspace) catch |err| switch (err) {
+            error.AgentsDirMissing => {}, // no workspace overlay is fine
+            else => return err,
         };
-        try entries.append(aa, loaded);
+    }
+
+    // Global next — only append entries whose names aren't already
+    // claimed by the workspace overlay.
+    if (home.len > 0) {
+        const before = entries.items.len;
+        appendAgentsFromDir(&entries, aa, io, home) catch |err| switch (err) {
+            error.AgentsDirMissing => {},
+            else => return err,
+        };
+        // Dedupe by name: walk the newly-added tail and drop names
+        // that duplicate a workspace-claimed entry. Linear but the
+        // v0.1.0 agent count is tiny.
+        var write_idx = before;
+        for (entries.items[before..]) |candidate| {
+            var dup = false;
+            for (entries.items[0..before]) |earlier| {
+                if (std.mem.eql(u8, earlier.name, candidate.name)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                entries.items[write_idx] = candidate;
+                write_idx += 1;
+            }
+        }
+        entries.shrinkRetainingCapacity(write_idx);
     }
 
     const entries_slice = try entries.toOwnedSlice(aa);
@@ -96,6 +118,43 @@ pub fn loadFromHome(
         .arena = arena,
         .config = .{ .default = default_name, .entries = entries_slice },
     };
+}
+
+/// Back-compat shim — prefer `load(..., workspace, home)`.
+pub fn loadFromHome(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+) LoadError!Loaded {
+    if (home.len == 0) return error.HomeMissing;
+    return load(allocator, io, "", home);
+}
+
+fn appendAgentsFromDir(
+    entries: *std.ArrayList(agents_cfg.AgentConfig),
+    arena_alloc: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) LoadError!void {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const agents_dir_path = std.fmt.bufPrint(&path_buf, "{s}/.tigerclaw/agents", .{root}) catch
+        return error.AgentsDirMissing;
+
+    var dir = std.Io.Dir.cwd().openDir(io, agents_dir_path, .{ .iterate = true }) catch
+        return error.AgentsDirMissing;
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+
+        const loaded = loadOne(arena_alloc, io, dir, entry.name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue, // malformed one agent dir, skip it
+        };
+        try entries.append(arena_alloc, loaded);
+    }
 }
 
 fn loadOne(
@@ -173,9 +232,16 @@ fn parseChannels(
             break :blk try arena_alloc.dupe(u8, t.string);
         };
 
+        const token: ?[]const u8 = blk: {
+            const t = raw.object.get("token") orelse break :blk null;
+            if (t != .string) break :blk null;
+            break :blk try arena_alloc.dupe(u8, t.string);
+        };
+
         out[i] = .{
             .kind = kind,
             .account = try arena_alloc.dupe(u8, account_v.string),
+            .token = token,
             .token_env = token_env,
         };
     }
