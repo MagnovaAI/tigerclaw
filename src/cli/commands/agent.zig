@@ -25,6 +25,11 @@ const http_client = @import("http_client.zig");
 pub const Options = struct {
     /// Base URL for the gateway, e.g. `http://127.0.0.1:8765`.
     base_url: []const u8,
+    /// Configured agent name (`tigerclaw agent <name> -m ...`).
+    agent_name: []const u8 = "default",
+    /// User-facing message. Empty means "no payload" (the mock runner
+    /// echoes regardless; live runners receive it as the user turn).
+    message: []const u8 = "",
     /// Session to POST the turn to.
     session_id: []const u8 = "mock-session",
     /// Optional bearer token forwarded as `authorization: Bearer ...`.
@@ -87,6 +92,15 @@ pub fn run(
         .{ opts.base_url, opts.session_id },
     ) catch return error.UrlTooLong;
 
+    // Build the JSON body. Mock runner ignores it; live runners read
+    // `agent` + `message`. Body is heap-allocated through the arena so
+    // it survives the http_client.send call.
+    const body_json = try std.json.Stringify.valueAlloc(allocator, .{
+        .agent = opts.agent_name,
+        .message = opts.message,
+    }, .{});
+    defer allocator.free(body_json);
+
     var body_buf: [16 * 1024]u8 = undefined;
     var body_writer: std.Io.Writer = .fixed(&body_buf);
 
@@ -97,9 +111,10 @@ pub fn run(
             .method = .POST,
             .url = url,
             .bearer = opts.bearer,
-            // Empty JSON body is what the mock endpoint accepts; the
-            // mock runner uses a fixed prompt regardless of payload.
-            .json_body = "{}",
+            .json_body = body_json,
+            // Opt the gateway into the SSE response shape so the
+            // renderer below has token events to walk.
+            .accept = "text/event-stream",
         },
         &body_writer,
         .{},
@@ -123,6 +138,9 @@ pub fn run(
     }
 
     try renderSse(opts.out, body_writer.buffered());
+    // Trailing newline so the shell prompt lands on the next line —
+    // the SSE token frames carry no terminator of their own.
+    opts.out.writeAll("\n") catch return error.InvalidResponse;
 }
 
 /// Fire DELETE /sessions/:id/turns/current. Surfaced separately so the

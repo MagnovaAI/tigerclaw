@@ -51,6 +51,10 @@ pub const Request = struct {
     /// Optional request body. Sets content-type to
     /// `application/json` when non-null; the CLI only ever POSTs JSON.
     json_body: ?[]const u8 = null,
+    /// Optional `Accept` header value. When set, the gateway can use
+    /// content negotiation (e.g. `text/event-stream` to opt the
+    /// `/sessions/:id/turns` endpoint into the SSE response shape).
+    accept: ?[]const u8 = null,
 };
 
 pub const Response = struct {
@@ -129,7 +133,7 @@ fn fetchOnce(
     body_out: ?*std.Io.Writer,
 ) std.http.Client.FetchError!std.http.Client.FetchResult {
     var auth_buf: [256]u8 = undefined;
-    var extra: [2]std.http.Header = undefined;
+    var extra: [3]std.http.Header = undefined;
     var extra_len: usize = 0;
 
     if (req.bearer) |token| {
@@ -140,6 +144,10 @@ fn fetchOnce(
     }
     if (req.json_body != null) {
         extra[extra_len] = .{ .name = "content-type", .value = "application/json" };
+        extra_len += 1;
+    }
+    if (req.accept) |a| {
+        extra[extra_len] = .{ .name = "accept", .value = a };
         extra_len += 1;
     }
 

@@ -1,36 +1,35 @@
-//! `tigerclaw gateway <verb>` sub-verb parser.
+//! `tigerclaw gateway` parser. Modelled on the v1 / openclaw form:
 //!
-//! Sub-verbs mirror the common daemon control surface:
+//!   tigerclaw gateway [--port PORT] [--host HOST]
+//!     Run the gateway daemon in the foreground. SIGTERM (or Ctrl-C)
+//!     stops it cleanly through the documented drain ordering.
 //!
-//!   start   — launch the daemon (optional `--foreground` / `--detach`)
-//!   stop    — SIGTERM the running daemon and wait for drain
-//!   status  — print health + in-flight counter + PID
-//!   restart — stop then start with the same options
-//!   logs    — tail the daemon log file
-//!   serve   — run the gateway in the foreground regardless of config
+//!   tigerclaw gateway logs [--follow] [--tail N]
+//!     Read the daemon log file. Read-side helper — does NOT touch the
+//!     running daemon.
 //!
-//! Execution lives next to the daemon + HTTP client. This module is
-//! argv-only. The parser intentionally rejects unknown flags so a
-//! typo surfaces as a clear usage error rather than silently falling
-//! through to the default behaviour.
+//! v1 and openclaw both flatten "start the gateway" to bare `gateway`
+//! with optional bind flags rather than a `start` sub-verb. We follow
+//! that convention so muscle memory transfers; sub-verbs only exist
+//! for read-side helpers that don't conflict with the run intent.
 
 const std = @import("std");
 
 pub const Verb = union(enum) {
-    start: StartOptions,
-    stop,
-    status,
-    restart: StartOptions,
+    /// Bare `tigerclaw gateway` (or with --port/--host flags) — runs
+    /// the daemon in the foreground.
+    run: RunOptions,
+    /// `tigerclaw gateway logs` — read the on-disk log file.
     logs: LogsOptions,
-    serve: StartOptions,
 };
 
-pub const StartOptions = struct {
-    /// When true, keep the gateway attached to the current terminal.
-    /// Mutually exclusive with `detach`.
-    foreground: bool = false,
-    /// When true, fork + detach into a background daemon.
-    detach: bool = false,
+pub const RunOptions = struct {
+    /// Bind host. Defaults to loopback; v0.1.0 has no auth so the bind
+    /// stays loopback unless the operator opts in via flag.
+    host: []const u8 = "127.0.0.1",
+    /// Bind port. 8765 is the canonical local default the CLI verbs
+    /// (agent, sessions, providers status, etc.) probe by default.
+    port: u16 = 8765,
 };
 
 pub const LogsOptions = struct {
@@ -42,59 +41,53 @@ pub const LogsOptions = struct {
 };
 
 pub const ParseError = error{
-    MissingSubVerb,
     UnknownSubVerb,
     UnknownFlag,
     MissingFlagValue,
+    InvalidPort,
     InvalidTailCount,
-    ConflictingFlags,
 };
 
 pub fn parse(argv: []const []const u8) ParseError!Verb {
-    if (argv.len == 0) return error.MissingSubVerb;
+    // Bare `tigerclaw gateway` (no args) → run with defaults.
+    if (argv.len == 0) return .{ .run = .{} };
 
-    const sub = argv[0];
-    const rest = argv[1..];
+    const first = argv[0];
 
-    if (std.mem.eql(u8, sub, "start")) {
-        return .{ .start = try parseStartOptions(rest) };
+    // `logs` is the only true sub-verb: its flag set differs from the
+    // run options and a typo like `tigerclaw gateway logs --port 80`
+    // should error rather than silently start a daemon.
+    if (std.mem.eql(u8, first, "logs")) {
+        return .{ .logs = try parseLogsOptions(argv[1..]) };
     }
-    if (std.mem.eql(u8, sub, "restart")) {
-        return .{ .restart = try parseStartOptions(rest) };
-    }
-    if (std.mem.eql(u8, sub, "serve")) {
-        return .{ .serve = try parseStartOptions(rest) };
-    }
-    if (std.mem.eql(u8, sub, "stop")) {
-        if (rest.len != 0) return error.UnknownFlag;
-        return .stop;
-    }
-    if (std.mem.eql(u8, sub, "status")) {
-        if (rest.len != 0) return error.UnknownFlag;
-        return .status;
-    }
-    if (std.mem.eql(u8, sub, "logs")) {
-        return .{ .logs = try parseLogsOptions(rest) };
-    }
-    return error.UnknownSubVerb;
+
+    // Everything else is parsed as run options. A non-flag positional
+    // is a clear typo — surface it before we silently bind to localhost.
+    if (first.len == 0 or first[0] != '-') return error.UnknownSubVerb;
+
+    return .{ .run = try parseRunOptions(argv) };
 }
 
-fn parseStartOptions(argv: []const []const u8) ParseError!StartOptions {
-    var opts: StartOptions = .{};
+fn parseRunOptions(argv: []const []const u8) ParseError!RunOptions {
+    var opts: RunOptions = .{};
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
-        if (std.mem.eql(u8, a, "--foreground")) {
-            opts.foreground = true;
+        if (std.mem.eql(u8, a, "--port") or std.mem.eql(u8, a, "-p")) {
+            if (i + 1 >= argv.len) return error.MissingFlagValue;
+            const raw = argv[i + 1];
+            opts.port = std.fmt.parseInt(u16, raw, 10) catch return error.InvalidPort;
+            i += 1;
             continue;
         }
-        if (std.mem.eql(u8, a, "--detach")) {
-            opts.detach = true;
+        if (std.mem.eql(u8, a, "--host")) {
+            if (i + 1 >= argv.len) return error.MissingFlagValue;
+            opts.host = argv[i + 1];
+            i += 1;
             continue;
         }
         return error.UnknownFlag;
     }
-    if (opts.foreground and opts.detach) return error.ConflictingFlags;
     return opts;
 }
 
@@ -270,56 +263,158 @@ fn printTail(
     return bytes.len;
 }
 
+// ---------------------------------------------------------------------------
+// `gateway` execution — boot the daemon in the foreground.
+
+const gateway_root = @import("../../gateway/root.zig");
+const harness = @import("../../harness/root.zig");
+const clock_mod = @import("../../clock.zig");
+const tcp_server = @import("../../gateway/tcp_server.zig");
+const live_runner = @import("live_runner.zig");
+const agent_registry = @import("agent_registry.zig");
+
+pub const RunRunOptions = struct {
+    /// Resolved bind. Production main resolves --host into an IpAddress;
+    /// tests inject a localhost ephemeral binding.
+    address: std.Io.net.IpAddress,
+    /// Caller-resolved absolute path to `<HOME>/.tigerclaw/state`. The
+    /// boot layer owns subdirectory creation under it (outbox, etc.).
+    state_dir_path: []const u8,
+    /// Caller-resolved $HOME so the runner can find config.json + the
+    /// agent's SOUL.md. When empty, the live runner falls back to
+    /// MockAgentRunner so the daemon still boots in places without a
+    /// home directory (CI, tmpdirs, etc.).
+    home_path: []const u8 = "",
+    /// Name of the agent the live runner uses for every turn in
+    /// v0.1.0. Per-request agent dispatch lands when the runner gets
+    /// promoted from a single-agent shim to a registry.
+    agent_name: []const u8 = "tiger",
+};
+
+pub const RunRunError = error{
+    StateDirOpenFailed,
+    BindFailed,
+} || std.Io.Writer.Error || std.mem.Allocator.Error;
+
+fn wallNowNs() i128 {
+    // Zig 0.16 dropped std.time.nanoTimestamp; reach for the libc
+    // clock_gettime directly. CLOCK.REALTIME mirrors the wall clock.
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts) != 0) return 0;
+    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+}
+
+/// Boot the gateway in the foreground. Blocks until SIGTERM/SIGINT
+/// trips `tcp_server.requestStop`, then runs the documented drain
+/// (in-flight wait → manager stop → outbox flush) before returning.
+/// The mock agent runner is wired in v0.1.0; the real react-loop
+/// runner replaces it without changing this surface.
+pub fn runGateway(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    opts: RunRunOptions,
+    out: *std.Io.Writer,
+    err_w: *std.Io.Writer,
+) RunRunError!void {
+    var state_dir = std.Io.Dir.cwd().openDir(io, opts.state_dir_path, .{}) catch |e| switch (e) {
+        error.FileNotFound => blk: {
+            std.Io.Dir.cwd().createDirPath(io, opts.state_dir_path) catch return error.StateDirOpenFailed;
+            break :blk std.Io.Dir.cwd().openDir(io, opts.state_dir_path, .{}) catch return error.StateDirOpenFailed;
+        },
+        else => return error.StateDirOpenFailed,
+    };
+    defer state_dir.close(io);
+
+    // Reset the stop flag so consecutive runs in the same process
+    // (tests, REPL-style smoke runs) do not inherit a poisoned flag.
+    tcp_server.resetStopForTesting();
+
+    var clock_cb: clock_mod.CallbackClock = .{ .now_fn = wallNowNs };
+    var boot = gateway_root.boot.Boot.init(allocator, io, .{
+        .address = opts.address,
+        .state_root = state_dir,
+        .routes = &gateway_root.routes.routes,
+        .handlers = &gateway_root.routes.handlers,
+        .clock = clock_cb.clock(),
+    }) catch return error.BindFailed;
+    defer boot.deinit();
+
+    // Pre-load every agent under ~/.tigerclaw/agents. The route
+    // handler routes turns by `req.session_id` (the CLI sets that to
+    // the agent name) and falls back to a mock when no live runner
+    // can be loaded so tests + bare boot still come up cleanly.
+    var registry = agent_registry.AgentRegistry.init(allocator);
+    defer registry.deinit();
+    if (opts.home_path.len > 0) {
+        registry.loadAll(io, opts.home_path) catch |e| {
+            try err_w.print("tigerclaw: agent registry load warning: {s}\n", .{@errorName(e)});
+        };
+        try out.print("tigerclaw: loaded {d} live agent(s)\n", .{registry.entries.items.len});
+        for (registry.entries.items) |e| {
+            try out.print("  - {s} ({s} / {s})\n", .{
+                e.name,
+                @tagName(e.runner.provider_kind),
+                e.runner.model,
+            });
+        }
+    } else {
+        try err_w.writeAll("tigerclaw: no HOME — falling back to mock runner\n");
+    }
+    var ctx: gateway_root.routes.Context = .{ .runner = registry.runner() };
+
+    try out.print("tigerclaw gateway listening on {f}\n", .{opts.address});
+    try out.flush();
+
+    boot.run(&ctx) catch |e| {
+        try err_w.print("tigerclaw: gateway exited with error: {s}\n", .{@errorName(e)});
+        return;
+    };
+
+    try out.writeAll("tigerclaw gateway stopped cleanly\n");
+}
+
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
 
-test "parse: start with no flags" {
-    const argv = [_][]const u8{"start"};
+test "parse: bare gateway runs with default host + port" {
+    const argv = [_][]const u8{};
     const v = try parse(&argv);
-    try testing.expect(!v.start.foreground);
-    try testing.expect(!v.start.detach);
+    try testing.expectEqualStrings("127.0.0.1", v.run.host);
+    try testing.expectEqual(@as(u16, 8765), v.run.port);
 }
 
-test "parse: start --foreground sets the flag" {
-    const argv = [_][]const u8{ "start", "--foreground" };
+test "parse: --port sets the bind port" {
+    const argv = [_][]const u8{ "--port", "9000" };
     const v = try parse(&argv);
-    try testing.expect(v.start.foreground);
-    try testing.expect(!v.start.detach);
+    try testing.expectEqual(@as(u16, 9000), v.run.port);
 }
 
-test "parse: start --detach sets the flag" {
-    const argv = [_][]const u8{ "start", "--detach" };
+test "parse: -p short form for --port" {
+    const argv = [_][]const u8{ "-p", "9001" };
     const v = try parse(&argv);
-    try testing.expect(v.start.detach);
+    try testing.expectEqual(@as(u16, 9001), v.run.port);
 }
 
-test "parse: start --foreground --detach is rejected" {
-    const argv = [_][]const u8{ "start", "--foreground", "--detach" };
-    try testing.expectError(error.ConflictingFlags, parse(&argv));
-}
-
-test "parse: stop takes no flags" {
-    const argv = [_][]const u8{"stop"};
+test "parse: --host sets the bind host" {
+    const argv = [_][]const u8{ "--host", "0.0.0.0" };
     const v = try parse(&argv);
-    try testing.expectEqual(Verb.stop, v);
+    try testing.expectEqualStrings("0.0.0.0", v.run.host);
 }
 
-test "parse: stop with extra args rejects UnknownFlag" {
-    const argv = [_][]const u8{ "stop", "--soft" };
-    try testing.expectError(error.UnknownFlag, parse(&argv));
+test "parse: --port with a non-integer returns InvalidPort" {
+    const argv = [_][]const u8{ "--port", "lots" };
+    try testing.expectError(error.InvalidPort, parse(&argv));
 }
 
-test "parse: status takes no flags" {
-    const argv = [_][]const u8{"status"};
-    const v = try parse(&argv);
-    try testing.expectEqual(Verb.status, v);
+test "parse: --port without a value returns MissingFlagValue" {
+    const argv = [_][]const u8{"--port"};
+    try testing.expectError(error.MissingFlagValue, parse(&argv));
 }
 
-test "parse: restart carries start options" {
-    const argv = [_][]const u8{ "restart", "--detach" };
-    const v = try parse(&argv);
-    try testing.expect(v.restart.detach);
+test "parse: bogus positional returns UnknownSubVerb" {
+    const argv = [_][]const u8{"launch"};
+    try testing.expectError(error.UnknownSubVerb, parse(&argv));
 }
 
 test "parse: logs default options" {
@@ -351,22 +446,6 @@ test "parse: logs --tail without a value returns MissingFlagValue" {
 test "parse: logs --tail with a non-integer returns InvalidTailCount" {
     const argv = [_][]const u8{ "logs", "--tail", "lots" };
     try testing.expectError(error.InvalidTailCount, parse(&argv));
-}
-
-test "parse: empty argv returns MissingSubVerb" {
-    const argv = [_][]const u8{};
-    try testing.expectError(error.MissingSubVerb, parse(&argv));
-}
-
-test "parse: unknown sub-verb returns UnknownSubVerb" {
-    const argv = [_][]const u8{"launch"};
-    try testing.expectError(error.UnknownSubVerb, parse(&argv));
-}
-
-test "parse: serve carries start options" {
-    const argv = [_][]const u8{ "serve", "--foreground" };
-    const v = try parse(&argv);
-    try testing.expect(v.serve.foreground);
 }
 
 fn writeTempLog(dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {

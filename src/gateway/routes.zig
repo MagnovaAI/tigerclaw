@@ -224,11 +224,17 @@ fn sessionsTurnHandler(
         };
     }
 
-    // The mock runner takes the session_id verbatim as its session
-    // identifier and echoes the input back. Production will parse the
-    // request body JSON; the mock endpoint accepts any body and sends
-    // a canned prompt through the runner so the counter round-trips.
-    const result = ctx.runner.run(.{ .session_id = id, .input = "ping" }) catch |err| switch (err) {
+    // Extract `message` from the request body JSON. Empty body → fall
+    // back to a fixed prompt so smoke tests with no payload still
+    // exercise the runner. Errors here surface as bad-request rather
+    // than internal — the client built a malformed JSON.
+    const message_or_empty = extractMessage(req.body) catch return error.BadRequest;
+    // Fall back to a deterministic prompt when the body has no
+    // `message` field — keeps existing smoke tests + the canonical
+    // mock-runner behaviour intact.
+    const message = if (message_or_empty.len > 0) message_or_empty else "ping";
+
+    const result = ctx.runner.run(.{ .session_id = id, .input = message }) catch |err| switch (err) {
         error.SessionMissing => return http.Response.notFound(),
         error.BudgetExceeded => return .{ .status = .too_many_requests, .body = "budget exceeded\n" },
         else => return error.InternalServerError,
@@ -236,21 +242,61 @@ fn sessionsTurnHandler(
 
     // Content negotiation: a client asking for `text/event-stream`
     // receives the same logical turn rendered as SSE token events.
-    // The mock runner returns a single-shot reply (no real streaming),
-    // so the body is a fixed sequence framed in the SSE wire format.
-    // Real streaming arrives once the runner is wired to the react
-    // loop and the dispatcher gains a streaming response shape.
+    // The runner returns the full reply in one shot (real per-token
+    // streaming is the v0.2.0 dispatcher rewrite); we frame the
+    // response into a single token event + done event so the wire
+    // shape matches what a streaming client expects.
     if (wantsSse(req)) {
-        _ = result;
-        return .{
-            .status = .ok,
-            .headers = &sse_headers,
-            .body = mock_sse_body,
-        };
+        return renderSseFromOutput(result.output);
     }
 
-    _ = result;
     return http.Response.jsonOk("{\"status\":\"ok\"}");
+}
+
+/// Pull `message` out of the request body JSON. Empty body → empty
+/// string (the runner falls back to a deterministic prompt). Returns
+/// `error.BadRequest` for malformed JSON or non-string `message` to
+/// surface a typo at the wire boundary instead of inside the runner.
+fn extractMessage(body: []const u8) error{BadRequest}![]const u8 {
+    if (body.len == 0) return "";
+    // We need a leaky parse so we can borrow the slice into the body
+    // bytes without re-allocating. The handler returns immediately
+    // after this; the tcp_server frees `body` once dispatch finishes.
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch
+        return error.BadRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadRequest;
+    const m = parsed.value.object.get("message") orelse return "";
+    if (m != .string) return error.BadRequest;
+    // Slice aliases the parsed arena; that arena dies at deinit above.
+    // We re-find the slice in the original body so the returned slice
+    // outlives this function.
+    const needle = m.string;
+    const start = std.mem.indexOf(u8, body, needle) orelse return error.BadRequest;
+    return body[start .. start + needle.len];
+}
+
+/// Build the SSE response body for a one-shot runner output. Memory
+/// for the body comes out of a thread-local fixed buffer — the
+/// handler signature is allocator-free, and the body is consumed by
+/// `tcp_server` before this thread services its next request.
+threadlocal var sse_body_buf: [16 * 1024]u8 = undefined;
+
+fn renderSseFromOutput(output: []const u8) http.Response {
+    const truncated = if (output.len > sse_body_buf.len - 256)
+        output[0 .. sse_body_buf.len - 256]
+    else
+        output;
+    const body = std.fmt.bufPrint(
+        &sse_body_buf,
+        "event: token\ndata: {s}\n\nevent: done\ndata: {{\"completed\":true}}\n\n",
+        .{truncated},
+    ) catch return .{ .status = .internal_server_error, .body = "render failed\n" };
+    return .{
+        .status = .ok,
+        .headers = &sse_headers,
+        .body = body,
+    };
 }
 
 /// DELETE /sessions/:id/turns/current — cancel the in-flight turn for
