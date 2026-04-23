@@ -335,8 +335,18 @@ pub fn decode(bytes: []const u8, alloc: std.mem.Allocator) PlugError!Envelope {
         }
     }
 
-    // Sanity checks on required fields. envelope_v is allowed here to
-    // be any value; version-gating is a separate pass (TIG-151).
+    // Version gating: the wire must declare the exact schema version
+    // this build supports. Missing (default 0) or any other value is
+    // refused — no silent downgrade or forward compat.
+    if (env.envelope_v != envelope_mod.EnvelopeV) {
+        std.log.warn(
+            "envelope_v mismatch: wire={d} expected={d}",
+            .{ env.envelope_v, envelope_mod.EnvelopeV },
+        );
+        return error.BadInput;
+    }
+
+    // Sanity checks on required fields.
     // Double-free guard: errdefer above calls deinit on error path;
     // we don't free here, just return and let errdefer handle it.
     // Body is NOT required — proto3 defaults an unset bytes field to
@@ -499,7 +509,7 @@ test "encode: include_sig=false omits sender_sig" {
     try testing.expectEqual(@as(?[]const u8, null), decoded.sender_sig);
 }
 
-test "decode: rejects missing sender_id" {
+test "decode: rejects missing sender_id (after version gate)" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
 
@@ -515,7 +525,7 @@ test "decode: rejects missing sender_id" {
     try testing.expectError(error.BadInput, result);
 }
 
-test "decode: rejects missing verb" {
+test "decode: rejects missing verb (after version gate)" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
 
@@ -586,6 +596,36 @@ test "fixture: user_msg.pb.bin decodes to expected content" {
     try testing.expectEqualStrings("conv-01", decoded.conversation_id);
     try testing.expectEqualStrings("user:omkar", decoded.sender_id);
     try testing.expectEqualStrings("{\"text\":\"hi\"}", decoded.body);
+}
+
+test "version gating: decode rejects envelope_v == 0 (missing)" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+
+    // Skip envelope_v (proto3 default for uint32 = 0 when unset).
+    try writeEnum(&buf, testing.allocator, F_VERB, 1);
+    try writeString(&buf, testing.allocator, F_CONVERSATION_ID, "c");
+    try writeString(&buf, testing.allocator, F_ORIGIN_CHANNEL_ID, "o");
+    try writeString(&buf, testing.allocator, F_SENDER_ID, "s");
+    try writeInt64(&buf, testing.allocator, F_SENT_AT_MS, 1);
+    try writeString(&buf, testing.allocator, F_BODY_MIME, "application/json");
+
+    try testing.expectError(error.BadInput, decode(buf.items, testing.allocator));
+}
+
+test "version gating: decode rejects envelope_v == 2 (future)" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+
+    try writeUint32(&buf, testing.allocator, F_ENVELOPE_V, 2);
+    try writeEnum(&buf, testing.allocator, F_VERB, 1);
+    try writeString(&buf, testing.allocator, F_CONVERSATION_ID, "c");
+    try writeString(&buf, testing.allocator, F_ORIGIN_CHANNEL_ID, "o");
+    try writeString(&buf, testing.allocator, F_SENDER_ID, "s");
+    try writeInt64(&buf, testing.allocator, F_SENT_AT_MS, 1);
+    try writeString(&buf, testing.allocator, F_BODY_MIME, "application/json");
+
+    try testing.expectError(error.BadInput, decode(buf.items, testing.allocator));
 }
 
 test "canonicalBytes: deterministic across calls" {
