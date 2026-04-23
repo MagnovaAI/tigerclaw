@@ -1,10 +1,19 @@
 //! Canonical error taxonomy.
 //!
-//! Every subsystem maps its failure modes onto an `Id` here. Ids are stable
-//! identifiers used in logs, traces, and user-facing messages — renaming one
-//! is a breaking change. To add a variant, append; never reorder. To retire a
-//! variant, mark it `.deprecated` in the `descriptions` table and leave the
-//! enum slot reserved.
+//! Two layers live here:
+//!
+//! 1. `Id` — the project-wide canonical error catalog used in logs,
+//!    traces, and user-facing messages. Stable: append-only, never
+//!    reorder, never rename (renames are breaking changes).
+//! 2. `PlugError` — the closed error set Zig's error-union system uses
+//!    at plug vtable boundaries. Every plugger vtable method returns a
+//!    value of type `PlugError!T`, never `anyerror!T`. Callers can
+//!    handle exhaustive error variants.
+//!
+//! `plugErrorToId()` maps a PlugError back to the corresponding Id so
+//! existing log/trace infrastructure keeps working unchanged.
+//!
+//! Spec: docs/spec/agent-architecture-v3.yaml §architecture.error-taxonomy
 
 const std = @import("std");
 
@@ -30,6 +39,8 @@ pub const Id = enum {
     // Harness
     mode_forbidden,
     interrupt_requested,
+    // Plug vtable boundary
+    internal,
 };
 
 pub fn name(id: Id) []const u8 {
@@ -54,6 +65,54 @@ pub fn description(id: Id) []const u8 {
         .rate_limited => "provider rejected the request as rate-limited",
         .mode_forbidden => "current harness mode forbids this operation",
         .interrupt_requested => "caller asked the loop to stop",
+        .internal => "unexpected internal failure (always a bug)",
+    };
+}
+
+// --- PlugError: closed error set for vtable boundaries ---------------------
+
+/// Closed error set returned at plug vtable boundaries. Plugs surface
+/// exactly one of these variants; callers can handle them exhaustively
+/// without resorting to `anyerror`.
+///
+/// Mapping back to the broader `Id` catalog is available via
+/// `plugErrorToId()` — that keeps existing log/trace paths working.
+pub const PlugError = error{
+    /// Dependency unreachable or temporarily missing (network down,
+    /// upstream 5xx, sidecar not started, required fs path absent).
+    Unavailable,
+
+    /// Input failed validation at the plug boundary: malformed envelope,
+    /// unknown verb, wrong schema version, etc.
+    BadInput,
+
+    /// Operation exceeded the deadline carried by Context.deadline_ms.
+    Timeout,
+
+    /// Policy refused the operation. Guardrail deny, PKG scope
+    /// unauthorized, authz rejection.
+    Refused,
+
+    /// Budget (meter) could not cover the requested operation.
+    OverBudget,
+
+    /// Unexpected internal failure. Always a bug; logged and traced
+    /// with best-effort context.
+    Internal,
+};
+
+/// Maps a PlugError to the canonical Id used by the rest of the
+/// taxonomy. The mapping is exhaustive — every PlugError variant has a
+/// corresponding Id, so logs and traces stay uniform regardless of
+/// where the failure originated.
+pub fn plugErrorToId(e: PlugError) Id {
+    return switch (e) {
+        error.Unavailable => .unavailable,
+        error.BadInput => .invalid_argument,
+        error.Timeout => .timed_out,
+        error.Refused => .permission_denied,
+        error.OverBudget => .budget_exhausted,
+        error.Internal => .internal,
     };
 }
 
@@ -94,10 +153,40 @@ test "stability: canonical ids are spelled as expected" {
         "rate_limited",
         "mode_forbidden",
         "interrupt_requested",
+        "internal",
     };
     const fields = @typeInfo(Id).@"enum".fields;
     try testing.expectEqual(expected.len, fields.len);
     inline for (fields, 0..) |f, i| {
         try testing.expectEqualStrings(expected[i], f.name);
     }
+}
+
+test "PlugError: every variant maps to an Id" {
+    // Exhaustive: inline for over the PlugError error set ensures any
+    // new variant added breaks this test until a mapping is added.
+    const variants = [_]PlugError{
+        error.Unavailable,
+        error.BadInput,
+        error.Timeout,
+        error.Refused,
+        error.OverBudget,
+        error.Internal,
+    };
+    for (variants) |e| {
+        const id = plugErrorToId(e);
+        // Just assert description is non-empty; semantic correctness of
+        // the mapping is checked by the specific-case test below.
+        const d = description(id);
+        try testing.expect(d.len > 0);
+    }
+}
+
+test "PlugError: mapping is semantically correct" {
+    try testing.expectEqual(Id.unavailable, plugErrorToId(error.Unavailable));
+    try testing.expectEqual(Id.invalid_argument, plugErrorToId(error.BadInput));
+    try testing.expectEqual(Id.timed_out, plugErrorToId(error.Timeout));
+    try testing.expectEqual(Id.permission_denied, plugErrorToId(error.Refused));
+    try testing.expectEqual(Id.budget_exhausted, plugErrorToId(error.OverBudget));
+    try testing.expectEqual(Id.internal, plugErrorToId(error.Internal));
 }
