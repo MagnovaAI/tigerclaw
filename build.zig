@@ -19,14 +19,15 @@ pub fn build(b: *std.Build) void {
     const extensions_spec = b.option(
         []const u8,
         "extensions",
-        "Comma-separated provider extensions to compile in (anthropic,openai,bedrock,openrouter,all). Default: all.",
-    ) orelse "anthropic,openai,bedrock,openrouter,telegram";
+        "Comma-separated extensions to compile in (anthropic,openai,bedrock,openrouter,telegram,memory,all). Default: all.",
+    ) orelse "anthropic,openai,bedrock,openrouter,telegram,memory";
 
     const enable_anthropic = hasToken(extensions_spec, "anthropic");
     const enable_openai = hasToken(extensions_spec, "openai");
     const enable_bedrock = hasToken(extensions_spec, "bedrock");
     const enable_openrouter = hasToken(extensions_spec, "openrouter");
     const enable_telegram = hasToken(extensions_spec, "telegram");
+    const enable_memory = hasToken(extensions_spec, "memory");
 
     // CalVer — YYYY.M.D. Release pipelines override with
     // `-Dversion=2026.4.11`; local dev builds derive it from the
@@ -57,6 +58,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_bedrock", enable_bedrock);
     build_options.addOption(bool, "enable_openrouter", enable_openrouter);
     build_options.addOption(bool, "enable_telegram", enable_telegram);
+    build_options.addOption(bool, "enable_memory", enable_memory);
     const build_options_mod = build_options.createModule();
 
     // Named modules carved out of the `tigerclaw` source tree so that
@@ -115,6 +117,7 @@ pub fn build(b: *std.Build) void {
     var provider_bedrock_mod: ?*std.Build.Module = null;
     var provider_openrouter_mod: ?*std.Build.Module = null;
     var channel_telegram_mod: ?*std.Build.Module = null;
+    var memory_tigerclaw_mod: ?*std.Build.Module = null;
     if (enable_anthropic) {
         const ext = b.addModule("provider_anthropic", .{
             .root_source_file = b.path("extensions/providers-anthropic/root.zig"),
@@ -173,6 +176,19 @@ pub fn build(b: *std.Build) void {
         tigerclaw_mod.addImport("channel_telegram", ext);
         channel_telegram_mod = ext;
     }
+    if (enable_memory) {
+        const ext = b.addModule("memory_tigerclaw", .{
+            .root_source_file = b.path("extensions/memory-tigerclaw/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            // sqlite3 is reached via @cImport; libc provides the headers.
+            .link_libc = true,
+        });
+        ext.addImport("memory_spec", memory_spec_mod);
+        ext.linkSystemLibrary("sqlite3", .{});
+        tigerclaw_mod.addImport("memory_tigerclaw", ext);
+        memory_tigerclaw_mod = ext;
+    }
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -193,6 +209,10 @@ pub fn build(b: *std.Build) void {
     if (provider_bedrock_mod) |m| exe_mod.addImport("provider_bedrock", m);
     if (provider_openrouter_mod) |m| exe_mod.addImport("provider_openrouter", m);
     if (channel_telegram_mod) |m| exe_mod.addImport("channel_telegram", m);
+    if (memory_tigerclaw_mod) |m| {
+        exe_mod.addImport("memory_tigerclaw", m);
+        exe_mod.linkSystemLibrary("sqlite3", .{});
+    }
     const exe = b.addExecutable(.{
         .name = "tigerclaw",
         .root_module = exe_mod,
@@ -227,6 +247,10 @@ pub fn build(b: *std.Build) void {
     if (provider_bedrock_mod) |m| unit_mod.addImport("provider_bedrock", m);
     if (provider_openrouter_mod) |m| unit_mod.addImport("provider_openrouter", m);
     if (channel_telegram_mod) |m| unit_mod.addImport("channel_telegram", m);
+    if (memory_tigerclaw_mod) |m| {
+        unit_mod.addImport("memory_tigerclaw", m);
+        unit_mod.linkSystemLibrary("sqlite3", .{});
+    }
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
@@ -261,6 +285,10 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
     if (channel_telegram_mod) |m| {
+        const t = b.addTest(.{ .root_module = m });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    if (memory_tigerclaw_mod) |m| {
         const t = b.addTest(.{ .root_module = m });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
