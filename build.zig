@@ -148,6 +148,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        // Daemon plumbing reaches std.c.{getpid, clock_gettime, SIG};
+        // Linux/musl needs the dependency declared explicitly.
+        .link_libc = true,
     });
     exe_mod.addImport("build_options", build_options_mod);
     exe_mod.addImport("types", types_mod);
@@ -178,6 +181,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        // Same libc requirement as exe_mod — unit tests exercise the
+        // same daemon code paths.
+        .link_libc = true,
     });
     unit_mod.addImport("build_options", build_options_mod);
     unit_mod.addImport("types", types_mod);
