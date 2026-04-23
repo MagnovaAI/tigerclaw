@@ -156,6 +156,17 @@ pub fn encode(
     return buf.toOwnedSlice(alloc) catch return error.Internal;
 }
 
+/// Encode an envelope into its canonical byte representation used for
+/// signing. Equivalent to `encode(env, alloc, include_sig=false)` but
+/// named explicitly to make calling sites self-documenting. The bytes
+/// returned are:
+///   - stable across Zig builds (determinism test guards this)
+///   - missing the `sender_sig` field even if populated
+///   - exactly what ed25519 signs in envelope_sig.zig
+pub fn canonicalBytes(env: *const Envelope, alloc: std.mem.Allocator) PlugError![]u8 {
+    return encode(env, alloc, false);
+}
+
 fn doEncode(
     env: *const Envelope,
     alloc: std.mem.Allocator,
@@ -575,6 +586,92 @@ test "fixture: user_msg.pb.bin decodes to expected content" {
     try testing.expectEqualStrings("conv-01", decoded.conversation_id);
     try testing.expectEqualStrings("user:omkar", decoded.sender_id);
     try testing.expectEqualStrings("{\"text\":\"hi\"}", decoded.body);
+}
+
+test "canonicalBytes: deterministic across calls" {
+    var env = makeMinimal();
+    env.sender_sig = "TEST_SIG_VALUE";
+
+    const bytes_a = try canonicalBytes(&env, testing.allocator);
+    defer testing.allocator.free(bytes_a);
+
+    const bytes_b = try canonicalBytes(&env, testing.allocator);
+    defer testing.allocator.free(bytes_b);
+
+    try testing.expectEqualSlices(u8, bytes_a, bytes_b);
+}
+
+test "canonicalBytes: omits sender_sig even when populated" {
+    var env_with_sig = makeMinimal();
+    env_with_sig.sender_sig = "DIFFERENT_SIG";
+
+    var env_without_sig = makeMinimal();
+    env_without_sig.sender_sig = null;
+
+    const canon_with = try canonicalBytes(&env_with_sig, testing.allocator);
+    defer testing.allocator.free(canon_with);
+
+    const canon_without = try canonicalBytes(&env_without_sig, testing.allocator);
+    defer testing.allocator.free(canon_without);
+
+    // Whether the envelope's sender_sig is set or not, the canonical
+    // bytes must be byte-identical — the field is excluded from signing.
+    try testing.expectEqualSlices(u8, canon_with, canon_without);
+}
+
+test "canonicalBytes: signature changes don't affect canonical output" {
+    var env = makeMinimal();
+
+    env.sender_sig = "SIG_A";
+    const with_a = try canonicalBytes(&env, testing.allocator);
+    defer testing.allocator.free(with_a);
+
+    env.sender_sig = "SIG_B_LONGER";
+    const with_b = try canonicalBytes(&env, testing.allocator);
+    defer testing.allocator.free(with_b);
+
+    try testing.expectEqualSlices(u8, with_a, with_b);
+}
+
+test "canonicalBytes: body content DOES affect canonical output" {
+    var env_a = makeMinimal();
+    env_a.body = "{\"text\":\"hi\"}";
+
+    var env_b = makeMinimal();
+    env_b.body = "{\"text\":\"bye\"}";
+
+    const canon_a = try canonicalBytes(&env_a, testing.allocator);
+    defer testing.allocator.free(canon_a);
+
+    const canon_b = try canonicalBytes(&env_b, testing.allocator);
+    defer testing.allocator.free(canon_b);
+
+    // Different body → different canonical bytes. This is what makes
+    // the signature catch tampering.
+    try testing.expect(!std.mem.eql(u8, canon_a, canon_b));
+}
+
+test "canonicalBytes: all 9 fixture verbs produce deterministic output" {
+    const cases = [_][]const u8{
+        fixtures.user_msg,    fixtures.tool_call,
+        fixtures.tool_result, fixtures.reply,
+        fixtures.retract,     fixtures.hello,
+        fixtures.hello_ack,   fixtures.refuse,
+        fixtures.heartbeat,
+    };
+
+    for (cases) |bytes| {
+        var decoded = try decode(bytes, testing.allocator);
+        defer deinitDecoded(&decoded, testing.allocator);
+
+        // Two canonicalizations of the same envelope must be identical.
+        const pass1 = try canonicalBytes(&decoded, testing.allocator);
+        defer testing.allocator.free(pass1);
+        const pass2 = try canonicalBytes(&decoded, testing.allocator);
+        defer testing.allocator.free(pass2);
+
+        try testing.expectEqualSlices(u8, pass1, pass2);
+    }
 }
 
 test "fixture: all 9 verb fixtures decode successfully" {
