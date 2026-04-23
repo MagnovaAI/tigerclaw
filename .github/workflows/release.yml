@@ -1,0 +1,87 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-macos
+            artifact: tigerclaw-macos-arm64
+            runs-on: macos-14
+          - target: x86_64-macos
+            artifact: tigerclaw-macos-x86_64
+            runs-on: macos-13
+          - target: x86_64-linux-musl
+            artifact: tigerclaw-linux-x86_64
+            runs-on: ubuntu-latest
+          - target: aarch64-linux-musl
+            artifact: tigerclaw-linux-arm64
+            runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseSmall -Dtarget=${{ matrix.target }}
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/tigerclaw dist/${{ matrix.artifact }}
+          shasum -a 256 dist/${{ matrix.artifact }} > dist/${{ matrix.artifact }}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}*
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compose release notes
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          awk -v ver="$version" '
+            /^## \[/ { if (capture) exit; if ($0 ~ "\\["ver"\\]") capture=1; next }
+            capture { print }
+          ' CHANGELOG.md > dist/release-notes.md
+          if [ ! -s dist/release-notes.md ]; then
+            echo "no CHANGELOG section found for $tag" >&2
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: tigerclaw ${{ github.ref_name }}
+          body_path: dist/release-notes.md
+          files: |
+            dist/tigerclaw-*
+            dist/tigerclaw-*.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false
