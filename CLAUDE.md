@@ -4,6 +4,16 @@ Guidance for Claude Code (and other AI agents) working in this repository.
 
 **Read `AGENTS.md` before any code change.** It is the authoritative engineering protocol. It links to the plug architecture spec at `docs/spec/agent-architecture-v3.yaml` and the runtime state layout at `docs/spec/WORKING_DIR_TREE.yaml` — read those when touching anything plug-shaped.
 
+## On complexity
+
+**Complexity is anything related to the structure of a software system that makes it hard to understand and modify the system.**
+
+If a change is hard to reason about, hard to review, or ripples into subsystems it shouldn't touch — that's complexity. Not a feature. Not a style preference. A cost.
+
+Every abstraction, flag, vtable, plug, hook, and config knob is paying that cost. They earn their keep by making other things simpler. When they don't, remove them.
+
+Before adding anything: can I solve the problem without adding structure? If yes, do that.
+
 ## Build & test
 
 ```sh
