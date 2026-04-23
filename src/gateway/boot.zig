@@ -44,6 +44,8 @@ const dispatch_mod = @import("../channels/dispatch.zig");
 const manager_mod = @import("../channels/manager.zig");
 const outbox_mod = @import("../channels/outbox.zig");
 const startup_mod = @import("../channels/startup.zig");
+const dispatch_worker_mod = @import("../channels/dispatch_worker.zig");
+const outbox_sender_mod = @import("../channels/outbox_sender.zig");
 const agent_registry = @import("../harness/agent_registry.zig");
 const spec = @import("channels_spec");
 
@@ -115,6 +117,14 @@ pub const Boot = struct {
     /// caller supplied no registry this stays at `.empty` and deinit
     /// is a no-op.
     channel_telegram: startup_mod.ChannelTelegram,
+    /// Drains the dispatch FIFO, calls the runner, appends replies to
+    /// the outbox. Optional — null when the Boot is constructed without
+    /// a runner (tests that exercise routes in isolation).
+    dispatch_worker: ?dispatch_worker_mod.Worker = null,
+    /// Walks the outbox and delivers to the channel adapter. One per
+    /// channel kind; v0.1.0 ships telegram. Null when agents weren't
+    /// supplied.
+    telegram_sender: ?outbox_sender_mod.Sender = null,
 
     state_root: std.Io.Dir,
     config_path: []const u8,
@@ -282,6 +292,28 @@ pub const Boot = struct {
 
         try self.manager.start();
 
+        // Dispatch worker drains inbound → runner → outbox; outbox
+        // sender delivers to the channel adapter. Only start when a
+        // registry was supplied (live daemon), otherwise tests that
+        // exercise routes in isolation would race the runner.
+        if (self.channel_telegram.telegram_entries.items.len > 0) {
+            self.dispatch_worker = dispatch_worker_mod.Worker.init(
+                self.allocator,
+                &self.dispatch,
+                &self.outbox,
+                ctx.runner,
+            );
+            try self.dispatch_worker.?.start();
+
+            self.telegram_sender = outbox_sender_mod.Sender.init(
+                self.io,
+                &self.manager,
+                &self.outbox,
+                .telegram,
+            );
+            try self.telegram_sender.?.start();
+        }
+
         // serve blocks until should_stop is observed between
         // connections; the defer below runs whether serve returned
         // cleanly or fell out via error so the drain always fires.
@@ -324,10 +356,13 @@ pub const Boot = struct {
         // that case.
         self.manager.stop();
 
-        // Step 4: flush outbox. Every append already fsyncs and the
-        // receivers joined in step 3 were the only writers, so this
-        // is a contract anchor rather than an active call.
-        _ = self.outbox;
+        // Step 4: stop dispatch worker (no more inbound to route) and
+        // outbox sender (in-flight sends finish their iteration, then
+        // the thread joins). Order: dispatch_worker before sender so
+        // no new outbox records land after the sender has been told
+        // to quit.
+        if (self.dispatch_worker) |*w| w.stop();
+        if (self.telegram_sender) |*s| s.stop();
     }
 };
 

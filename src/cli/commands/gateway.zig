@@ -285,6 +285,8 @@ const clock_mod = @import("../../clock.zig");
 const tcp_server = @import("../../gateway/tcp_server.zig");
 const live_runner = @import("live_runner.zig");
 const agent_registry = @import("agent_registry.zig");
+const agents_loader = @import("agents_loader.zig");
+const harness_agent_registry = @import("../../harness/agent_registry.zig");
 const startup_log = @import("../../gateway/startup_log.zig");
 const log_formatter = @import("../../gateway/log_formatter.zig");
 
@@ -362,12 +364,35 @@ pub fn runGateway(
     tcp_server.resetStopForTesting();
 
     var clock_cb: clock_mod.CallbackClock = .{ .now_fn = wallNowNs };
+
+    // Load the AgentsConfig from disk and convert to a harness
+    // Registry for Boot.init to walk. An empty or missing agents
+    // directory is not fatal — we proceed without live channels and
+    // the daemon still answers HTTP routes.
+    var loaded_agents_opt: ?agents_loader.Loaded = null;
+    var harness_registry_opt: ?harness_agent_registry.Registry = null;
+    defer if (loaded_agents_opt) |*l| l.deinit();
+    defer if (harness_registry_opt) |*r| r.deinit();
+    if (opts.home_path.len > 0) {
+        if (agents_loader.loadFromHome(allocator, io, opts.home_path)) |loaded| {
+            loaded_agents_opt = loaded;
+            if (harness_agent_registry.build(allocator, loaded.config)) |built| {
+                harness_registry_opt = built;
+            } else |err| {
+                gw_log.warn("agents registry build failed: {s}", .{@errorName(err)});
+            }
+        } else |err| {
+            gw_log.warn("agents loader failed: {s}", .{@errorName(err)});
+        }
+    }
+
     var boot = gateway_root.boot.Boot.init(allocator, io, .{
         .address = opts.address,
         .state_root = state_dir,
         .routes = &gateway_root.routes.routes,
         .handlers = &gateway_root.routes.handlers,
         .clock = clock_cb.clock(),
+        .agents = if (harness_registry_opt) |*r| r else null,
     }) catch return error.BindFailed;
     defer boot.deinit();
 

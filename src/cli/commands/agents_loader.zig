@@ -74,8 +74,8 @@ pub fn loadFromHome(
     var entries: std.ArrayList(agents_cfg.AgentConfig) = .empty;
     defer entries.deinit(aa);
 
-    var it = dir.iterate(io);
-    while (it.next() catch null) |entry| {
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
         if (entry.kind != .directory) continue;
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
 
