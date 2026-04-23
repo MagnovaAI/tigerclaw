@@ -55,6 +55,7 @@ const F_MAX_TOKENS: u32 = 12;
 const F_MAX_WALL_MS: u32 = 13;
 const F_MAX_COST_USD_MICROS: u32 = 14;
 const F_ATTACHMENTS: u32 = 15;
+const F_THREAD_KEY: u32 = 16;
 
 // Attachment field numbers
 const F_ATT_NAME: u32 = 1;
@@ -208,6 +209,8 @@ fn doEncode(
     for (env.attachments) |att| {
         try writeAttachment(buf, alloc, F_ATTACHMENTS, att);
     }
+
+    if (env.thread_key) |k| try writeString(buf, alloc, F_THREAD_KEY, k);
 }
 
 // --- reader helpers --------------------------------------------------------
@@ -331,6 +334,7 @@ pub fn decode(bytes: []const u8, alloc: std.mem.Allocator) PlugError!Envelope {
                 const att = decodeAttachment(payload) catch return error.BadInput;
                 attachments_list.append(alloc, att) catch return error.Internal;
             },
+            F_THREAD_KEY => env.thread_key = readString(&r) catch return error.BadInput,
             else => r.skipField(wire) catch return error.BadInput,
         }
     }
@@ -452,6 +456,7 @@ test "roundtrip: all optional fields populated" {
     env.max_tokens = 4000;
     env.max_wall_ms = 30000;
     env.max_cost_usd_micros = 12345;
+    env.thread_key = "topic-7";
 
     const bytes = try encode(&env, testing.allocator, true);
     defer testing.allocator.free(bytes);
@@ -468,6 +473,21 @@ test "roundtrip: all optional fields populated" {
     try testing.expectEqual(@as(?u32, 4000), decoded.max_tokens);
     try testing.expectEqual(@as(?u32, 30000), decoded.max_wall_ms);
     try testing.expectEqual(@as(?u32, 12345), decoded.max_cost_usd_micros);
+    try testing.expect(decoded.thread_key != null);
+    try testing.expectEqualStrings("topic-7", decoded.thread_key.?);
+}
+
+test "roundtrip: thread_key omitted when null" {
+    const env = makeMinimal();
+    try testing.expectEqual(@as(?[]const u8, null), env.thread_key);
+
+    const bytes = try encode(&env, testing.allocator, true);
+    defer testing.allocator.free(bytes);
+
+    var decoded = try decode(bytes, testing.allocator);
+    defer deinitDecoded(&decoded, testing.allocator);
+
+    try testing.expectEqual(@as(?[]const u8, null), decoded.thread_key);
 }
 
 test "roundtrip: with attachments" {

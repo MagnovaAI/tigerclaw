@@ -115,6 +115,13 @@ pub const Envelope = struct {
     /// .proto field 15 — inline attachments.
     attachments: []const Attachment = &.{},
 
+    /// .proto field 16 — optional thread/topic key within the
+    /// conversation. Preserved end-to-end so threaded channels
+    /// (Telegram topics, Slack thread_ts, Discord threads) route
+    /// replies back onto the originating thread. Null for
+    /// single-threaded channels.
+    thread_key: ?[]const u8 = null,
+
     /// Builder with validation. Required fields must be set before
     /// calling `build()`. Returns PlugError.BadInput if any required
     /// field is missing or empty.
@@ -197,6 +204,11 @@ pub const Envelope = struct {
             return self;
         }
 
+        pub fn threadKey(self: *Builder, k: []const u8) *Builder {
+            self.env.thread_key = k;
+            return self;
+        }
+
         /// Validate and return the envelope. Required fields: verb
         /// (non-unspecified), conversation_id, origin_channel_id,
         /// sender_id, sent_at_ms (>= 0), body_mime, body.
@@ -230,6 +242,9 @@ pub const Envelope = struct {
         _ = b.sentAtMs(sent_at_ms_val);
         _ = b.inReplyTo(in_reply_to_id);
         _ = b.body(body_val);
+        // Pin replies to the originating thread so threaded channels
+        // route the response back onto the correct topic.
+        if (self.thread_key) |k| _ = b.threadKey(k);
         return b.build();
     }
 };
@@ -332,6 +347,38 @@ test "newReply: inherits conversation_id and origin_channel_id" {
     try testing.expectEqualStrings("agent:tiger", reply.sender_id);
     try testing.expect(reply.in_reply_to != null);
     try testing.expectEqualStrings("env-1", reply.in_reply_to.?);
+}
+
+test "newReply: pins thread_key to inbound" {
+    var b = Envelope.Builder.init();
+    const inbound = try b
+        .verb(.user_msg)
+        .conversationId("conv-42")
+        .originChannelId("chan-telegram:group:777")
+        .senderId("user:omkar")
+        .sentAtMs(1745000000000)
+        .threadKey("topic-3")
+        .body("{\"text\":\"hi\"}")
+        .build();
+
+    const reply = try inbound.newReply("agent:tiger", 1745000001000, "{\"text\":\"hello\"}", "env-1");
+    try testing.expect(reply.thread_key != null);
+    try testing.expectEqualStrings("topic-3", reply.thread_key.?);
+}
+
+test "newReply: thread_key stays null when inbound has none" {
+    var b = Envelope.Builder.init();
+    const inbound = try b
+        .verb(.user_msg)
+        .conversationId("conv-42")
+        .originChannelId("chan-cli:local")
+        .senderId("user:omkar")
+        .sentAtMs(1745000000000)
+        .body("{\"text\":\"hi\"}")
+        .build();
+
+    const reply = try inbound.newReply("agent:tiger", 1745000001000, "{\"text\":\"hello\"}", "env-1");
+    try testing.expectEqual(@as(?[]const u8, null), reply.thread_key);
 }
 
 test "EnvelopeV: locked at 1" {

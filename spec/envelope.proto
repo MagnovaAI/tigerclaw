@@ -65,8 +65,15 @@ message Envelope {
   // via content-addressed blob store (see WORKING_DIR_TREE.yaml).
   repeated Attachment attachments = 15;
 
+  // Optional thread/topic key within a conversation. Preserves thread
+  // context for channels that support sub-threads (Telegram topics via
+  // message_thread_id, Slack thread_ts, Discord thread_id). Omitted for
+  // single-threaded channels. Scope: (conversation_id, thread_key) is
+  // the finest-grained routing unit dispatch uses to pin a turn.
+  optional string thread_key = 16;
+
   // Reserved field numbers for forward-compat extensions inside v1.
-  reserved 16 to 99;
+  reserved 17 to 99;
 }
 
 // Kind of envelope. Defines the shape expected of `body` and who can

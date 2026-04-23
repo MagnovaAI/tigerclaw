@@ -61,10 +61,28 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_memory", enable_memory);
     const build_options_mod = build_options.createModule();
 
-    // Named modules carved out of the `tigerclaw` source tree so that
-    // extension code (in its own module) can reach exactly these three
-    // surfaces and nothing else. The Amendment A allowlist is enforced
-    // by the explicit `addImport` chain below.
+    // Extension ABI allowlist (Amendment A / architecture v3).
+    //
+    // Extensions live in their own module graph and may only reach the
+    // tigerclaw core via the named modules declared below. Nothing in
+    // `src/` is importable from extension code without going through
+    // one of these surfaces. Enforcement is structural — each extension
+    // is `b.addModule(...)` with its own source root, and the only
+    // `.addImport(...)` calls it ever sees are the ones in this file.
+    //
+    // Current allowlist (keep this list in lockstep with the blocks
+    // further down in this file):
+    //   - types           — canonical struct definitions
+    //   - llm_provider    — provider vtable (for provider-* plugs)
+    //   - llm_transport   — HTTP + SSE transport helpers
+    //   - channels_spec   — channel vtable (for channel-* plugs)
+    //   - memory_spec     — session-store vtable (for memory-* plugs)
+    //   - build_options   — compile-time feature flags
+    //
+    // New surface? Add it here AND in the extension's addImport block,
+    // AND update this comment. Adding an ad-hoc `@import("../../src/x.zig")`
+    // from an extension is not a shortcut — it breaks the module graph
+    // and the build won't let you.
     const types_mod = b.addModule("types", .{
         .root_source_file = b.path("src/types/root.zig"),
         .target = target,
