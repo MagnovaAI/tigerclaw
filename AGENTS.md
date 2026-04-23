@@ -12,11 +12,34 @@ Authoritative engineering protocol for contributors and AI coding agents working
 
 ## Architecture
 
+The plug architecture is specified in `docs/spec/agent-architecture-v3.yaml`. Read it before:
+
+- adding a new capability or plugger
+- adding a new plug under an existing plugger
+- introducing a new verb (high bar — see §extension_points.new-verb)
+
+The runtime state layout at `~/.tigerclaw/` is specified in `docs/spec/WORKING_DIR_TREE.yaml`.
+
+### Key concepts
+
+- **11 verbs:** identify, pair, sense, remember, reason, gate, act, converse, run, wake, attest
+- **Pluggers** are capability slots (plural names): `providers`, `channels`, `memory`, `tools`, `guardrails`, `persona`, `pairing`, `supervisor`, `scheduler`, `auditor`, `clock`, `meter`, `telemetry`, `waiter`, `hook_bus`
+- **Plugs** use singular prefix (`provider-anthropic`, `channel-discord`, `memory-sqlite`, `tool-github`, `guardrail-access-allowlist`, `persona-soul-md`)
+- **Extensions** live under `extensions/<plug-id>/`; core primitives live at `src/` top level
+
+### Vtable discipline
+
 The runtime is vtable-driven. Subsystems expose a `ptr: *anyopaque` + `vtable: *const VTable` pair so that implementations are pluggable.
+
+Every plugger vtable method takes `*const Context` as its first argument (`src/context.zig`). Methods return `PlugError!T` — never `anyerror!T` (`src/errors.zig`).
 
 **Ownership rule:** callers must own the implementing struct (local var or heap allocation). Never return a vtable interface that points to a temporary — the pointer dangles.
 
-Module initialization order lives in `src/root.zig`. Dependency direction flows inward toward primitives (log, clock, determinism, errors). Subsystems must not import across each other.
+Module initialization order lives in `src/root.zig`. Dependency direction flows inward toward primitives (log, clock, determinism, errors, capabilities). Subsystems must not import across each other.
+
+### Versioning
+
+CalVer, zero-padded: `YYYY.MM.DD` (e.g., `2026.04.23`). Never unpadded.
 
 ## Testing
 

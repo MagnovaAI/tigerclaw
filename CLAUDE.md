@@ -2,7 +2,7 @@
 
 Guidance for Claude Code (and other AI agents) working in this repository.
 
-**Read `AGENTS.md` before any code change.** It is the authoritative engineering protocol.
+**Read `AGENTS.md` before any code change.** It is the authoritative engineering protocol. It links to the plug architecture spec at `docs/spec/agent-architecture-v3.yaml` and the runtime state layout at `docs/spec/WORKING_DIR_TREE.yaml` — read those when touching anything plug-shaped.
 
 ## Build & test
 
