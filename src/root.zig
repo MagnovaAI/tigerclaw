@@ -22,6 +22,7 @@ pub const envelope_sig = @import("envelope_sig.zig");
 pub const contract_runner = @import("contract_runner.zig");
 pub const meter = @import("meter.zig");
 pub const telemetry = @import("telemetry.zig");
+pub const invariants = @import("invariants.zig");
 pub const channels = @import("channels/root.zig");
 pub const cli = @import("cli/root.zig");
 pub const clock = @import("clock.zig");
