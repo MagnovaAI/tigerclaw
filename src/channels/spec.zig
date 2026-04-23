@@ -39,6 +39,18 @@ pub const InboundMessage = struct {
     /// Stable opaque id from the upstream channel (Telegram update_id, etc.).
     /// Channel adapters guarantee monotonic ordering per (channel_id, conversation_key).
     upstream_id: u64,
+    /// Stamped by the channel adapter via its vtable id(). The
+    /// dispatch worker reads this to route to the right outbox
+    /// partition. Default is `.telegram` because v0.1.0 has only one
+    /// channel kind; kept explicit so a missing stamp surfaces as a
+    /// compile error when a new kind joins the enum.
+    channel_id: ChannelId = .telegram,
+    /// Stamped by the channel manager: the name of the agent this
+    /// binding belongs to. Borrowed from the agent registry arena,
+    /// valid for the daemon's lifetime. The dispatch worker uses
+    /// `(agent_name, channel_id, conversation_key)` to build the
+    /// session key routed to the runner.
+    agent_name: []const u8 = "",
     /// Routing key the dispatch layer maps to a session. Raw, URL-safe text;
     /// Telegram supplies the chat id formatted as decimal.
     conversation_key: []const u8,

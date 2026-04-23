@@ -73,5 +73,31 @@ pub fn main(init: std.process.Init) !u8 {
         "OK: 1 telegram channel bound; manager.get(\"tiger\", .telegram) = {any}\n",
         .{manager.get("tiger", .telegram) != null},
     );
+
+    // Second leg: if TIGERCLAW_TG_CHAT is set, drive the channel's
+    // send() with a hello message. This proves the outbound path —
+    // Bot.sendMessage through the rate limiter and HTTP client —
+    // end to end. Skipped silently when the env var is unset.
+    const chat_z: [*:0]const u8 = "TIGERCLAW_TG_CHAT";
+    if (std.c.getenv(chat_z)) |raw| {
+        const chat_str = std.mem.span(raw);
+        if (chat_str.len == 0) return 0;
+
+        const ch = manager.get("tiger", .telegram).?;
+        ch.send(.{
+            .conversation_key = chat_str,
+            .text = "hello from tiger — live smoke test OK",
+        }) catch |err| {
+            try stdout_writer.interface.print(
+                "SEND FAIL: {s}\n",
+                .{@errorName(err)},
+            );
+            return 1;
+        };
+        try stdout_writer.interface.print(
+            "SEND OK: replied to chat {s}\n",
+            .{chat_str},
+        );
+    }
     return 0;
 }

@@ -173,7 +173,18 @@ fn receiveLoop(self: *Manager, entry: *ChannelEntry) void {
             },
         };
         if (n == 0) continue;
-        for (buf[0..n]) |msg| _ = self.dispatch.enqueue(msg);
+        const cid = entry.channel.id();
+        for (buf[0..n]) |raw| {
+            // Stamp routing fields before the message leaves the
+            // receive thread. The channel adapter doesn't know which
+            // agent it's bound to — only the manager does — so we
+            // add agent_name here. channel_id is set from the vtable
+            // so the dispatch worker doesn't have to re-query.
+            var msg = raw;
+            msg.channel_id = cid;
+            msg.agent_name = entry.agent_name;
+            _ = self.dispatch.enqueue(msg);
+        }
     }
 }
 
