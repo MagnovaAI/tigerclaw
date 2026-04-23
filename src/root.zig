@@ -18,6 +18,7 @@ pub const envelope = @import("envelope.zig");
 pub const envelope_codec = @import("envelope_codec.zig");
 pub const peer_id = @import("peer_id.zig");
 pub const channel_id = @import("channel_id.zig");
+pub const envelope_sig = @import("envelope_sig.zig");
 pub const channels = @import("channels/root.zig");
 pub const cli = @import("cli/root.zig");
 pub const clock = @import("clock.zig");
