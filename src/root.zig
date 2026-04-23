@@ -38,6 +38,7 @@ pub const globals = @import("globals.zig");
 pub const harness = @import("harness/root.zig");
 pub const llm = @import("llm/root.zig");
 pub const log = @import("log.zig");
+pub const memory = @import("memory/root.zig");
 pub const permissions = @import("permissions/root.zig");
 pub const sandbox = @import("sandbox/root.zig");
 pub const scenario = @import("scenario/root.zig");
