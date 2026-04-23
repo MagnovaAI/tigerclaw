@@ -469,7 +469,7 @@ test "telegram-shaped channel: inbound update drives a sendMessage back through 
     defer mgr.deinit();
     mgr.retry_backoff_ns = 1 * std.time.ns_per_ms;
 
-    try mgr.add(tg.channel());
+    try mgr.add("default", tg.channel());
 
     var mock = harness.MockAgentRunner.init();
     // Mock echoes input verbatim; the dispatch worker stamps the

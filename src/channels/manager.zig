@@ -25,7 +25,7 @@ const std = @import("std");
 const spec = @import("channels_spec");
 const dispatch_mod = @import("dispatch.zig");
 
-pub const AddError = error{OutOfMemory};
+pub const AddError = error{ OutOfMemory, DuplicateBinding };
 pub const StartError = std.Thread.SpawnError || error{OutOfMemory};
 
 pub const Manager = struct {
@@ -66,14 +66,49 @@ pub const Manager = struct {
         self.* = undefined;
     }
 
-    /// Register a channel. The caller guarantees each channel value
-    /// is added at most once — the spec does not expose channel
-    /// equality, so the manager cannot deduplicate safely.
-    pub fn add(self: *Manager, channel: spec.Channel) AddError!void {
+    /// Register a channel on behalf of a named agent. The tuple
+    /// `(agent_name, channel.id())` uniquely identifies a binding — a
+    /// second `add` with the same tuple returns `DuplicateBinding`.
+    /// Multiple agents MAY share the same `ChannelId` kind; each gets
+    /// its own receive thread and its own outbox partition.
+    ///
+    /// `agent_name` is borrowed; the caller keeps it alive for the
+    /// lifetime of the manager.
+    pub fn add(
+        self: *Manager,
+        agent_name: []const u8,
+        channel: spec.Channel,
+    ) AddError!void {
+        // Dedup on (agent_name, channel_id). Linear scan is fine —
+        // v0.1.0 fans out to a handful of agents.
+        const cid = channel.id();
+        for (self.entries.items) |e| {
+            if (e.channel.id() == cid and std.mem.eql(u8, e.agent_name, agent_name)) {
+                return error.DuplicateBinding;
+            }
+        }
+
         const entry = self.allocator.create(ChannelEntry) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(entry);
-        entry.* = .{ .channel = channel };
+        entry.* = .{ .agent_name = agent_name, .channel = channel };
         self.entries.append(self.allocator, entry) catch return error.OutOfMemory;
+    }
+
+    /// Look up a previously-added channel by (agent_name, channel_id).
+    /// Returns null if nothing matches. The returned handle remains
+    /// valid until `deinit` — callers must not retain it across a
+    /// manager restart.
+    pub fn get(
+        self: *const Manager,
+        agent_name: []const u8,
+        channel_id: spec.ChannelId,
+    ) ?spec.Channel {
+        for (self.entries.items) |e| {
+            if (e.channel.id() == channel_id and std.mem.eql(u8, e.agent_name, agent_name)) {
+                return e.channel;
+            }
+        }
+        return null;
     }
 
     /// Spawn one receive thread per registered channel. The cancel
@@ -105,6 +140,9 @@ pub const Manager = struct {
 };
 
 const ChannelEntry = struct {
+    /// Borrowed agent name, unique within this manager together with
+    /// `channel.id()`. Enables multi-agent fan-out on a single daemon.
+    agent_name: []const u8,
     channel: spec.Channel,
     thread: ?std.Thread = null,
 };
@@ -218,7 +256,7 @@ test "start -> one message -> stop joins cleanly" {
     mgr.retry_backoff_ns = 1 * std.time.ns_per_ms;
 
     var fake = FakeChannel.make(1);
-    try mgr.add(fake.channel());
+    try mgr.add("agent-a", fake.channel());
     try mgr.start();
 
     var cancel = std.atomic.Value(bool).init(false);
@@ -236,7 +274,7 @@ test "stop without prior start is a no-op" {
     defer mgr.deinit();
 
     var fake = FakeChannel.make(0);
-    try mgr.add(fake.channel());
+    try mgr.add("agent-a", fake.channel());
     mgr.stop();
 }
 
@@ -249,7 +287,7 @@ test "start can run twice with a stop in between" {
     mgr.retry_backoff_ns = 1 * std.time.ns_per_ms;
 
     var fake = FakeChannel.make(1);
-    try mgr.add(fake.channel());
+    try mgr.add("agent-a", fake.channel());
 
     try mgr.start();
     var cancel = std.atomic.Value(bool).init(false);
@@ -275,7 +313,7 @@ test "TransportFailure backs off then delivers" {
 
     var fake = FakeChannel.make(1);
     fake.fail_count.store(3, .release);
-    try mgr.add(fake.channel());
+    try mgr.add("agent-a", fake.channel());
     try mgr.start();
 
     var cancel = std.atomic.Value(bool).init(false);
@@ -296,8 +334,8 @@ test "two channels: both threads enqueue" {
 
     var a = FakeChannel.make(5);
     var b = FakeChannel.make(3);
-    try mgr.add(a.channel());
-    try mgr.add(b.channel());
+    try mgr.add("agent-a", a.channel());
+    try mgr.add("agent-b", b.channel());
     try mgr.start();
 
     var cancel = std.atomic.Value(bool).init(false);
@@ -308,4 +346,34 @@ test "two channels: both threads enqueue" {
 
     mgr.stop();
     try testing.expectEqual(@as(u64, 8), dispatch.stats().drained);
+}
+
+test "add: same (agent, channel_id) twice returns DuplicateBinding" {
+    var dispatch = try dispatch_mod.Dispatch.init(testing.allocator, 4);
+    defer dispatch.deinit();
+
+    var mgr = Manager.init(testing.allocator, testing.io, &dispatch);
+    defer mgr.deinit();
+
+    var a = FakeChannel.make(0);
+    var b = FakeChannel.make(0);
+    try mgr.add("agent-a", a.channel());
+    try testing.expectError(error.DuplicateBinding, mgr.add("agent-a", b.channel()));
+}
+
+test "get: returns the channel bound for (agent, channel_id)" {
+    var dispatch = try dispatch_mod.Dispatch.init(testing.allocator, 4);
+    defer dispatch.deinit();
+
+    var mgr = Manager.init(testing.allocator, testing.io, &dispatch);
+    defer mgr.deinit();
+
+    var a = FakeChannel.make(0);
+    var b = FakeChannel.make(0);
+    try mgr.add("agent-a", a.channel());
+    try mgr.add("agent-b", b.channel());
+
+    try testing.expect(mgr.get("agent-a", .telegram) != null);
+    try testing.expect(mgr.get("agent-b", .telegram) != null);
+    try testing.expect(mgr.get("agent-c", .telegram) == null);
 }

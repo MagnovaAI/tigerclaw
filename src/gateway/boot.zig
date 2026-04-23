@@ -212,10 +212,12 @@ pub const Boot = struct {
         self.* = undefined;
     }
 
-    /// Register a channel with the manager. Delegates unchanged; the
-    /// boot layer does not own channel lifetimes.
-    pub fn addChannel(self: *Boot, channel: spec.Channel) !void {
-        try self.manager.add(channel);
+    /// Register a channel on behalf of the named agent. The
+    /// `(agent_name, channel.id())` tuple is the manager's binding key
+    /// — a second addChannel with the same tuple returns
+    /// `DuplicateBinding`. `agent_name` must outlive the Boot.
+    pub fn addChannel(self: *Boot, agent_name: []const u8, channel: spec.Channel) !void {
+        try self.manager.add(agent_name, channel);
     }
 
     /// Start channel threads, run the gateway accept loop, then drain
@@ -427,7 +429,7 @@ test "Boot lifecycle: start, requestStop, drain, manager joined" {
     defer boot.deinit();
 
     var fake: FakeChannel = .{};
-    try boot.addChannel(fake.channel());
+    try boot.addChannel("default", fake.channel());
 
     var mock = harness.MockAgentRunner.init();
     var ctx: routes.Context = .{ .runner = mock.runner() };

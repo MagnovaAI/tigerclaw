@@ -20,6 +20,11 @@ pub const Subcommand = union(enum) {
 pub const TelegramTestArgs = struct {
     to: []const u8,
     text: []const u8,
+    /// Optional agent to route the test message through. When set, the
+    /// gateway picks the (agent, telegram) binding registered via
+    /// `Manager.add`. When null, the gateway falls back to the default
+    /// agent — matches prior behavior for single-agent deployments.
+    agent: ?[]const u8 = null,
     base_url: []const u8 = "http://127.0.0.1:8765",
     bearer: ?[]const u8 = null,
 };
@@ -70,6 +75,10 @@ fn parseTest(rest: []const []const u8) ParseError!Subcommand {
             if (i + 1 >= rest.len) return error.MissingFlagValue;
             i += 1;
             args.bearer = rest[i];
+        } else if (std.mem.eql(u8, flag, "--agent")) {
+            if (i + 1 >= rest.len) return error.MissingFlagValue;
+            i += 1;
+            args.agent = rest[i];
         } else {
             return error.UnknownFlag;
         }
@@ -120,11 +129,18 @@ fn runTelegramTest(
     ) catch return error.UrlTooLong;
 
     var body_buf: [4096]u8 = undefined;
-    const body = std.fmt.bufPrint(
-        &body_buf,
-        "{{\"channel\":\"telegram\",\"to\":\"{s}\",\"text\":\"{s}\"}}",
-        .{ args.to, args.text },
-    ) catch return error.BodyTooLarge;
+    const body = if (args.agent) |agent_name|
+        std.fmt.bufPrint(
+            &body_buf,
+            "{{\"channel\":\"telegram\",\"agent\":\"{s}\",\"to\":\"{s}\",\"text\":\"{s}\"}}",
+            .{ agent_name, args.to, args.text },
+        ) catch return error.BodyTooLarge
+    else
+        std.fmt.bufPrint(
+            &body_buf,
+            "{{\"channel\":\"telegram\",\"to\":\"{s}\",\"text\":\"{s}\"}}",
+            .{ args.to, args.text },
+        ) catch return error.BodyTooLarge;
 
     const result = http_client.send(
         allocator,
@@ -182,6 +198,21 @@ test "parse: telegram test with --to and --text" {
     try testing.expectEqualStrings("hi", sub.telegram_test.text);
     try testing.expectEqualStrings("http://127.0.0.1:8765", sub.telegram_test.base_url);
     try testing.expect(sub.telegram_test.bearer == null);
+}
+
+test "parse: telegram test with --agent" {
+    const argv = [_][]const u8{ "telegram", "test", "--to", "123", "--text", "hi", "--agent", "reviewer-01" };
+    const sub = try parse(&argv);
+    try testing.expectEqualStrings("123", sub.telegram_test.to);
+    try testing.expectEqualStrings("hi", sub.telegram_test.text);
+    try testing.expect(sub.telegram_test.agent != null);
+    try testing.expectEqualStrings("reviewer-01", sub.telegram_test.agent.?);
+}
+
+test "parse: telegram test without --agent leaves it null" {
+    const argv = [_][]const u8{ "telegram", "test", "--to", "123", "--text", "hi" };
+    const sub = try parse(&argv);
+    try testing.expectEqual(@as(?[]const u8, null), sub.telegram_test.agent);
 }
 
 test "parse: telegram test missing both fields → TelegramTestMissingFields" {
