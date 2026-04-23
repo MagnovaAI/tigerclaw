@@ -246,6 +246,24 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run tigerclaw");
     run_step.dependOn(&run_cmd.step);
 
+    // Opt-in live smoke test for telegram. Hits the real Telegram API
+    // via TIGERCLAW_TG_TOKEN; not part of `zig build test`.
+    const smoke_mod = b.createModule(.{
+        .root_source_file = b.path("tests/live_telegram_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    smoke_mod.addImport("tigerclaw", tigerclaw_mod);
+    smoke_mod.addImport("build_options", build_options_mod);
+    const smoke_exe = b.addExecutable(.{
+        .name = "smoke-telegram",
+        .root_module = smoke_mod,
+    });
+    const run_smoke = b.addRunArtifact(smoke_exe);
+    const smoke_step = b.step("smoke-telegram", "Run the live Telegram handshake smoke test");
+    smoke_step.dependOn(&run_smoke.step);
+
     const test_step = b.step("test", "Run all tests (unit + integration)");
 
     // Unit tests: live at the bottom of source files, discovered via src/main.zig.
