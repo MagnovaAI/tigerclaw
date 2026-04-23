@@ -116,12 +116,29 @@ fn handleConnection(
         return;
     };
 
+    // CRITICAL: `request.head.target` and the slices returned by
+    // `iterateHeaders` all alias `head_buffer` and are invalidated
+    // the moment the body reader is initialized below
+    // (`readerExpectNone` overwrites the head buffer). Snapshot every
+    // string we want post-body BEFORE touching the body.
+    const target_owned = try allocator.dupe(u8, request.head.target);
+    defer allocator.free(target_owned);
+
     var headers_buf: [http.max_request_headers]http.Header = undefined;
     var headers_len: usize = 0;
+    var headers_storage: [http.max_request_headers * 2][]u8 = undefined;
+    var headers_storage_len: usize = 0;
+    defer for (headers_storage[0..headers_storage_len]) |s| allocator.free(s);
     var it = request.iterateHeaders();
     while (it.next()) |h| {
         if (headers_len == opts.max_request_headers or headers_len == headers_buf.len) break;
-        headers_buf[headers_len] = .{ .name = h.name, .value = h.value };
+        const name_owned = try allocator.dupe(u8, h.name);
+        headers_storage[headers_storage_len] = name_owned;
+        headers_storage_len += 1;
+        const value_owned = try allocator.dupe(u8, h.value);
+        headers_storage[headers_storage_len] = value_owned;
+        headers_storage_len += 1;
+        headers_buf[headers_len] = .{ .name = name_owned, .value = value_owned };
         headers_len += 1;
     }
 
@@ -143,7 +160,7 @@ fn handleConnection(
 
     const our_req: http.Request = .{
         .method = method,
-        .target = request.head.target,
+        .target = target_owned,
         .headers = headers_buf[0..headers_len],
         .body = body_storage,
     };
