@@ -38,6 +38,7 @@ pub const ProviderConfig = union(enum) {
     /// owns; the mock provider does not copy them.
     mock: MockConfig,
     anthropic: AnthropicConfig,
+    openai: OpenAIConfig,
     openrouter: OpenRouterConfig,
     /// Reserved for v0.2.0 — see file doc comment.
     bedrock,
@@ -55,6 +56,12 @@ pub const AnthropicConfig = struct {
     endpoint: ?[]const u8 = null,
     api_version: ?[]const u8 = null,
     beta_features: ?[]const u8 = null,
+};
+
+pub const OpenAIConfig = struct {
+    io: std.Io,
+    api_key: []const u8,
+    endpoint: ?[]const u8 = null,
 };
 
 pub const OpenRouterConfig = struct {
@@ -89,6 +96,7 @@ pub fn fromSettings(
     return switch (cfg) {
         .mock => |m| try makeMock(allocator, m),
         .anthropic => |a| try makeAnthropic(allocator, a),
+        .openai => |o| try makeOpenAI(allocator, o),
         .openrouter => |o| try makeOpenRouter(allocator, o),
         .bedrock => error.NotImplemented,
     };
@@ -165,6 +173,33 @@ fn freeOpenRouter(allocator: std.mem.Allocator, ptr: *anyopaque) void {
     if (!build_options.enable_openrouter) return;
     const impl: *providers.OpenRouterProvider = @ptrCast(@alignCast(ptr));
     allocator.destroy(impl);
+}
+
+/// OpenAI uses the OpenAI-compatible chat completions endpoint —
+/// identical wire format to OpenRouter, just a different host. We
+/// reuse the OpenRouter provider pointed at api.openai.com to avoid
+/// duplicating ~150 lines of HTTP wiring across two extensions. The
+/// `OpenAIProvider` extension stays on `.literal` only for cassette
+/// replay; live calls go through the OR-shaped HTTP path.
+fn makeOpenAI(
+    allocator: std.mem.Allocator,
+    o: OpenAIConfig,
+) FactoryError!Owned {
+    if (!build_options.enable_openrouter) return error.ProviderDisabled;
+    const OpenRouter = providers.OpenRouterProvider;
+    const impl = try allocator.create(OpenRouter);
+    const http: providers.openrouter.HttpSource = .{
+        .allocator = allocator,
+        .io = o.io,
+        .api_key = o.api_key,
+        .endpoint = o.endpoint orelse "https://api.openai.com/v1/chat/completions",
+    };
+    impl.* = .init(.{ .http = http });
+    return .{
+        .provider = impl.provider(),
+        .impl_ptr = impl,
+        .free_fn = freeOpenRouter,
+    };
 }
 
 // --- tests -----------------------------------------------------------------
