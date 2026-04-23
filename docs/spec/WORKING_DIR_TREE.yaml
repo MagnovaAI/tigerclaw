@@ -1,0 +1,506 @@
+# ============================================================================
+# tigerclaw — Working Directory Tree  (~/.tigerclaw)
+# ----------------------------------------------------------------------------
+# Runtime state that lives OUTSIDE the repo. Per-instance isolation,
+# predictable paths, safe for multi-device sync (with .syncignore).
+#
+# Design principles:
+#   - Multi-instance: ~/.tigerclaw/instances/<id>/ fully self-contained
+#   - Plug-owned paths: plugs write under their declared subpath, not elsewhere
+#   - Append-only where possible (turns, audit, ledger) -> sync-friendly
+#   - Content-addressed (blobs) -> dedupe across sessions and machines
+#   - Secrets separated -> blast radius limited
+#   - Forget semantics: audit survives purge, sessions can be hard-deleted
+#
+# Reading order:
+#   0. meta
+#   1. top_level
+#   2. instance                 — the shape of one agent's runtime home
+#   3. global_subdirs           — cross-instance resources
+#   4. lifecycle                — first-run, boot, forget, daily rollups
+#   5. permissions
+#   6. sync_policy              — what syncs, what doesn't
+#   7. bootstrap_commands
+#   8. extension_rules
+# ============================================================================
+
+meta:
+  version: "0.1.0"
+  schema_version: 1
+  updated: "2026-04-23"
+  relates_to:
+    - "docs/spec/agent-architecture-v3.yaml"
+  how_to_extend:
+    per_session:   "New file under instances/<id>/sessions/<session>/"
+    per_instance:  "New subdir under instances/<id>/"
+    per_plug:      "Plug owns its named subdirectory; declared in manifest"
+    cross_instance:"Promote to top-level ~/.tigerclaw/"
+
+# ============================================================================
+# 1. TOP-LEVEL LAYOUT
+# ============================================================================
+top_level:
+  root: "~/.tigerclaw"
+  files:
+    - { name: config.toml,     purpose: "User-wide config; composition picks + plug overrides" }
+    - { name: persona.key,     purpose: "Ed25519 private key", perms: "0600" }
+    - { name: persona.pub,     purpose: "Matching public key" }
+    - { name: instance-id,     purpose: "Stable UUIDv7 generated on first run" }
+    - { name: .syncignore,     purpose: "Enforces sync exclusions (see §sync_policy)" }
+
+  subdirs:
+    - instances/                # §2 — one per running agent
+    - extensions/               # §3.extensions — sideloaded plugs
+    - compositions/             # §3.compositions — user personas (TOML)
+    - teams/                    # §3.teams — multi-agent teams (TOML)
+    - secrets/                  # §3.secrets — encrypted at rest
+    - cache/                    # §3.cache — safely deletable
+    - tmp/                      # §3.tmp — ephemeral, cleaned on shutdown
+
+# ============================================================================
+# 2. INSTANCE LAYOUT  (~/.tigerclaw/instances/<instance-id>/)
+# ============================================================================
+# Everything below repeats per instance. Default instance id is "default".
+# ============================================================================
+instance:
+  path: "~/.tigerclaw/instances/<id>/"
+  files:
+    - { name: config.toml,             purpose: "Instance-scoped overrides; inherits top-level config.toml" }
+    - { name: active_composition,      purpose: "Symlink -> ../../compositions/<name>.toml" }
+    - { name: telemetry-state.json,    purpose: "Rollup state: distinct_id, boot counter" }
+
+  # ---- Trust & identity ----------------------------------------------------
+  peers:
+    path: peers/
+    owned_by: "pairing plugger (sole writer); gate-allowlist reads only"
+    files:
+      - { name: peer_store.jsonl, purpose: "Append-only peer records (id, kind, trust_level)" }
+    subdirs:
+      trusted_keys:
+        pattern: "<peer_id>.pub"
+        example: "discord:user:OMKAR_ID.pub"
+
+  # ---- Sessions (conversation state) --------------------------------------
+  sessions:
+    path: sessions/
+    owned_by: "memory plugger (default: memory-tigerclaw)"
+    files:
+      - { name: index.jsonl, purpose: "Session manifest: id, channel, created, last_active, status" }
+    per_session:
+      path: "sessions/<session-id>/"
+      files:
+        - { name: turns.jsonl,              purpose: "Append-only envelope log — one Envelope per line" }
+        - { name: config.json,              purpose: "Snapshot of plug config at session start (for replay)" }
+        - { name: cost.json,                purpose: "Rolling meter total for this session" }
+        - { name: summary.md,               purpose: "Auto-extracted summary, written post-session" }
+        - { name: away_summary.md,          purpose: "'While you were gone' synthesis" }
+        - { name: trace_spans.jsonl,        purpose: "Telemetry spine (ops-facing)" }
+        - { name: tool_use_summary.json,    purpose: "Aggregated tool invocations" }
+        - { name: todos.json,               purpose: "todo_write tool state" }
+        - { name: rng_seed.txt,             purpose: "Determinism anchor" }
+        - { name: diagnostics.jsonl,        purpose: "Rolling startup/runtime metrics" }
+      subdirs:
+        logs:
+          files:
+            - harness.log
+            - provider.log
+            - sandbox.log
+            - mcp.log
+            - channel.log
+        workdir:
+          purpose: "Per-session scratch (safe to delete when session closes)"
+          note: "Gitignored. Files here are referenced by blobs/ if promoted."
+        clawnet:
+          purpose: "Present only if the clawnet tool ran this session"
+          files:
+            - { name: bus.jsonl,      purpose: "Inter-persona message log, single-writer ordered" }
+            - { name: manifest.json,  purpose: "persona -> reservation -> outcome ledger" }
+
+  # ---- Auditor (compliance trail, survives forget) ------------------------
+  audit:
+    path: audit/
+    owned_by: "auditor plugger (audit-jsonl / audit-sig-chain)"
+    note: "Distinct from telemetry. forget(purge) writes hash-only stub here; never erases."
+    files:
+      - { name: events.jsonl, purpose: "Append-only audit events (turn_start, turn_end, tool_call, gate_decision, forget)" }
+      - { name: chain.seal,   purpose: "Merkle root + seq cursor (audit-sig-chain plug only)" }
+    subdirs:
+      index:
+        by-date:    { pattern: "YYYY-MM/DD.jsonl" }
+        by-verb:    { pattern: "<verb>.jsonl" }
+        by-session: { pattern: "<session-id>.jsonl" }
+
+  # ---- Telemetry (ops-facing spans, rotates) -------------------------------
+  telemetry:
+    path: telemetry/
+    owned_by: "telemetry plugger (default: telemetry-stdout/telemetry-jsonl)"
+    files:
+      - { name: spans.jsonl, purpose: "Current day's spans" }
+    subdirs:
+      archive:
+        pattern: "YYYY-MM-DD.jsonl.zst"
+
+  # ---- Meter (budget ledger, authoritative for cost) -----------------------
+  meter:
+    path: meter/
+    owned_by: "meter infrastructure plugger"
+    files:
+      - { name: ledger.jsonl, purpose: "Append-only reserve/commit/refund/consume events" }
+    subdirs:
+      daily:
+        pattern: "YYYY-MM-DD.json"
+        purpose: "Rollup: tokens, dollars, wall-clock for the day"
+
+  # ---- Cross-session memory (distinct from session store) ------------------
+  memory:
+    path: memory/
+    owned_by: "memory plugger (long-term tier)"
+    files:
+      - { name: long_term.jsonl, purpose: "Extracted memories (post-session distillation)" }
+      - { name: kv.sqlite,       purpose: "Key/value bag; used by remember/recall tools" }
+    subdirs:
+      embeddings:
+        purpose: "Present only if memory-embed-* plug active"
+        pattern: "<embed-plug-id>/…"
+
+  # ---- Team-shared memory (optional, if team_memory enabled) --------------
+  team_memory:
+    path: team_memory/
+    owned_by: "team_memory subsystem (optional)"
+    files:
+      - { name: shared.jsonl,  purpose: "Append-only team log, secret-scanned before append" }
+      - { name: watchers.json, purpose: "Who is subscribed to shared.jsonl" }
+    subdirs:
+      locks:
+        purpose: "Filesystem-level locks for sync safety"
+
+  # ---- Blobs (content-addressed artifact store) ---------------------------
+  blobs:
+    path: blobs/
+    owned_by: "workdir subsystem"
+    note: "Keyed by sha256; deduped across sessions and (if synced) machines."
+    subdirs:
+      sha256:
+        pattern: "<first-2-chars>/<full-hash>"
+    files:
+      - { name: refcount.jsonl, purpose: "Conservative GC; blob considered live if any session workdir references it" }
+
+  # ---- VCR (HTTP-level record/replay, hash-keyed) --------------------------
+  vcr:
+    path: vcr/
+    owned_by: "vcr subsystem"
+    subdirs:
+      cassettes:
+        pattern: "<request-hash>/"
+        files:
+          - cassette.yaml
+          - meta.json
+
+  # ---- Scheduler state (hooks plugs) --------------------------------------
+  hooks:
+    path: hooks/
+    owned_by: "scheduler plugger (hooks-cron / hooks-wakeup / hooks-interval)"
+    files:
+      - { name: jobs.jsonl,     purpose: "Scheduled jobs (declarative, survives reboot)" }
+      - { name: last_fire.json, purpose: "Per-job last-fire timestamp; anti-miss catchup state" }
+
+  # ---- Skills (loadable instruction bundles active this instance) --------
+  skills:
+    path: skills/
+    owned_by: "skills plugger"
+    files:
+      - { name: active.txt, purpose: "Active skill IDs (one per line)" }
+    subdirs:
+      overlay:
+        purpose: "Instance-specific overrides to a skill"
+        pattern: "<skill-id>/…"
+
+  # ---- Inbox / Outbox (channel buffers across restarts) -------------------
+  inbox:
+    path: inbox/
+    owned_by: "channel plugs (buffered when offline)"
+    subdirs:
+      by_channel:
+        pattern: "<channel-id>/"
+        files:
+          - pending.jsonl
+
+  outbox:
+    path: outbox/
+    owned_by: "channel plugs (retry queue for unsent envelopes)"
+    subdirs:
+      by_channel:
+        pattern: "<channel-id>/"
+        files:
+          - pending.jsonl
+
+  # ---- Approvals (gate.defer tickets awaiting human resolution) -----------
+  approvals:
+    path: approvals/
+    owned_by: "gate plugger (defer state machine)"
+    subdirs:
+      open:
+        pattern: "<ticket-id>.json"
+        purpose: "Pending approval; turn blocked on this"
+      resolved:
+        pattern: "<ticket-id>.json"
+        purpose: "Decided; kept for audit reference"
+      expired:
+        pattern: "<ticket-id>.json"
+        purpose: "Deadline hit; treated as deny"
+
+  # ---- Locks (PID, unix sockets) ------------------------------------------
+  locks:
+    path: locks/
+    files:
+      - { name: daemon.pid, purpose: "PID of current daemon; refuse second daemon without --force" }
+    subdirs:
+      channels:
+        pattern: "<channel-id>.sock"
+        purpose: "Unix socket for CLI<->daemon IPC (future)"
+
+  # ---- Logs (instance-level, rotated) -------------------------------------
+  logs:
+    path: logs/
+    files:
+      - server.log
+    subdirs:
+      archive:
+        pattern: "server-YYYY-MM-DD.log.zst"
+
+  # ---- Backups (auto snapshots of critical state) -------------------------
+  backups:
+    path: backups/
+    subdirs:
+      daily:
+        pattern: "YYYY-MM-DD/"
+        contents: "Snapshot of peers/, memory/long_term.jsonl, critical config"
+
+# ============================================================================
+# 3. GLOBAL SUBDIRS  (shared across instances)
+# ============================================================================
+global_subdirs:
+
+  extensions:
+    path: extensions/
+    purpose: "Sideloaded plugs (not compiled into binary)"
+    files:
+      - { name: enabled.txt, purpose: "Allowlist; one plug-id per line" }
+    per_plug:
+      path: "extensions/<plug-id>/"
+      files:
+        - manifest.zon
+        - { name: "<binary>", purpose: "Plug native binary OR Zig module" }
+        - config.example.toml
+
+  compositions:
+    path: compositions/
+    purpose: "User-custom personas (TOML). Override or extend built-in compositions."
+    pattern: "<name>.toml"
+    example_contents: |
+      id: my-custom-cli
+      extends: mvp-cli
+      add_plugs: [chan-discord, gate-budget]
+
+  teams:
+    path: teams/
+    purpose: "User-custom multi-agent teams (TOML)"
+    pattern: "<name>.toml"
+
+  secrets:
+    path: secrets/
+    perms: "0700"
+    files:
+      - { name: master.key, perms: "0600", purpose: "Wraps per-secret data keys" }
+    subdirs:
+      tokens:
+        perms: "0700"
+        pattern: "<service>.enc"
+        examples: ["discord.enc", "anthropic.enc", "openai.enc"]
+      oauth:
+        perms: "0700"
+        pattern: "<provider>.enc"
+
+  cache:
+    path: cache/
+    purpose: "Safely deletable; regenerable content"
+    subdirs:
+      providers:       { pattern: "<provider>/…", purpose: "Provider response cache" }
+      prompts:         { purpose: "Prompt cache metadata" }
+      mcp:             { purpose: "MCP tool schema cache" }
+      embeddings:      { purpose: "Embedding cache" }
+
+  tmp:
+    path: tmp/
+    purpose: "Ephemeral; cleaned on shutdown"
+
+# ============================================================================
+# 4. LIFECYCLE
+# ============================================================================
+lifecycle:
+
+  first_run:
+    trigger: "`tigerclaw bootstrap` OR first `tigerclaw agent run`"
+    steps:
+      - "Create ~/.tigerclaw/ if missing"
+      - "Generate persona.key / persona.pub (ed25519) if missing"
+      - "Generate instance-id (UUIDv7) if missing"
+      - "Materialize instances/default/ skeleton"
+      - "Generate secrets/master.key if missing"
+      - "Write initial config.toml from composition template"
+      - "Emit audit event: instance_bootstrap"
+
+  daemon_boot:
+    steps:
+      - "Acquire locks/daemon.pid (die if held unless --force)"
+      - "Rotate logs/server.log -> logs/archive/server-YYYY-MM-DD.log.zst"
+      - "Replay any inbox/**/pending.jsonl through the turn loop"
+      - "Load hooks/jobs.jsonl and enqueue scheduler jobs"
+      - "Drain outbox/**/pending.jsonl through channel plugs"
+      - "Emit audit event: daemon_start"
+
+  forget:
+    vtable: "session_store.forget(session_id, policy)"
+    policies:
+      soft:   "Mark in sessions/index.jsonl as deleted; keep files readable by audit only"
+      scrub:  "In-place overwrite PII fields in turns.jsonl; retain structure"
+      purge:  "Hard-delete sessions/<id>/; write hash-only stub to audit/events.jsonl"
+    cascade:
+      - "Remove related blobs (refcount decrement; GC sweep later)"
+      - "Remove from memory/long_term.jsonl index"
+      - "Add to telemetry redaction list for span scrubbing"
+    invariant: "audit/events.jsonl is NEVER erased by forget"
+
+  daily_rollups:
+    owned_by: "harness (scheduled via hooks-cron daily at 04:00 local)"
+    steps:
+      - "Rotate telemetry/spans.jsonl -> telemetry/archive/YYYY-MM-DD.jsonl.zst"
+      - "Roll up meter/ledger.jsonl -> meter/daily/YYYY-MM-DD.json"
+      - "Refcount blobs/ ; GC conservative (only if no sessions/*/workdir references)"
+      - "Snapshot peers/ + memory/long_term.jsonl -> backups/daily/YYYY-MM-DD/"
+      - "Expire stale approvals/open/* (past deadline) -> approvals/expired/"
+      - "Rotate TTL'd entries in inbox/ / outbox/"
+
+  shutdown:
+    steps:
+      - "Emit audit event: daemon_stop"
+      - "Flush telemetry.flush()"
+      - "Persist hooks/last_fire.json"
+      - "Drain approvals/open for deadline-imminent tickets; defer remainder to next boot"
+      - "Release locks/daemon.pid"
+      - "Clean tmp/"
+
+# ============================================================================
+# 5. PERMISSIONS
+# ============================================================================
+permissions:
+  "~/.tigerclaw":                         "0755"
+  "~/.tigerclaw/persona.key":             "0600"
+  "~/.tigerclaw/secrets/":                "0700"
+  "~/.tigerclaw/secrets/master.key":      "0600"
+  "~/.tigerclaw/secrets/**/*.enc":        "0600"
+  "~/.tigerclaw/instances/<id>/locks/":   "0700"
+  everything_else:                        "0644 for files, 0755 for dirs"
+  enforcement:
+    - "tigerclaw doctor fails hard on permission violations"
+    - "Daemon refuses to start if persona.key mode != 0600"
+
+# ============================================================================
+# 6. SYNC POLICY  (~/.tigerclaw/.syncignore)
+# ============================================================================
+sync_policy:
+
+  syncable:
+    description: "Append-only or content-addressed; safe for multi-device (Syncthing / iCloud)"
+    paths:
+      - "instances/<id>/sessions/*/turns.jsonl"
+      - "instances/<id>/audit/events.jsonl"
+      - "instances/<id>/memory/long_term.jsonl"
+      - "instances/<id>/peers/peer_store.jsonl"
+      - "instances/<id>/peers/trusted_keys/"
+      - "instances/<id>/meter/ledger.jsonl"
+      - "blobs/"                                # content-addressed -> natural dedupe
+
+  git_friendly:
+    description: "Safe to commit to personal dotfiles repo"
+    paths:
+      - "config.toml"
+      - "compositions/"
+      - "teams/"
+      - "extensions/enabled.txt"
+      - "instances/<id>/skills/active.txt"
+
+  never_sync:
+    description: "Per-machine state, secrets, or regenerable"
+    paths:
+      - "persona.key"
+      - "secrets/"
+      - "cache/"
+      - "tmp/"
+      - "instances/<id>/locks/"
+      - "instances/<id>/hooks/jobs.jsonl"       # per-machine scheduler state
+      - "instances/<id>/hooks/last_fire.json"
+      - "instances/<id>/logs/"
+      - "instances/<id>/telemetry/"             # rotate-heavy; fetch on demand
+      - "instances/<id>/inbox/"                 # machine-local buffers
+      - "instances/<id>/outbox/"
+
+# ============================================================================
+# 7. BOOTSTRAP COMMANDS
+# ============================================================================
+bootstrap_commands:
+
+  - cmd: "tigerclaw bootstrap"
+    purpose: "Init ~/.tigerclaw/ tree if missing; refuses if already bootstrapped"
+  - cmd: "tigerclaw bootstrap --force"
+    purpose: "Wipe and re-init (prompts for confirmation)"
+  - cmd: "tigerclaw bootstrap --from <backup-path>"
+    purpose: "Restore state from a backup directory"
+  - cmd: "tigerclaw doctor"
+    purpose: "Verify tree integrity; exit non-zero on violations"
+  - cmd: "tigerclaw doctor --fix"
+    purpose: "Auto-repair missing dirs, perms, orphan files"
+  - cmd: "tigerclaw doctor wipe tmp cache"
+    purpose: "Safe cleanup of regenerable data"
+  - cmd: "tigerclaw instance new <id>"
+    purpose: "Create a new isolated instance at instances/<id>/"
+  - cmd: "tigerclaw instance list"
+    purpose: "List instances with last_active + composition"
+  - cmd: "tigerclaw -i <id> ..."
+    purpose: "Target any command at a specific instance (default: 'default')"
+  - cmd: "tigerclaw backup [--out <dir>]"
+    purpose: "Snapshot the syncable + git_friendly subset to a tarball"
+  - cmd: "tigerclaw restore <tarball>"
+    purpose: "Restore from a backup tarball into a fresh instance"
+  - cmd: "tigerclaw forget <session-id> --policy <soft|scrub|purge>"
+    purpose: "Invoke session_store.forget with cascade"
+
+# ============================================================================
+# 8. EXTENSION RULES
+# ============================================================================
+extension_rules:
+
+  - rule: "Plugs declare their subpath in manifest; harness enforces"
+    example: "channel-discord declares inbox_path=inbox/chan-discord:*/; writes only there"
+
+  - rule: "No plug writes outside its declared subpath"
+    enforcement: "harness/sandbox intercepts writes; violation -> PlugError.Refused"
+
+  - rule: "Append-only files get fsync on every write"
+    applies_to: [turns.jsonl, events.jsonl, ledger.jsonl, long_term.jsonl, peer_store.jsonl]
+
+  - rule: "Deletes happen only via dedicated APIs"
+    examples:
+      - "session_store.forget() for sessions"
+      - "blob_gc.sweep() for blobs"
+      - "tigerclaw doctor wipe for cache/tmp"
+
+  - rule: "Secrets never touch session or audit logs in cleartext"
+    enforcement: "gate-pii-scrub + secret_scanner in team_memory"
+
+  - rule: "Cross-instance writes forbidden"
+    rationale: "Instance isolation. Shared state goes to top-level ~/.tigerclaw/ via explicit subsystem."
+
+# ============================================================================
+# END
+# ============================================================================

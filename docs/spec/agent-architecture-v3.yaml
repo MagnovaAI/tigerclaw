@@ -1,0 +1,821 @@
+# ============================================================================
+# TigerClaw Agent Architecture — v3 (11 verbs)
+# ----------------------------------------------------------------------------
+# Post-review refinements:
+#   - Dropped `bound` (resolver is strategy inside remember/reason)
+#   - Dropped `watcher` (merged into channel with direction: in, kind: sensor)
+#   - Split `live` into `run` (supervisor) + `wake` (scheduler)
+#   - Added `attest` (auditor) — provenance + audit trail
+#   - Guardrails plugger (renamed from `gate`) owns ALL enforcement
+#   - Sub-families under guardrails: access / budget / approval / personal
+#     (PKG) / team / content / sandbox
+#   - meter is passive accounting; guardrail-budget-* enforces
+#   - guardrails.defer spec'd with on_deferred_resolved callback
+#   - Every vtable fn takes *const Context (deadline, trace, budget, principal)
+#   - Streaming semantics: preview + retract on deny
+#   - Channel routing: reply pins to origin_channel_id
+#   - Tool loop: per-iteration meter + iteration cap enforced
+#   - Cross-process vtable handshake for collab-* channels
+#   - Singular plug prefix (provider-anthropic, channel-discord, memory-sqlite,
+#     tool-github, guardrail-access-allowlist, …); plural pluggers (providers,
+#     channels, guardrails, …)
+#   - CalVer version format: zero-padded YYYY.MM.DD (e.g. 2026.04.23)
+#
+# Reading order:
+#   0. meta
+#   1. verbs
+#   2. turn_flow
+#   3. architecture
+#   4. pluggers
+#   5. plugs
+#   6. infrastructure
+#   7. compositions
+#   8. extension_points
+#   9. invariants
+#
+# Extension rules:
+#   - New plug     → append under `plugs:`, reference plugger
+#   - New persona  → append under `compositions:`, list plug ids
+#   - New plugger  → justify with 2+ distinct plug impls
+#   - New verb     → 1+ plugger with 2+ plugs showing ORTHOGONAL failure modes
+#                    (deleting plug A must not affect plug B's failure paths)
+# ============================================================================
+
+meta:
+  version: "0.3.1"
+  schema_version: 3
+  updated: "2026.04.23"
+  verb_count: 11
+  release_calver: "2026.04.23"
+  conventions:
+    id_format: kebab-case
+    plug_prefix: singular (provider-*, channel-*, memory-*, tool-*, persona-*,
+                 pairing-*, guardrail-<sub>-*, scheduler-*, supervisor-*,
+                 skill-*, hook-*, team-*, auditor-*)
+    plugger_name: plural (providers, channels, memory, tools, guardrails, ...)
+    slot_types: [exclusive, exclusive-with-fallback, shared, exclusive-per-channel]
+    status_values: [planned, alpha, stable, deprecated]
+    tier_values: [1, 2, 3, 4, 5]
+    calver_format: "YYYY.MM.DD (zero-padded, e.g. 2026.04.23)"
+  deprecations_from_v2:
+    - { verb: bound,   reason: "Resolver is strategy inside remember/reason, not peer verb" }
+    - { plugger: watcher, replaced_by: "channel with direction=in, kind=sensor" }
+    - { plugger: resolver, replaced_by: "retrieval strategy inside session_store or reason context-builder" }
+    - { verb: live, split_into: [run, wake] }
+  renames_in_v3_1:
+    - { old: "gate (plugger)", new: "guardrails (plugger)", reason: "matches user-facing naming; sub-families expand cleanly" }
+    - { old: "gate-* plugs",   new: "guardrail-<sub>-* plugs", reason: "sub-family prefix encodes intent" }
+    - { old: "pkg (plugger)",  new: "guardrail-personal-* plugs under guardrails", reason: "PKG is a guardrail sub-family, not a separate plugger; statefulness stays inside the plug" }
+
+# ============================================================================
+# 1. VERBS — 11 canonical
+# ============================================================================
+verbs:
+
+  - id: identify
+    question: "Who am I?"
+    pluggers: [persona]
+    when: "Boot (load keys) + before every outbound converse (sign envelope)"
+    tier: 1
+
+  - id: pair
+    question: "How do strangers become trusted peers?"
+    pluggers: [pairing]
+    when: "Device onboarding, A2A handshake, new-user trust bootstrap"
+    tier: 2
+    ownership: "Sole writer of peer_store. guardrail-access-allowlist reads only."
+
+  - id: sense
+    question: "What's coming in?"
+    pluggers: [channel]
+    when: "Turn starts from inbound envelope on a channel with direction=in|both"
+    tier: 1
+
+  - id: remember
+    question: "What's the state? What should be retrieved?"
+    pluggers: [session_store]
+    when: "Read at turn start; append once per tool-result; append once at end (>=3 writes/turn)"
+    tier: 1
+    note: "Retrieval strategies (keyword, vector, recency) are sub-features of session_store, not separate pluggers"
+
+  - id: reason
+    question: "What should happen next?"
+    pluggers: [text_inference, planner]
+    when: "Core of every turn; loops with act until model stops emitting tool_calls OR caps hit"
+    tier: 1
+    context_builders: "Optional pre-prompt preprocessors (ref-resolution, memory-picking); internal to reason, not plugger"
+
+  - id: gate
+    question: "Is this action allowed? Owns ALL enforcement."
+    pluggers: [guardrails]
+    when: "inbound (pre-sense→remember), pre-act (each tool call), pre-reply (before converse)"
+    tier: 1
+    note: "Verb stays `gate`; plugger renamed to `guardrails`. Sub-families: access, budget, approval, personal (PKG), team, content, sandbox."
+
+  - id: act
+    question: "Do the thing."
+    pluggers: [custom_tool]
+    when: "reason emits tool_call; meter.reserve per iteration; bounded by max_tool_iterations"
+    tier: 1
+
+  - id: converse
+    question: "Send to peer (human or agent)."
+    pluggers: [channel]
+    when: "End of turn; pinned to inbound origin for reactive turns"
+    tier: 1
+
+  - id: run
+    question: "Stay alive across boots, crashes, reboots."
+    pluggers: [supervisor]
+    when: "Ambient. Boot once, restart on crash with exponential backoff."
+    tier: 1
+
+  - id: wake
+    question: "Start a turn without inbound bytes."
+    pluggers: [scheduler]
+    when: "Ambient. Fires turns on cron / interval / wakeup / external event."
+    tier: 2
+
+  - id: attest
+    question: "What happened? Can I prove it?"
+    pluggers: [auditor]
+    when: "Cross-cuts every verb; emits provenance records; survives forget()"
+    tier: 2
+    note: "Separate from telemetry (ops-facing) — attest is compliance/audit trail"
+
+# ============================================================================
+# 2. TURN FLOW
+# ============================================================================
+turn_flow:
+
+  boot_once:
+    - identify.load_keys       # persona reads SOUL/IDENTITY, loads signing key
+    - pair.resume_peer_store   # load trusted peers
+    - run.boot                 # supervisor starts
+    - wake.schedule            # register cron/interval jobs if composition has them
+
+  turn_reactive:
+    trigger: "channel (direction=in|both) delivers envelope"
+    steps:
+      - sense                       # receive bytes → Envelope {origin_channel_id, ...}
+      - gate.inspect(phase=inbound) # is this peer allowed? rate-limited?
+      - remember.read               # load session history
+      - attest.record(turn_start)
+      - reason                      # build {system, messages, tools}, call LLM
+      - loop:
+          name: tool_loop
+          while: "model returns tool_call AND iteration < max_tool_iterations AND meter.remaining > 0"
+          steps:
+            - meter.reserve(iteration_budget)
+            - gate.inspect(phase=pre-act, action=tool_call)
+            - handle_defer:
+                if: "gate returns .defer(ticket_id)"
+                action: "waiter.wait_human(ticket_id, deadline) → resume with decision"
+                on_timeout: ".deny(timeout)"
+            - act.invoke                  # run tool
+            - remember.append(tool_call, tool_result)
+            - attest.record(tool_call)
+            - meter.refund_unused
+            - reason                      # next LLM call with result
+      - gate.inspect(phase=pre-reply)
+      - identify.sign(reply_envelope)
+      - converse.send:
+          route: "reply.origin_channel_id == sense.origin_channel_id"
+      - remember.append(final_turn)
+      - attest.record(turn_end)
+
+  turn_autonomous:
+    trigger: "wake.scheduler fires"
+    steps:
+      - "Synthetic inbound envelope built from scheduler job context"
+      - "origin_channel_id picked from composition.autonomous_reply_channel"
+      - "Then proceeds as turn_reactive"
+
+  streaming_semantics:
+    rule: "stream is a preview; canonical reply is post-stream"
+    contract:
+      - "text_inference.stream emits partial tokens to telemetry + channel preview"
+      - "gate(pre-reply) runs on COMPLETE message only"
+      - "If gate denies after preview shipped, channel sends retraction envelope:"
+      - "  {verb: retract, in_reply_to: preview_id, reason: <deny-reason>}"
+      - "Channels that can't retract (email, SMS) MUST declare !supports_retract; agent disables streaming on those"
+
+  model_sees:
+    system: "from identify (persona.system_prompt)"
+    messages: "from remember (session history) + current sense envelope"
+    tools: "from act (custom_tool.describe() for each registered tool plug)"
+
+# ============================================================================
+# 3. ARCHITECTURE — Substrate
+# ============================================================================
+architecture:
+
+  - id: registry
+    role: "Capability -> active plug(s); atomic snapshot-swap"
+    properties: [atomic-snapshot-swap, refcounted, read-mostly]
+
+  - id: capability-enum
+    role: "Closed set of capability names; compile-time known"
+
+  - id: vtable-contract
+    role: "Versioned function-pointer struct per capability"
+    fields: [version_u16, ctx_ptr, fn_pointers]
+    rule: "Every vtable fn takes *const Context as first param"
+
+  - id: manifest
+    fields: [id, version, provides, requires, prefers, conflicts, slot, config_schema, start_order, platform]
+
+  - id: lifecycle
+    phases: [register, start, drain, stop]
+
+  - id: config-scopes
+    scopes: [build_time, startup, runtime]
+
+  - id: dependency-graph
+    edge_kinds: [requires, prefers, conflicts]
+
+  - id: hook-bus
+    example_hooks:
+      - before_sense
+      - before_reason
+      - before_dispatch
+      - before_reply
+      - before_converse
+      - on_tool_call
+      - on_gate_defer
+      - on_gate_deferred_resolved
+      - on_config_reload
+      - on_shutdown
+
+  - id: context-object
+    role: "Immutable per-request bundle — FIRST param of every vtable fn"
+    fields:
+      - io              # Zig 0.16 Io
+      - alloc           # per-request arena
+      - clock           # *const Clock
+      - trace_id
+      - parent_span_id
+      - deadline_ms     # wall-clock deadline for this operation
+      - budget          # *Meter handle
+      - principal       # who caused this turn (user id, peer id, scheduler job id)
+      - session_id
+      - origin_channel_id   # pins converse routing
+
+  - id: io-abstraction
+    role: "Zig 0.16 Io; all syscalls via Context.io"
+
+  - id: allocator-discipline
+    rules:
+      - "Per-request arena from Context.alloc"
+      - "Registry allocator for long-lived state"
+      - "No global allocator in plug code"
+
+  - id: error-taxonomy
+    variants: [Unavailable, BadInput, Timeout, Refused, OverBudget, Internal]
+    rule: "Closed error set at vtable boundaries; no anyerror"
+    enforcement: "Only gate plugs return Refused/OverBudget; meter only returns current state"
+
+  - id: trust-boundary
+    role: "Envelope signing at every cross-process edge"
+    fields: [sender_id, signature, timestamp, nonce]
+
+  - id: vtable-handshake
+    role: "Cross-process version negotiation"
+    when: "First envelope on any new collab-* channel connection"
+    shape:
+      hello: "{verb: 'hello', vtable_version: u16, caps: [cap_names], agent_id}"
+      response: "{verb: 'hello_ack', vtable_version: u16, caps: [cap_names], agent_id} OR {verb: 'refuse', reason}"
+    policy: "Version mismatch → downgrade to min(supported) OR refuse"
+
+  - id: transport-independence
+    principle: "Wire format separate from transport; swap freely"
+
+  - id: fallback-chain
+    role: "Ordered retry for exclusive-with-fallback slots"
+    method: "plug.supports(ctx) -> priority; registry picks winner"
+
+  - id: config-reload-protocol
+    role: "Atomic snapshot swap with generation counter"
+    fields: [generation_u64, snapshot_ptr, refcount]
+
+  - id: telemetry-spine
+    role: "Ops-facing structured events at every capability boundary"
+    fields: [trace_id, span_id, attrs, parent_span_id]
+    distinct_from: "attest (compliance/audit; see `auditor` plugger)"
+
+  - id: test-harness
+    rule: "Every plug claiming capability X passes contract suite X"
+
+  - id: build-zig-registration
+    rule: "Explicit addExtension(); no filesystem scan"
+
+  - id: envelope
+    role: "Canonical message shape for all cross-boundary bytes"
+    fields:
+      - verb                   # user_msg | tool_call | reply | retract | hello | heartbeat
+      - conversation_id
+      - in_reply_to
+      - origin_channel_id      # for reply routing
+      - sender_id
+      - sender_sig
+      - sent_at_ms
+      - body_mime
+      - body
+      - max_tokens
+      - max_wall_ms
+      - max_cost_usd_micros
+      - attachments
+    consumers: [channel, gate, meter, telemetry, auditor]
+
+# ============================================================================
+# 4. PLUGGERS
+# ============================================================================
+pluggers:
+
+  # Identity
+  - id: persona
+    verb: identify
+    slot: exclusive
+    tier: 1
+    vtable:
+      - "describe(ctx) -> PersonaCard"
+      - "system_prompt(ctx) -> []const u8"
+      - "sign(ctx, envelope) -> Signature"
+      - "verify(ctx, envelope, sig) -> bool"
+
+  - id: pairing
+    verb: pair
+    slot: exclusive
+    tier: 2
+    vtable:
+      - "begin(ctx, method) -> PairingHandle"
+      - "confirm(ctx, handle, proof) -> PeerCard"
+      - "list_peers(ctx) -> []PeerCard"
+      - "revoke(ctx, peer_id) -> void"
+    invariant: "Only this plugger writes peer_store. guardrail-access-allowlist is read-only consumer."
+
+  # Channel (sense + converse + sensor inputs all live here)
+  - id: channel
+    verbs: [sense, converse]
+    slot: shared
+    tier: 1
+    vtable:
+      - "kind(ctx) -> ChannelKind        # human | agent | sensor"
+      - "direction(ctx) -> Direction      # in | out | both"
+      - "capabilities(ctx) -> ChannelCaps # supports_retract, supports_streaming, max_chars"
+      - "send(ctx, envelope) -> void"
+      - "poll_inbox(ctx) -> ?Envelope"
+      - "subscribe(ctx, cb) -> Subscription"
+      - "supports(ctx, peer_id) -> bool"
+    note: "Sensor inputs (file-watch, audio, vision) register as direction=in, kind=sensor"
+
+  # Cognition
+  - id: text_inference
+    verb: reason
+    slot: exclusive-with-fallback
+    tier: 1
+    vtable:
+      - "complete(ctx, prompt, opts) -> Completion"
+      - "stream(ctx, prompt, opts) -> StreamHandle"
+      - "count_tokens(ctx, text) -> u32"
+      - "supports(ctx, model_id) -> bool"
+
+  - id: planner
+    verb: reason
+    slot: exclusive-with-fallback
+    tier: 3
+    vtable:
+      - "plan(ctx, goal) -> Plan"
+      - "critique(ctx, plan) -> Critique"
+
+  # Continuity
+  - id: session_store
+    verb: remember
+    slot: shared
+    tier: 1
+    vtable:
+      - "append(ctx, session_id, entry) -> void"
+      - "read(ctx, session_id, range) -> []Entry"
+      - "search(ctx, session_id, query) -> []Entry"
+      - "list_sessions(ctx) -> []SessionId"
+      - "tag(ctx, session_id, tag) -> void"
+      - "forget(ctx, session_id, policy) -> void"
+    forget_policy:
+      soft:  "mark deleted; readable by attest only"
+      scrub: "overwrite PII fields in place; retain shape"
+      purge: "hard delete; attest retains hash-only record"
+
+  - id: supervisor
+    verb: run
+    slot: exclusive
+    tier: 1
+    vtable:
+      - "boot(ctx) -> void"
+      - "shutdown(ctx, deadline_ms) -> void"
+      - "status(ctx) -> SupervisorStatus"
+      - "on_crash(ctx, cb) -> Subscription"
+
+  - id: scheduler
+    verb: wake
+    slot: shared
+    tier: 2
+    vtable:
+      - "schedule(ctx, when, job) -> JobId"
+      - "cancel(ctx, job_id) -> void"
+      - "list(ctx) -> []Job"
+
+  # Action / enforcement — one plugger, many sub-family plugs
+  - id: guardrails
+    verb: gate
+    slot: shared
+    tier: 1
+    vtable:
+      - "inspect(ctx, action, phase) -> Decision"
+      - "on_deferred_resolved(ctx, ticket_id, decision) -> void"
+    decision_kinds:
+      allow:  "proceed"
+      deny:   "deny(reason); fails closed"
+      defer:  "defer(ticket_id, deadline_ms); turn blocks via waiter"
+    phase_enum: [inbound, pre-act, pre-reply]
+    semantics: "Any plug deny wins. All plugs invoked per phase. defer requires paired on_deferred_resolved call."
+    sub_families:
+      access:    "Who/what is allowed (allowlist, policy, rate-limit)"
+      budget:    "Cost / token / wall-clock enforcement (reads meter)"
+      approval:  "Human-in-loop consent (CLI, Discord, auto)"
+      personal:  "PKG — personal data scope default-deny + grants + classifier"
+      team:      "Team / company scope rules + member ACL"
+      content:   "PII scrub, secret detection, LLM judge on output"
+      sandbox:   "Process isolation (landlock, firejail, bubblewrap, docker) — shapes the yes"
+    stateful_plugs_allowed:
+      - "Sub-family plugs MAY carry internal state (grants, ACLs, rollups)"
+      - "State exposed via plug-specific CLI (tigerclaw consent, tigerclaw team, tigerclaw budget)"
+      - "Plugger vtable stays stateless `inspect()` — state is the plug's business"
+
+  - id: custom_tool
+    verb: act
+    slot: shared
+    tier: 1
+    vtable:
+      - "describe(ctx) -> ToolDescriptor"
+      - "invoke(ctx, args) -> Output"
+      - "cancel(ctx, handle) -> void"
+      - "supports(ctx, tool_name) -> bool"
+
+  # Attestation — new in v3
+  - id: auditor
+    verb: attest
+    slot: shared
+    tier: 2
+    vtable:
+      - "record(ctx, event) -> RecordId"
+      - "query(ctx, filter) -> []Record"
+      - "seal(ctx, range) -> MerkleRoot        # optional; for hash-chain plugs"
+    event_kinds: [turn_start, turn_end, tool_call, gate_decision, forget, config_reload]
+    note: "forget(purge) does NOT erase audit records; keeps hash-only stub"
+
+# ============================================================================
+# 5. PLUGS
+# ============================================================================
+plugs:
+
+  # persona
+  - { id: persona-soul-md, plugger: persona, tier: 1, status: alpha }
+  - { id: persona-struct,  plugger: persona, tier: 2, status: planned }
+  - { id: persona-env,     plugger: persona, tier: 3, status: planned }
+
+  # pairing
+  - { id: pair-qr,        plugger: pairing, tier: 2, status: planned }
+  - { id: pair-bootstrap, plugger: pairing, tier: 2, status: planned }
+  - { id: pair-oauth,     plugger: pairing, tier: 3, status: planned }
+
+  # channel (human, agent, sensor all here)
+  - { id: chan-cli,              plugger: channel, tier: 1, status: alpha,   direction: both, kind: human }
+  - { id: chan-discord,          plugger: channel, tier: 2, status: planned, direction: both, kind: human }
+  - { id: chan-slack,            plugger: channel, tier: 3, status: planned, direction: both, kind: human }
+  - { id: chan-imsg,             plugger: channel, tier: 3, status: planned, direction: both, kind: human }
+  - { id: chan-telegram,         plugger: channel, tier: 3, status: planned, direction: both, kind: human }
+  - { id: chan-collab-inprocess, plugger: channel, tier: 2, status: planned, direction: both, kind: agent }
+  - { id: chan-collab-stdio,     plugger: channel, tier: 2, status: planned, direction: both, kind: agent }
+  - { id: chan-collab-http-a2a,  plugger: channel, tier: 3, status: planned, direction: both, kind: agent, handshake: required }
+  - { id: chan-collab-mcp,       plugger: channel, tier: 3, status: planned, direction: both, kind: agent, companion: tool-mcp-bridge }
+  - { id: chan-file-watch,       plugger: channel, tier: 2, status: planned, direction: in,   kind: sensor }
+  - { id: chan-audio-in,         plugger: channel, tier: 4, status: planned, direction: in,   kind: sensor }
+  - { id: chan-audio-out,        plugger: channel, tier: 4, status: planned, direction: out,  kind: human }
+  - { id: chan-vision-in,        plugger: channel, tier: 4, status: planned, direction: in,   kind: sensor }
+
+  # text_inference
+  - { id: infer-anthropic, plugger: text_inference, tier: 1, status: alpha }
+  - { id: infer-fake,      plugger: text_inference, tier: 1, status: alpha }
+  - { id: infer-openai,    plugger: text_inference, tier: 2, status: planned }
+  - { id: infer-ollama,    plugger: text_inference, tier: 2, status: planned }
+  - { id: infer-deepseek,  plugger: text_inference, tier: 3, status: planned }
+  - { id: infer-gemini,    plugger: text_inference, tier: 3, status: planned }
+
+  # planner
+  - { id: planner-llm,      plugger: planner, tier: 3, status: planned }
+  - { id: planner-template, plugger: planner, tier: 4, status: planned }
+
+  # session_store
+  - { id: store-memory,   plugger: session_store, tier: 1, status: alpha }
+  - { id: store-jsonl,    plugger: session_store, tier: 1, status: alpha }
+  - { id: store-sqlite,   plugger: session_store, tier: 2, status: planned }
+  - { id: store-postgres, plugger: session_store, tier: 3, status: planned }
+  - { id: store-lancedb,  plugger: session_store, tier: 3, status: planned }
+
+  # supervisor
+  - { id: super-boot,    plugger: supervisor, tier: 1, status: alpha }
+  - { id: super-launchd, plugger: supervisor, tier: 2, status: planned }
+  - { id: super-systemd, plugger: supervisor, tier: 2, status: planned }
+  - { id: super-docker,  plugger: supervisor, tier: 3, status: planned }
+
+  # scheduler
+  - { id: sched-wakeup,   plugger: scheduler, tier: 2, status: planned }
+  - { id: sched-cron,     plugger: scheduler, tier: 2, status: planned }
+  - { id: sched-interval, plugger: scheduler, tier: 2, status: planned }
+  - { id: sched-event,    plugger: scheduler, tier: 3, status: planned }
+
+  # guardrails — grouped by sub-family via plug-id prefix
+  # ── access (who/what is allowed) ──────────────────────────────────────
+  - { id: guardrail-access-allowlist,    plugger: guardrails, tier: 1, status: planned, phase: [inbound, pre-act], reads: peer_store, sub_family: access }
+  - { id: guardrail-access-policy,       plugger: guardrails, tier: 2, status: planned, phase: [inbound, pre-act, pre-reply], sub_family: access }
+  - { id: guardrail-access-rate-limit,   plugger: guardrails, tier: 2, status: planned, phase: [inbound], sub_family: access }
+
+  # ── budget (cost / token / wall-clock) ────────────────────────────────
+  - { id: guardrail-budget-cap,          plugger: guardrails, tier: 2, status: planned, phase: [pre-act], reads: meter, sub_family: budget }
+  - { id: guardrail-budget-daily,        plugger: guardrails, tier: 3, status: planned, phase: [pre-act], reads: meter, stateful: true, sub_family: budget }
+
+  # ── approval (human-in-loop consent) ──────────────────────────────────
+  - { id: guardrail-approval-cli,        plugger: guardrails, tier: 1, status: planned, phase: [pre-act], sub_family: approval }
+  - { id: guardrail-approval-discord,    plugger: guardrails, tier: 3, status: planned, phase: [pre-act], sub_family: approval }
+  - { id: guardrail-approval-auto,       plugger: guardrails, tier: 1, status: planned, phase: [pre-act, pre-reply], sub_family: approval }
+
+  # ── personal (PKG — personal data scopes, default-deny) ───────────────
+  - { id: guardrail-personal-default-deny,      plugger: guardrails, tier: 1, status: planned, phase: [inbound, pre-act, pre-reply], sub_family: personal }
+  - { id: guardrail-personal-classifier-local,  plugger: guardrails, tier: 1, status: planned, phase: [inbound, pre-act, pre-reply], sub_family: personal, note: "On-device regex+keyword+small-LLM classifier" }
+  - { id: guardrail-personal-classifier-llm,    plugger: guardrails, tier: 3, status: planned, phase: [inbound, pre-act, pre-reply], sub_family: personal, note: "LLM-judge classifier; slower, more accurate" }
+  - { id: guardrail-personal-grant-manager,     plugger: guardrails, tier: 1, status: planned, phase: [pre-act, pre-reply], stateful: true, sub_family: personal, note: "CRUD over ~/.tigerclaw/consent/grants/" }
+  - { id: guardrail-personal-consent-cli,       plugger: guardrails, tier: 1, status: planned, phase: [pre-act], sub_family: personal, note: "Just-in-time prompt on CLI" }
+  - { id: guardrail-personal-consent-discord,   plugger: guardrails, tier: 3, status: planned, phase: [pre-act], sub_family: personal }
+  - { id: guardrail-personal-provider-tier,     plugger: guardrails, tier: 1, status: planned, phase: [pre-act], sub_family: personal, note: "Scope × provider-tier allow/deny matrix" }
+  - { id: guardrail-personal-export-controls,   plugger: guardrails, tier: 2, status: planned, phase: [pre-reply], sub_family: personal }
+  - { id: guardrail-personal-redactor,          plugger: guardrails, tier: 2, status: planned, phase: [pre-reply], sub_family: personal }
+
+  # ── team (cross-member scope rules) ───────────────────────────────────
+  - { id: guardrail-team-member-acl,     plugger: guardrails, tier: 3, status: planned, phase: [pre-act, pre-reply], stateful: true, sub_family: team }
+  - { id: guardrail-team-scope-deny,     plugger: guardrails, tier: 3, status: planned, phase: [pre-reply], sub_family: team }
+  - { id: guardrail-team-attest-share,   plugger: guardrails, tier: 4, status: planned, phase: [pre-reply], sub_family: team, note: "Require audit record when sharing cross-member" }
+
+  # ── content (PII, secret detection, LLM judge on output) ──────────────
+  - { id: guardrail-content-pii-scrub,      plugger: guardrails, tier: 3, status: planned, phase: [pre-reply], sub_family: content }
+  - { id: guardrail-content-secret-detect,  plugger: guardrails, tier: 2, status: planned, phase: [pre-reply], sub_family: content }
+  - { id: guardrail-content-llm-judge,      plugger: guardrails, tier: 4, status: planned, phase: [pre-reply], sub_family: content }
+
+  # ── sandbox (process isolation; shapes the yes rather than denies) ────
+  - { id: guardrail-sandbox-landlock,    plugger: guardrails, tier: 3, status: planned, phase: [pre-act], sub_family: sandbox }
+  - { id: guardrail-sandbox-firejail,    plugger: guardrails, tier: 3, status: planned, phase: [pre-act], sub_family: sandbox }
+  - { id: guardrail-sandbox-bubblewrap,  plugger: guardrails, tier: 3, status: planned, phase: [pre-act], sub_family: sandbox }
+  - { id: guardrail-sandbox-docker,      plugger: guardrails, tier: 4, status: planned, phase: [pre-act], sub_family: sandbox }
+
+  # custom_tool
+  - { id: tool-bash,       plugger: custom_tool, tier: 1, status: alpha }
+  - { id: tool-read,       plugger: custom_tool, tier: 1, status: alpha }
+  - { id: tool-edit,       plugger: custom_tool, tier: 1, status: alpha }
+  - { id: tool-write,      plugger: custom_tool, tier: 1, status: alpha }
+  - { id: tool-grep,       plugger: custom_tool, tier: 2, status: planned }
+  - { id: tool-http,       plugger: custom_tool, tier: 2, status: planned }
+  - { id: tool-git,        plugger: custom_tool, tier: 2, status: planned }
+  - { id: tool-sqlite,     plugger: custom_tool, tier: 3, status: planned }
+  - { id: tool-mcp-bridge, plugger: custom_tool, tier: 3, status: planned, companion: chan-collab-mcp }
+  - { id: tool-screenshot, plugger: custom_tool, tier: 4, status: planned }
+
+  # auditor
+  - { id: audit-jsonl,     plugger: auditor, tier: 2, status: planned, note: "Append-only JSONL with seq nums" }
+  - { id: audit-sig-chain, plugger: auditor, tier: 3, status: planned, note: "Hash-chained; seal() returns Merkle root" }
+  - { id: audit-telemetry, plugger: auditor, tier: 2, status: planned, note: "Bridges to telemetry-spine for ops overlap" }
+  - { id: audit-siem,      plugger: auditor, tier: 4, status: planned, note: "External SIEM sink" }
+
+# ============================================================================
+# 6. INFRASTRUCTURE — Cross-cutting, no verb
+# ============================================================================
+infrastructure:
+
+  - id: clock
+    slot: exclusive
+    tier: 1
+    vtable:
+      - "now_ms(ctx) -> i64"
+      - "monotonic_ms(ctx) -> i64"
+      - "sleep_ms(ctx, ms) -> void"
+    plugs: [clock-system, clock-fake-test]
+
+  - id: meter
+    slot: shared
+    tier: 1
+    role: "Passive accounting. Does NOT refuse. guardrail-budget-cap reads meter, enforces."
+    vtable:
+      - "reserve(ctx, kind, amount) -> ReservationId"
+      - "refund(ctx, reservation_id, unused) -> void"
+      - "consume(ctx, reservation_id) -> void"
+      - "remaining(ctx, kind) -> u64"
+    plugs: [meter-tokens, meter-dollars, meter-wall, meter-quota]
+
+  - id: telemetry
+    slot: shared
+    tier: 1
+    role: "Ops-facing. Distinct from attest (compliance)."
+    vtable:
+      - "span_start(ctx, name, attrs) -> SpanId"
+      - "span_end(ctx, span_id, status) -> void"
+      - "event(ctx, name, attrs) -> void"
+      - "flush(ctx) -> void"
+    plugs: [telemetry-stdout, telemetry-jsonl, telemetry-otel, telemetry-prometheus]
+
+  - id: waiter
+    slot: shared
+    tier: 2
+    role: "Resolves gate.defer tickets, sched-event triggers, any async wait"
+    vtable:
+      - "wait_timer(ctx, ms) -> void"
+      - "wait_file(ctx, path, event_mask) -> FileEvent"
+      - "wait_http_poll(ctx, url, matcher) -> HttpEvent"
+      - "wait_human(ctx, ticket_id, deadline_ms) -> Decision"
+      - "wait_event_bus(ctx, topic) -> BusEvent"
+    plugs: [wait-timer, wait-file, wait-http-poll, wait-human, wait-event-bus]
+
+# ============================================================================
+# 7. COMPOSITIONS
+# ============================================================================
+compositions:
+
+  - id: mvp-cli
+    description: "Smallest agent: CLI only, local, one LLM"
+    plugs:
+      - clock-system
+      - telemetry-stdout
+      - audit-jsonl
+      - persona-soul-md
+      - guardrail-access-allowlist
+      - guardrail-approval-cli
+      - chan-cli
+      - store-jsonl
+      - infer-anthropic
+      - super-boot
+      - tool-bash
+      - tool-read
+      - tool-edit
+      - tool-write
+
+  - id: discord-always-on
+    description: "Tiger on Discord, Omkar-only, auto-boot, budget-capped"
+    extends: mvp-cli
+    add_plugs:
+      - chan-discord
+      - store-sqlite
+      - guardrail-budget-cap
+      - guardrail-access-rate-limit
+      - meter-tokens
+      - meter-dollars
+      - super-launchd
+    config_overrides:
+      guardrail-access-allowlist:
+        allow_peers: ["discord:user:OMKAR_ID"]
+        default: deny
+        bootstrap_pair_exception: true
+      meter-dollars:
+        daily_cap_usd: 5.00
+      chan-discord:
+        reply_mode: "reply"
+        listen_dms: ["discord:user:OMKAR_ID"]
+
+  - id: autonomous-heartbeat
+    description: "Proactive agent: wakes on schedule, uses sensors"
+    extends: discord-always-on
+    add_plugs:
+      - sched-cron
+      - sched-wakeup
+      - sched-interval
+      - chan-file-watch
+      - wait-timer
+      - wait-human
+    config_overrides:
+      autonomous_reply_channel: chan-discord
+
+  - id: multi-agent-mesh
+    description: "Delegates to peer agents locally and over network"
+    extends: discord-always-on
+    add_plugs:
+      - chan-collab-inprocess
+      - chan-collab-stdio
+      - chan-collab-http-a2a
+      - pair-bootstrap
+      - audit-sig-chain
+    note: "Multi-persona = run multiple composition instances, one persona each"
+
+  - id: code-reviewer
+    description: "Reads PR, calls tools, produces review"
+    extends: mvp-cli
+    add_plugs:
+      - tool-grep
+      - tool-git
+      - tool-http
+      - guardrail-approval-auto
+
+# ============================================================================
+# 8. EXTENSION POINTS
+# ============================================================================
+extension_points:
+
+  - id: new-llm-provider
+    how: "Add plug under text_inference"
+    example: "infer-mistral, infer-groq"
+
+  - id: new-channel
+    how: "Add plug under channel; set direction + kind + capabilities"
+    example: "chan-matrix, chan-signal, chan-webhook, chan-serial-in"
+
+  - id: new-tool
+    how: "Add plug under custom_tool; describe() returns schema"
+    example: "tool-ssh, tool-docker-exec"
+
+  - id: new-memory-backend
+    how: "Add plug under session_store; pass contract tests incl. forget policies"
+    example: "store-duckdb, store-redis"
+
+  - id: new-guardrail-access-policy
+    how: "Add plug under gate; declare phase(s)"
+    example: "guardrail-content-dlp, guardrail-access-rate-limit, guardrail-content-pii-scrub"
+
+  - id: new-sandbox
+    how: "gate plug with phase=pre-act; shapes rather than denies"
+    example: "guardrail-sandbox-bubblewrap, guardrail-sandbox-firejail, guardrail-sandbox-docker"
+
+  - id: new-auditor
+    how: "Add plug under auditor"
+    example: "audit-kafka, audit-splunk"
+
+  - id: new-pairing-method
+    how: "Add plug under pairing"
+    example: "pair-nfc, pair-bluetooth, pair-webauthn"
+
+  - id: new-persona
+    how: "Append to compositions:; no new code"
+    example: "poet-agent, sre-agent"
+
+  - id: new-hook-point
+    how: "Add name to architecture.hook-bus.example_hooks"
+    example: "before_act, after_gate_defer"
+
+  - id: new-verb
+    rule: |
+      Requires ≥1 plugger, and that plugger must have ≥2 plug impls with
+      orthogonal failure modes. Failure-mode orthogonality test:
+      deleting plug A does not affect plug B's failure paths.
+      If the candidate is just a persona or strategy — REJECT.
+
+# ============================================================================
+# 9. INVARIANTS
+# ============================================================================
+invariants:
+
+  structural:
+    - "Every plug references an existing plugger"
+    - "Every verb references 1+ existing plugger"
+    - "Every plugger is referenced by 1+ verb OR is infrastructure"
+    - "Every composition's plugs exist"
+    - "deprecated status implies replaced_by is set"
+    - "MVP compositions (mvp-cli) use only tier=1 plugs"
+    - "Every vtable fn has *const Context as first param"
+
+  ownership:
+    - "Only pairing plugger writes peer_store"
+    - "guardrail-access-allowlist reads peer_store; never writes"
+    - "Only gate plugs return Refused/OverBudget errors"
+    - "meter only returns current state; never refuses"
+    - "Only auditor writes audit_log; forget(purge) does NOT erase audit records"
+
+  runtime:
+    - "Every outbound converse envelope carries valid persona signature"
+    - "Every custom_tool.invoke is preceded by gate.inspect(phase=pre-act)"
+    - "Every text_inference.complete has meter.reserve called first; refund on error"
+    - "Every channel message emits telemetry.span with channel.{in|out}"
+    - "Every channel inbound+outbound+tool_call emits auditor.record"
+    - "Every gate.defer resolves within deadline_ms OR on_deferred_resolved(deny(timeout))"
+    - "gate(pre-reply) runs on COMPLETE message; streams get retract envelope on deny"
+    - "Channels with !supports_retract MUST disable streaming"
+    - "reply.origin_channel_id == sense.origin_channel_id for reactive turns"
+    - "tool_loop iterations <= composition.max_tool_iterations (default 1000)"
+    - "meter.reserve is called PER tool_loop iteration, not per turn"
+    - "Supervisor restart backoff is exponential, capped at 60s"
+    - "Scheduler wake within ±100ms of target on idle system"
+    - "store-* plugs all pass the session_store contract suite"
+    - "All collab-* channels perform vtable-handshake on first connection"
+
+  slot_rules:
+    exclusive: "Exactly 1 active plug per config"
+    exclusive_with_fallback: "Ordered list; highest priority supports(ctx) wins; on error, next in chain"
+    exclusive_per_channel: "1 per named channel (e.g., guardrail-approval-* per chan)"
+    shared: "N>=0 active; semantics per-plugger: guardrails = any deny wins; telemetry = all emit; session_store = all write"
+
+# ============================================================================
+# END
+# ============================================================================
