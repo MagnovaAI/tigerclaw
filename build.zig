@@ -375,6 +375,16 @@ pub fn build(b: *std.Build) void {
     const ctx_assemble_tests = b.addTest(.{ .root_module = ctx_assemble_test_mod });
     test_step.dependOn(&b.addRunArtifact(ctx_assemble_tests).step);
 
+    const ctx_budget_property_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/context_budget_property_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctx_budget_property_test_mod.addImport("ctx_types", ctx_types_mod);
+    ctx_budget_property_test_mod.addImport("ctx_assemble", ctx_assemble_mod);
+    const ctx_budget_property_tests = b.addTest(.{ .root_module = ctx_budget_property_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ctx_budget_property_tests).step);
+
     const ctx_registry_mod = b.addModule("ctx_registry", .{
         .root_source_file = b.path("src/context/registry.zig"),
         .target = target,
