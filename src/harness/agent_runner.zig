@@ -59,6 +59,25 @@ pub const InFlightCounter = struct {
 /// degrades to end-of-turn delivery.
 pub const StreamSink = *const fn (ctx: ?*anyopaque, fragment: []const u8) void;
 
+/// Phase reported to `ToolEventSink`. `started` fires before the
+/// runner dispatches the tool; `finished` fires after dispatch, with
+/// the rendered result slice. A failure during dispatch still ends
+/// with a `finished` event — the rendered output carries the error
+/// reason so the client can show it.
+pub const ToolEventPhase = enum { started, finished };
+
+/// Event callback for tool-use turns. Each tool call the runner
+/// dispatches invokes this sink twice: once before the tool runs
+/// (phase=.started), once after (phase=.finished). `output` is only
+/// populated on `.finished`; on `.started` it is an empty slice.
+pub const ToolEventSink = *const fn (
+    ctx: ?*anyopaque,
+    phase: ToolEventPhase,
+    id: []const u8,
+    name: []const u8,
+    output: []const u8,
+) void;
+
 pub const TurnRequest = struct {
     /// Opaque session identifier. Concrete impls may parse this into
     /// a (`agent_name`, `channel_id`, `conversation_key`) triple.
@@ -72,6 +91,13 @@ pub const TurnRequest = struct {
     /// for the duration of the call only.
     stream_sink: ?StreamSink = null,
     stream_sink_ctx: ?*anyopaque = null,
+    /// Optional per-turn tool-event sink. Fires on start and end of
+    /// each tool dispatch the runner performs. Shares `sink_ctx`
+    /// with the text sink when set on the same turn; callers that
+    /// want the two sinks wired to different contexts can set
+    /// `tool_event_sink_ctx` separately.
+    tool_event_sink: ?ToolEventSink = null,
+    tool_event_sink_ctx: ?*anyopaque = null,
 };
 
 pub const TurnResult = struct {

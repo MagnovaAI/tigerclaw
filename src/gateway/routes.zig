@@ -213,17 +213,12 @@ fn sessionsTurnHandler(
     req: http.Request,
     params: []const router.Param,
     _: ?[]const u8,
-    _: dispatcher.StreamHook,
+    stream_hook: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     const ctx = try contextOrInternal();
     const id = findParam(params, "id") orelse return error.BadRequest;
 
-    // Budget gate. This is a snapshot check — a concurrent streaming
-    // reader can push counters past a cap after we observe them, but
-    // the next turn will see the trip. The observable contract is
-    // "once the cap is hit, subsequent turns fail with 429 until the
-    // session is reset"; eventual consistency is enough for a spend
-    // safety net.
+    // Budget gate — see the non-streaming note below, same semantics.
     if (ctx.budget) |b| {
         if (b.check() != .none) return .{
             .status = .too_many_requests,
@@ -232,33 +227,160 @@ fn sessionsTurnHandler(
         };
     }
 
-    // Extract `message` from the request body JSON. Empty body → fall
-    // back to a fixed prompt so smoke tests with no payload still
-    // exercise the runner. Errors here surface as bad-request rather
-    // than internal — the client built a malformed JSON.
     const message_or_empty = extractMessage(req.body) catch return error.BadRequest;
-    // Fall back to a deterministic prompt when the body has no
-    // `message` field — keeps existing smoke tests + the canonical
-    // mock-runner behaviour intact.
     const message = if (message_or_empty.len > 0) message_or_empty else "ping";
 
-    const result = ctx.runner.run(.{ .session_id = id, .input = message }) catch |err| switch (err) {
-        error.SessionMissing => return http.Response.notFound(),
-        error.BudgetExceeded => return .{ .status = .too_many_requests, .body = "budget exceeded\n" },
-        else => return error.InternalServerError,
-    };
-
-    // Content negotiation: a client asking for `text/event-stream`
-    // receives the same logical turn rendered as SSE token events.
-    // The runner returns the full reply in one shot (real per-token
-    // streaming is the v0.2.0 dispatcher rewrite); we frame the
-    // response into a single token event + done event so the wire
-    // shape matches what a streaming client expects.
-    if (wantsSse(req)) {
-        return renderSseFromOutput(result.output);
+    // Non-streaming path (e.g. the CLI smoke tests that don't ask for
+    // SSE) still goes through the blocking run + JSON envelope. The
+    // streaming branch below lives alongside so regressions to the
+    // old path remain trivially bisectable.
+    if (!wantsSse(req) or stream_hook == null) {
+        const result = ctx.runner.run(.{ .session_id = id, .input = message }) catch |err| switch (err) {
+            error.SessionMissing => return http.Response.notFound(),
+            error.BudgetExceeded => return .{ .status = .too_many_requests, .body = "budget exceeded\n" },
+            else => return error.InternalServerError,
+        };
+        return renderJsonFromOutput(result.output);
     }
 
-    return renderJsonFromOutput(result.output);
+    return streamTurn(ctx, stream_hook.?, id, message);
+}
+
+/// Stream the turn over a chunked `text/event-stream` response.
+///
+/// Emits v1-compatible JSON-envelope frames:
+/// * `data: {"type":"chunk","text":"..."}\n\n` per provider text delta
+/// * `data: {"type":"tool_start","id":"...","name":"..."}\n\n` per dispatch
+/// * `data: {"type":"tool_done","id":"...","name":"...","output":"..."}\n\n`
+/// * `data: {"type":"done"}\n\n` terminal frame
+/// * `data: {"type":"error","message":"..."}\n\n` on failure (followed by done)
+///
+/// Each frame is flushed immediately so the client sees it before the
+/// turn completes. Returns `Response.streamingHandled()` so the
+/// tcp_server does not try to write a second response envelope.
+fn streamTurn(
+    ctx: *Context,
+    stream_hook: dispatcher.StreamHook,
+    session_id: []const u8,
+    message: []const u8,
+) dispatcher.HandlerError!http.Response {
+    const request: *std.http.Server.Request = @ptrCast(@alignCast(stream_hook.?));
+
+    var send_buf: [1024]u8 = undefined;
+    var body_writer = request.respondStreaming(&send_buf, .{
+        .respond_options = .{
+            .keep_alive = false,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
+                .{ .name = "cache-control", .value = "no-cache" },
+            },
+        },
+    }) catch return error.InternalServerError;
+
+    var frame_ctx: StreamCtx = .{ .body = &body_writer };
+
+    // Fire the turn through the runner with both sinks wired. The
+    // runner invokes these synchronously from the dispatch thread;
+    // this handler is single-threaded-per-request so no locking is
+    // needed around the body writer.
+    const run_err = ctx.runner.run(.{
+        .session_id = session_id,
+        .input = message,
+        .stream_sink = chunkSink,
+        .stream_sink_ctx = &frame_ctx,
+        .tool_event_sink = toolEventSink,
+        .tool_event_sink_ctx = &frame_ctx,
+    });
+
+    if (run_err) |_| {
+        writeFrame(&body_writer, "{\"type\":\"done\"}") catch {};
+    } else |err| {
+        const msg = switch (err) {
+            error.SessionMissing => "session missing",
+            error.BudgetExceeded => "budget exceeded",
+            error.Cancelled, error.Interrupted => "turn cancelled",
+            else => "internal error",
+        };
+        writeErrorFrame(&body_writer, msg) catch {};
+        writeFrame(&body_writer, "{\"type\":\"done\"}") catch {};
+    }
+
+    body_writer.end() catch {};
+    return http.Response.streamingHandled();
+}
+
+/// Context both sinks share. Single field today; kept as a struct so
+/// later additions (cancel token, frame counter) don't ripple through
+/// every sink signature.
+const StreamCtx = struct {
+    body: *std.http.BodyWriter,
+};
+
+fn chunkSink(ctx: ?*anyopaque, fragment: []const u8) void {
+    const self: *StreamCtx = @ptrCast(@alignCast(ctx.?));
+    writeChunkFrame(self.body, fragment) catch {};
+}
+
+fn toolEventSink(
+    ctx: ?*anyopaque,
+    phase: harness.agent_runner.ToolEventPhase,
+    id: []const u8,
+    name: []const u8,
+    output: []const u8,
+) void {
+    const self: *StreamCtx = @ptrCast(@alignCast(ctx.?));
+    switch (phase) {
+        .started => writeToolStartFrame(self.body, id, name) catch {},
+        .finished => writeToolDoneFrame(self.body, id, name, output) catch {},
+    }
+}
+
+/// Write a `data: <json>\n\n` frame and flush so the bytes hit the
+/// socket before the next frame is built.
+fn writeFrame(body: *std.http.BodyWriter, json_line: []const u8) !void {
+    try body.writer.writeAll("data: ");
+    try body.writer.writeAll(json_line);
+    try body.writer.writeAll("\n\n");
+    try body.writer.flush();
+}
+
+fn writeChunkFrame(body: *std.http.BodyWriter, text: []const u8) !void {
+    try body.writer.writeAll("data: {\"type\":\"chunk\",\"text\":");
+    try std.json.Stringify.encodeJsonString(text, .{}, &body.writer);
+    try body.writer.writeAll("}\n\n");
+    try body.writer.flush();
+}
+
+fn writeToolStartFrame(body: *std.http.BodyWriter, id: []const u8, name: []const u8) !void {
+    try body.writer.writeAll("data: {\"type\":\"tool_start\",\"id\":");
+    try std.json.Stringify.encodeJsonString(id, .{}, &body.writer);
+    try body.writer.writeAll(",\"name\":");
+    try std.json.Stringify.encodeJsonString(name, .{}, &body.writer);
+    try body.writer.writeAll("}\n\n");
+    try body.writer.flush();
+}
+
+fn writeToolDoneFrame(
+    body: *std.http.BodyWriter,
+    id: []const u8,
+    name: []const u8,
+    output: []const u8,
+) !void {
+    try body.writer.writeAll("data: {\"type\":\"tool_done\",\"id\":");
+    try std.json.Stringify.encodeJsonString(id, .{}, &body.writer);
+    try body.writer.writeAll(",\"name\":");
+    try std.json.Stringify.encodeJsonString(name, .{}, &body.writer);
+    try body.writer.writeAll(",\"output\":");
+    try std.json.Stringify.encodeJsonString(output, .{}, &body.writer);
+    try body.writer.writeAll("}\n\n");
+    try body.writer.flush();
+}
+
+fn writeErrorFrame(body: *std.http.BodyWriter, message: []const u8) !void {
+    try body.writer.writeAll("data: {\"type\":\"error\",\"message\":");
+    try std.json.Stringify.encodeJsonString(message, .{}, &body.writer);
+    try body.writer.writeAll("}\n\n");
+    try body.writer.flush();
 }
 
 /// Pull `message` out of the request body JSON. Empty body → empty
@@ -308,47 +430,6 @@ fn renderJsonFromOutput(output: []const u8) http.Response {
     return http.Response.jsonOk(w.buffered());
 }
 
-/// Build the SSE response body for a one-shot runner output. Memory
-/// for the body comes out of a thread-local fixed buffer — the
-/// handler signature is allocator-free, and the body is consumed by
-/// `tcp_server` before this thread services its next request.
-threadlocal var sse_body_buf: [16 * 1024]u8 = undefined;
-
-/// Emit the runner output as one `event: token` frame per source line
-/// followed by a single `event: done`. SSE forbids literal newlines in
-/// a `data:` line, so multi-line replies are split into multiple
-/// frames; clients concatenate them with `\n` between frames to
-/// reconstruct the original text.
-///
-/// The runner is still one-shot — true per-token streaming lands when
-/// the dispatcher grows a streaming response shape. Framing here so
-/// the wire protocol is honest and clients can render incrementally.
-fn renderSseFromOutput(output: []const u8) http.Response {
-    var w: std.Io.Writer = .fixed(&sse_body_buf);
-    const headroom: usize = 64; // space for the trailing done frame
-    const budget = if (sse_body_buf.len > headroom) sse_body_buf.len - headroom else 0;
-
-    var it = std.mem.splitScalar(u8, output, '\n');
-    while (it.next()) |line| {
-        // Cap any single frame so one pathologically long line can't
-        // exhaust the buffer on its own.
-        const cap = @min(line.len, budget / 2);
-        if (w.buffered().len + cap + 24 > budget) break;
-        w.writeAll("event: token\ndata: ") catch break;
-        if (cap > 0) w.writeAll(line[0..cap]) catch break;
-        w.writeAll("\n\n") catch break;
-    }
-
-    w.writeAll("event: done\ndata: {\"completed\":true}\n\n") catch
-        return .{ .status = .internal_server_error, .body = "render failed\n" };
-
-    return .{
-        .status = .ok,
-        .headers = &sse_headers,
-        .body = w.buffered(),
-    };
-}
-
 /// DELETE /sessions/:id/turns/current — cancel the in-flight turn for
 /// `id`. Idempotent: returns 204 even when no turn is in flight, so the
 /// CLI's Ctrl-C handler can fire without having to track turn state.
@@ -372,11 +453,6 @@ fn wantsSse(req: http.Request) bool {
     const accept = req.getHeader("accept") orelse return false;
     return std.mem.indexOf(u8, accept, "text/event-stream") != null;
 }
-
-const sse_headers = [_]http.Header{
-    .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
-    .{ .name = "cache-control", .value = "no-cache" },
-};
 
 fn findParam(params: []const router.Param, name: []const u8) ?[]const u8 {
     for (params) |p| {
@@ -487,7 +563,11 @@ test "routes: POST /sessions/:id/turns returns 429 when the budget is exhausted"
     try testing.expect(mock.in_flight.isZero());
 }
 
-fn runTurnSse(runner: *harness.MockAgentRunner) anyerror!void {
+fn runTurnSseFallback(runner: *harness.MockAgentRunner) anyerror!void {
+    // In-process dispatch has no real `std.http.Server.Request` to
+    // stream through, so the handler falls back to the buffered JSON
+    // path even when Accept requests SSE. The live streaming path is
+    // covered by the e2e gateway test.
     const accept = [_]http.Header{.{ .name = "accept", .value = "text/event-stream" }};
     const req: http.Request = .{
         .method = .POST,
@@ -497,45 +577,11 @@ fn runTurnSse(runner: *harness.MockAgentRunner) anyerror!void {
     const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.ok, resp.status);
     try testing.expect(runner.in_flight.isZero());
-
-    // Content-type must be SSE so a streaming client recognises it.
-    var ct_seen = false;
-    for (resp.headers) |h| {
-        if (std.mem.eql(u8, h.name, "content-type")) {
-            try testing.expect(std.mem.indexOf(u8, h.value, "text/event-stream") != null);
-            ct_seen = true;
-        }
-    }
-    try testing.expect(ct_seen);
-
-    // Body carries at least one token event followed by a done event.
-    try testing.expect(std.mem.indexOf(u8, resp.body, "event: token\ndata: ping") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "event: done") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "{\"completed\":true}") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"output\"") != null);
 }
 
-test "routes: POST /sessions/:id/turns with Accept: text/event-stream returns SSE" {
-    try withMockContext(runTurnSse);
-}
-
-fn runTurnAcceptMixed(_: *harness.MockAgentRunner) anyerror!void {
-    // Accept lists multiple types — SSE wins because the substring
-    // match in `wantsSse` ignores quality factors.
-    const accept = [_]http.Header{.{
-        .name = "accept",
-        .value = "application/json, text/event-stream;q=0.9",
-    }};
-    const req: http.Request = .{
-        .method = .POST,
-        .target = "/sessions/s1/turns",
-        .headers = &accept,
-    };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "event: token") != null);
-}
-
-test "routes: POST /sessions/:id/turns honours Accept when SSE is one of several" {
-    try withMockContext(runTurnAcceptMixed);
+test "routes: POST /sessions/:id/turns falls back to JSON when no stream hook present" {
+    try withMockContext(runTurnSseFallback);
 }
 
 fn runTurnCancel(_: *harness.MockAgentRunner) anyerror!void {

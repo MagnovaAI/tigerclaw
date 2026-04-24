@@ -419,6 +419,13 @@ pub const LiveAgentRunner = struct {
                 .content = text,
             });
             for (resp.tool_calls) |tc| {
+                // Fire a `.started` event before dispatch so the TUI
+                // can render a pending tool line. The runner never
+                // sees the sink output; it's a side channel for the
+                // gateway's SSE forwarder.
+                if (req.tool_event_sink) |s| {
+                    s(req.tool_event_sink_ctx, .started, tc.id, tc.name, "");
+                }
                 const result_text = dispatchBuiltinTool(
                     self.allocator,
                     self.io,
@@ -434,6 +441,9 @@ pub const LiveAgentRunner = struct {
                     ) catch return error.OutOfMemory;
                 };
                 defer self.allocator.free(result_text);
+                if (req.tool_event_sink) |s| {
+                    s(req.tool_event_sink_ctx, .finished, tc.id, tc.name, result_text);
+                }
 
                 const tool_msg_id = try self.nextMessageId();
                 defer self.allocator.free(tool_msg_id);
