@@ -50,6 +50,12 @@ pub const LiveAgentRunner = struct {
     /// for the duration of the request; rotated on the next run().
     last_output: []u8 = &.{},
 
+    /// Resolved root directory for the agent's workspace. All
+    /// file tools (read_file/write_file/list_files/edit_file)
+    /// resolve their `path` argument relative to this. Always
+    /// `<root>/.tigerclaw/agents/<name>/workspace`; owned.
+    agent_workspace_root: []u8,
+
     /// Multi-turn history store. Keyed by `TurnRequest.session_id`;
     /// each run ingests the user message, assembles the context
     /// window from prior turns, then ingests the assistant reply.
@@ -106,7 +112,12 @@ pub const LiveAgentRunner = struct {
 
         const api_key = try parseProviderKey(allocator, config_bytes, manifest.provider);
 
-        // SOUL.md is optional at both layers.
+        // SOUL.md is optional at both layers. It defines the agent's
+        // persona / voice; the tool catalog is appended to it below
+        // so every agent is told what it can actually call. A model
+        // that just sees schemas via the Anthropic `tools` channel
+        // still often refuses with "I can't do that"; a short prose
+        // list in the system prompt reliably flips that behaviour.
         const soul = readCascade(
             allocator,
             io,
@@ -118,6 +129,20 @@ pub const LiveAgentRunner = struct {
             .limited(32 * 1024),
             error.AgentMissing,
         ) catch null;
+        defer if (soul) |s| allocator.free(s);
+
+        const system_prompt = try buildSystemPrompt(allocator, soul);
+
+        // Resolve the file-tool sandbox root: prefer the workspace
+        // copy (per-project scratch dir) with fallback to the home
+        // copy (per-user scratch dir). We don't create it eagerly;
+        // write_file creates on demand.
+        const agent_workspace_root = try resolveAgentWorkspaceRoot(
+            allocator,
+            workspace,
+            home,
+            agent_name,
+        );
 
         const engine = try context_root.default_engine.DefaultEngine.init(allocator);
 
@@ -128,9 +153,50 @@ pub const LiveAgentRunner = struct {
             .provider_kind = manifest.provider,
             .api_key = api_key,
             .model = manifest.model,
-            .system_prompt = soul,
+            .system_prompt = system_prompt,
+            .agent_workspace_root = agent_workspace_root,
             .context_engine = engine,
         };
+    }
+
+    /// Build the final system prompt sent to the provider: the
+    /// agent's SOUL.md (if any) followed by an auto-generated
+    /// catalog of the tools in `builtin_tools`. The catalog is
+    /// generated rather than authored so adding a tool to the
+    /// table immediately teaches every agent about it — no
+    /// per-agent prompt edit needed.
+    fn buildSystemPrompt(allocator: std.mem.Allocator, soul: ?[]const u8) LoadError!?[]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        if (soul) |s| {
+            try buf.appendSlice(allocator, s);
+            if (s.len > 0 and s[s.len - 1] != '\n') try buf.append(allocator, '\n');
+            try buf.append(allocator, '\n');
+        }
+
+        try buf.appendSlice(allocator,
+            \\# Available tools
+            \\
+            \\You have these tools available. Call them instead of guessing, refusing,
+            \\or telling the user to do the work themselves. Each tool's JSON schema
+            \\is provided separately; the list below is for quick reference.
+            \\
+            \\
+        );
+        for (builtin_tools) |t| {
+            buf.append(allocator, '-') catch return error.OutOfMemory;
+            buf.append(allocator, ' ') catch return error.OutOfMemory;
+            buf.append(allocator, '`') catch return error.OutOfMemory;
+            buf.appendSlice(allocator, t.name) catch return error.OutOfMemory;
+            buf.append(allocator, '`') catch return error.OutOfMemory;
+            buf.appendSlice(allocator, " — ") catch return error.OutOfMemory;
+            buf.appendSlice(allocator, t.description) catch return error.OutOfMemory;
+            buf.append(allocator, '\n') catch return error.OutOfMemory;
+        }
+
+        if (buf.items.len == 0) return null;
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Back-compat shim — prefer `load(..., workspace, home)`.
@@ -148,6 +214,7 @@ pub const LiveAgentRunner = struct {
         self.allocator.free(self.model);
         if (self.system_prompt) |s| self.allocator.free(s);
         if (self.last_output.len > 0) self.allocator.free(self.last_output);
+        self.allocator.free(self.agent_workspace_root);
         self.context_engine.deinit();
         self.* = undefined;
     }
@@ -344,6 +411,7 @@ pub const LiveAgentRunner = struct {
                     self.allocator,
                     self.io,
                     clock_value,
+                    self.agent_workspace_root,
                     tc.name,
                     tc.arguments_json,
                 ) catch |e| blk: {
@@ -429,6 +497,26 @@ const builtin_tools = [_]types.Tool{
         .description = "HTTP GET the URL and return the response body as text (max 64 KB). Only http:// and https:// schemes are allowed; private and loopback addresses are refused.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute URL to fetch.\"}},\"required\":[\"url\"]}",
     },
+    .{
+        .name = "read_file",
+        .description = "Read a UTF-8 text file from the agent's workspace. `path` is relative to the workspace root; absolute paths and `..` traversal are refused. Returns up to 64 KiB.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}",
+    },
+    .{
+        .name = "write_file",
+        .description = "Write UTF-8 text to a file in the agent's workspace. Creates parent directories on demand. Overwrites existing content. Max 64 KiB. Path rules: relative only, no `..`.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}",
+    },
+    .{
+        .name = "list_files",
+        .description = "List the entries of a directory in the agent's workspace. `path` is relative; empty string or `.` lists the workspace root. Returns one entry per line prefixed with `f` (file) or `d` (dir).",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}",
+    },
+    .{
+        .name = "edit_file",
+        .description = "Replace the first occurrence of `old_text` with `new_text` inside a file under the agent's workspace. Fails if `old_text` is not found or appears more than once. Use for small in-place edits.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old_text\":{\"type\":\"string\"},\"new_text\":{\"type\":\"string\"}},\"required\":[\"path\",\"old_text\",\"new_text\"]}",
+    },
 };
 
 /// Execute a built-in tool by name. Returns caller-owned text; errors
@@ -437,6 +525,7 @@ fn dispatchBuiltinTool(
     allocator: std.mem.Allocator,
     io: std.Io,
     clock: clock_mod.Clock,
+    workspace_root: []const u8,
     name: []const u8,
     arguments_json: []const u8,
 ) ![]u8 {
@@ -451,6 +540,18 @@ fn dispatchBuiltinTool(
     }
     if (std.mem.eql(u8, name, "fetch_url")) {
         return runFetchUrl(allocator, io, arguments_json);
+    }
+    if (std.mem.eql(u8, name, "read_file")) {
+        return runReadFile(allocator, io, workspace_root, arguments_json);
+    }
+    if (std.mem.eql(u8, name, "write_file")) {
+        return runWriteFile(allocator, io, workspace_root, arguments_json);
+    }
+    if (std.mem.eql(u8, name, "list_files")) {
+        return runListFiles(allocator, io, workspace_root, arguments_json);
+    }
+    if (std.mem.eql(u8, name, "edit_file")) {
+        return runEditFile(allocator, io, workspace_root, arguments_json);
     }
     return error.UnknownTool;
 }
@@ -694,6 +795,199 @@ fn ensurePublicHost(host: []const u8) !void {
     // Not an IP literal — a hostname. Accept.
 }
 
+// ---------------------------------------------------------------------------
+// file tools (read_file / write_file / list_files / edit_file)
+//
+// Every file tool resolves its `path` argument inside the agent's
+// workspace root. The sandbox boundary is enforced by
+// `ensureSafeRelPath` — it rejects paths the agent could use to
+// escape the workspace (absolute paths, `..` components, NUL
+// bytes). We intentionally do *not* resolve symlinks; the workspace
+// root is created by tigerclaw itself on first write, so the agent
+// can't pre-plant one that points elsewhere.
+
+/// Enforce the file-tool path policy: path must be non-empty, not
+/// absolute, must not contain any `..` component, and must not
+/// contain NUL. Empty string and `.` are normalised to `.` so
+/// callers can use them to refer to the workspace root itself.
+fn ensureSafeRelPath(path: []const u8) ![]const u8 {
+    if (path.len == 0) return ".";
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+    if (std.fs.path.isAbsolute(path)) return error.PathEscapesWorkspace;
+
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |comp| {
+        if (comp.len == 0) continue;
+        if (std.mem.eql(u8, comp, "..")) return error.PathEscapesWorkspace;
+    }
+    return path;
+}
+
+/// Open (and lazily create) the workspace root directory, then
+/// open `rel` inside it. Caller closes the returned Dir.
+fn openWorkspaceDir(io: std.Io, workspace_root: []const u8) !std.Io.Dir {
+    // Root itself may not yet exist — create it. Then open.
+    std.Io.Dir.cwd().createDirPath(io, workspace_root) catch |e| switch (e) {
+        error.PathAlreadyExists => {},
+        else => return e,
+    };
+    return std.Io.Dir.cwd().openDir(io, workspace_root, .{});
+}
+
+fn runReadFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_root: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
+    const Args = struct { path: []const u8 };
+    var parsed = try std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const rel = try ensureSafeRelPath(parsed.value.path);
+
+    var root = try openWorkspaceDir(io, workspace_root);
+    defer root.close(io);
+
+    return root.readFileAlloc(io, rel, allocator, .limited(64 * 1024)) catch |e| switch (e) {
+        error.FileNotFound => error.FileNotFound,
+        else => error.ReadFailed,
+    };
+}
+
+fn runWriteFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_root: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
+    const Args = struct { path: []const u8, content: []const u8 };
+    var parsed = try std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const rel = try ensureSafeRelPath(parsed.value.path);
+    if (std.mem.eql(u8, rel, ".")) return error.InvalidPath;
+    if (parsed.value.content.len > 64 * 1024) return error.TooLarge;
+
+    var root = try openWorkspaceDir(io, workspace_root);
+    defer root.close(io);
+
+    // Ensure parent dirs exist so `foo/bar/baz.txt` works when
+    // nothing below the root has been created yet.
+    if (std.fs.path.dirname(rel)) |parent| {
+        if (parent.len > 0) {
+            root.createDirPath(io, parent) catch |e| switch (e) {
+                error.PathAlreadyExists => {},
+                else => return error.WriteFailed,
+            };
+        }
+    }
+
+    root.writeFile(io, .{ .sub_path = rel, .data = parsed.value.content }) catch return error.WriteFailed;
+
+    return std.fmt.allocPrint(allocator, "wrote {d} bytes to {s}", .{ parsed.value.content.len, rel });
+}
+
+fn runListFiles(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_root: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
+    // path is optional — missing or empty means the workspace root.
+    const Args = struct { path: []const u8 = "" };
+    var parsed = try std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    const rel = try ensureSafeRelPath(parsed.value.path);
+
+    var root = try openWorkspaceDir(io, workspace_root);
+    defer root.close(io);
+
+    var target = if (std.mem.eql(u8, rel, "."))
+        try std.Io.Dir.cwd().openDir(io, workspace_root, .{ .iterate = true })
+    else
+        try root.openDir(io, rel, .{ .iterate = true });
+    defer target.close(io);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var it = target.iterate();
+    while (try it.next(io)) |entry| {
+        const kind: u8 = switch (entry.kind) {
+            .directory => 'd',
+            .file, .sym_link => 'f',
+            else => '?',
+        };
+        try out.append(allocator, kind);
+        try out.append(allocator, ' ');
+        try out.appendSlice(allocator, entry.name);
+        try out.append(allocator, '\n');
+    }
+
+    if (out.items.len == 0) return allocator.dupe(u8, "(empty)");
+    return out.toOwnedSlice(allocator);
+}
+
+fn runEditFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_root: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
+    const Args = struct {
+        path: []const u8,
+        old_text: []const u8,
+        new_text: []const u8,
+    };
+    var parsed = try std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const rel = try ensureSafeRelPath(parsed.value.path);
+    if (std.mem.eql(u8, rel, ".")) return error.InvalidPath;
+    if (parsed.value.old_text.len == 0) return error.EmptyOldText;
+
+    var root = try openWorkspaceDir(io, workspace_root);
+    defer root.close(io);
+
+    const current = root.readFileAlloc(io, rel, allocator, .limited(64 * 1024)) catch |e| switch (e) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return error.ReadFailed,
+    };
+    defer allocator.free(current);
+
+    // Enforce uniqueness so the model can't accidentally overwrite
+    // multiple sites with a single `old_text`. If more than one
+    // match exists, the user probably wanted a more specific anchor.
+    const first = std.mem.indexOf(u8, current, parsed.value.old_text) orelse return error.OldTextNotFound;
+    const second = std.mem.indexOfPos(u8, current, first + 1, parsed.value.old_text);
+    if (second != null) return error.OldTextNotUnique;
+
+    const prefix = current[0..first];
+    const suffix = current[first + parsed.value.old_text.len ..];
+    const new_total = prefix.len + parsed.value.new_text.len + suffix.len;
+    if (new_total > 64 * 1024) return error.TooLarge;
+
+    var next: std.ArrayList(u8) = .empty;
+    defer next.deinit(allocator);
+    try next.ensureTotalCapacity(allocator, new_total);
+    next.appendSliceAssumeCapacity(prefix);
+    next.appendSliceAssumeCapacity(parsed.value.new_text);
+    next.appendSliceAssumeCapacity(suffix);
+
+    root.writeFile(io, .{ .sub_path = rel, .data = next.items }) catch return error.WriteFailed;
+
+    return std.fmt.allocPrint(allocator, "edited {s}: 1 replacement ({d} bytes)", .{ rel, new_total });
+}
+
 /// Format nanoseconds-since-epoch as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
 /// Uses Howard Hinnant's `civil_from_days` algorithm so no libc tz
 /// dependency is needed and the result is stable across platforms.
@@ -811,6 +1105,22 @@ fn readRootCascade(
         if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, limit)) |b| return b else |_| {}
     }
     return missing_err;
+}
+
+/// Resolve the sandbox directory for file tools. Prefers the
+/// workspace-scoped copy (`<workspace>/.tigerclaw/agents/<name>/workspace`)
+/// so agents scratched in-project don't spill into the user's
+/// home dir; falls back to the home copy. Caller owns the slice.
+fn resolveAgentWorkspaceRoot(
+    allocator: std.mem.Allocator,
+    workspace: []const u8,
+    home: []const u8,
+    agent_name: []const u8,
+) LoadError![]u8 {
+    const root = if (workspace.len > 0) workspace else home;
+    if (root.len == 0) return error.HomeMissing;
+    return std.fmt.allocPrint(allocator, "{s}/.tigerclaw/agents/{s}/workspace", .{ root, agent_name }) catch
+        error.OutOfMemory;
 }
 
 fn parseAgentManifest(allocator: std.mem.Allocator, bytes: []const u8) LoadError!AgentManifest {
@@ -980,7 +1290,7 @@ test "renderCurrentTimeIso8601: fixed timestamp renders canonically" {
 
 test "dispatchBuiltinTool: get_current_time matches renderCurrentTimeIso8601" {
     var fc = clock_mod.FixedClock{ .value_ns = 1_609_556_645 * @as(i128, std.time.ns_per_s) };
-    const out = try dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "get_current_time", "{}");
+    const out = try dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "", "get_current_time", "{}");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("2021-01-02T03:04:05Z", out);
 }
@@ -989,7 +1299,7 @@ test "dispatchBuiltinTool: unknown name returns UnknownTool" {
     var fc = clock_mod.FixedClock{ .value_ns = 0 };
     try testing.expectError(
         error.UnknownTool,
-        dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "no_such_tool", "{}"),
+        dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "", "no_such_tool", "{}"),
     );
 }
 
