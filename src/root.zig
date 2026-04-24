@@ -46,6 +46,7 @@ pub const scenario = @import("scenario/root.zig");
 pub const settings = @import("settings/root.zig");
 pub const tools = @import("tools/root.zig");
 pub const trace = @import("trace/root.zig");
+pub const tui = @import("tui/root.zig");
 pub const types = @import("types");
 pub const util = @import("util/root.zig");
 pub const vcr = @import("vcr/root.zig");

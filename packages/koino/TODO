@@ -1,0 +1,3 @@
+* use errdefer, actually recover without loss
+  * test failed allocations at various stages
+* strings: unescape and its dependents in place

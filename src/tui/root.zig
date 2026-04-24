@@ -39,6 +39,13 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const http_client = @import("../cli/commands/http_client.zig");
+const md = @import("md.zig");
+
+test {
+    // Ensure md's tests are discovered when the unit-test binary
+    // walks references from this file.
+    std.testing.refAllDecls(md);
+}
 
 const Event = union(enum) {
     key_press: vaxis.Key,

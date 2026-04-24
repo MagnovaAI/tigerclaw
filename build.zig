@@ -242,6 +242,78 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
 
+    // PCRE static library: compiled from vendored C sources. Koino's
+    // CommonMark parser (see packages/koino) needs a Perl-compatible
+    // regex engine; rather than depending on the system libpcre we
+    // build it in-tree so builds stay hermetic.
+    const pcre_lib = b.addLibrary(.{
+        .name = "pcre",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    pcre_lib.root_module.addIncludePath(b.path("packages/libpcre/pcre"));
+    pcre_lib.root_module.link_libc = true;
+    pcre_lib.root_module.addCSourceFiles(.{
+        .root = b.path("packages/libpcre/pcre"),
+        .flags = &.{
+            "-Wno-implicit-function-declaration",
+            "-DHAVE_CONFIG_H",
+        },
+        .files = &.{
+            "pcre_byte_order.c",     "pcre_chartables.c",   "pcre_compile.c",
+            "pcre_config.c",         "pcre_dfa_exec.c",     "pcre_exec.c",
+            "pcre_fullinfo.c",       "pcre_get.c",          "pcre_globals.c",
+            "pcre_jit_compile.c",    "pcre_maketables.c",   "pcre_newline.c",
+            "pcre_ord2utf8.c",       "pcre_refcount.c",     "pcre_string_utils.c",
+            "pcre_study.c",          "pcre_tables.c",       "pcre_ucd.c",
+            "pcre_valid_utf8.c",     "pcre_version.c",      "pcre_xclass.c",
+        },
+    });
+
+    // libpcre.zig binding module.
+    const libpcre_mod = b.addModule("libpcre", .{
+        .root_source_file = b.path("packages/libpcre/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    libpcre_mod.linkLibrary(pcre_lib);
+    libpcre_mod.addIncludePath(b.path("packages/libpcre/pcre"));
+
+    // Koino CommonMark parser. We drop koino's HTML renderer and CLI
+    // (see packages/koino/src/koino.zig) so the only external deps
+    // are libpcre for regex and uucode for grapheme casing. uucode
+    // is already wired further down as part of the context engine.
+    const koino_mod = b.addModule("koino", .{
+        .root_source_file = b.path("packages/koino/src/koino.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    koino_mod.addImport("libpcre", libpcre_mod);
+    // Reuse the uucode instance vaxis already configured — vaxis
+    // selected a specific `fields` set at dependency time and
+    // spawning a second uucode with a different set would double
+    // the expensive generate step. The vaxis dependency re-exposes
+    // its transitive uucode dep through its builder graph, so we
+    // reach in and pull the module from vaxis's own build graph
+    // rather than instantiating a fresh one.
+    // Reuse the uucode module vaxis already built — we patched
+    // koino's strings.zig to stop asking for `simple_lowercase_mapping`
+    // (now ASCII-only via std.ascii.toLower), so its remaining uses
+    // (`general_category`, etc.) all fit the default vaxis set.
+    koino_mod.addImport("uucode", vaxis_dep.builder.dependency("uucode", .{
+        .target = target,
+        .optimize = optimize,
+        .fields = @as([]const []const u8, &.{
+            "east_asian_width",
+            "grapheme_break",
+            "general_category",
+            "is_emoji_presentation",
+        }),
+    }).module("uucode"));
+    exe_mod.addImport("koino", koino_mod);
+
     const exe = b.addExecutable(.{
         .name = "tigerclaw",
         .root_module = exe_mod,
@@ -289,6 +361,8 @@ pub fn build(b: *std.Build) void {
     unit_mod.addImport("llm_transport", llm_transport_mod);
     unit_mod.addImport("channels_spec", channels_spec_mod);
     unit_mod.addImport("memory_spec", memory_spec_mod);
+    unit_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
+    unit_mod.addImport("koino", koino_mod);
     if (provider_anthropic_mod) |m| unit_mod.addImport("provider_anthropic", m);
     if (provider_openai_mod) |m| unit_mod.addImport("provider_openai", m);
     if (provider_bedrock_mod) |m| unit_mod.addImport("provider_bedrock", m);

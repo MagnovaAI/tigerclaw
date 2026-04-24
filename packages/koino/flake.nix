@@ -1,0 +1,49 @@
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    flake-utils.url = "github:numtide/flake-utils";
+  };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+      in
+      {
+        formatter.default = pkgs.nixfmt;
+
+        packages.default = pkgs.stdenv.mkDerivation {
+          name = "koino-build";
+          src = ./.;
+
+          nativeBuildInputs = [
+            pkgs.zig
+          ];
+
+          buildPhase = ''
+            export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig"
+            zig build
+            mkdir -p $out/bin
+            mv zig-out/bin/koino $out/bin/koino
+          '';
+
+          dontInstall = true;
+        };
+
+        devShells.default = pkgs.mkShell {
+          name = "koino";
+
+          packages = [
+            pkgs.zig
+            pkgs.zls
+          ];
+        };
+      }
+    );
+}
