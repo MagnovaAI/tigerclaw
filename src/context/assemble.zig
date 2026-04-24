@@ -42,9 +42,12 @@ pub fn fit(allocator: std.mem.Allocator, input: []const t.Section, budget: u32) 
         }
     }
 
+    const sections = try kept.toOwnedSlice(allocator);
+    errdefer allocator.free(sections);
+    const dropped_slice = try dropped.toOwnedSlice(allocator);
     return .{
-        .sections = try kept.toOwnedSlice(allocator),
+        .sections = sections,
         .estimated_tokens = used,
-        .dropped = try dropped.toOwnedSlice(allocator),
+        .dropped = dropped_slice,
     };
 }
