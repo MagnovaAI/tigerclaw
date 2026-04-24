@@ -507,18 +507,23 @@ pub const Bot = struct {
 
 /// Pure helper exposed so the wire shape can be pinned in tests without
 /// standing up an HTTP client. Emits the canonical sendMessage body
-/// with `parse_mode: "Markdown"` so agent replies render `**bold**`,
-/// `*italic*`, inline code, and bullet lists in the client. Legacy
-/// Markdown (not MarkdownV2) — v2 requires escaping a long list of
-/// punctuation that LLM output routinely violates. If Telegram rejects
-/// a particular message as unparseable the outbox logs BadRequest and
-/// skips it; the dispatch queue keeps moving.
+/// Sends with `parse_mode: "MarkdownV2"`. LLM output typically uses
+/// CommonMark-flavoured markdown (`**bold**`, `*italic*`, fenced code,
+/// inline code, links, bullet lists); MarkdownV2 is a different dialect
+/// that requires every reserved punctuation character outside entities
+/// to be backslash-escaped. `toMarkdownV2` translates from the former
+/// to the latter so the client renders structured output faithfully.
+/// If Telegram still rejects a message as unparseable the outbox logs
+/// BadRequest and skips it; the dispatch queue keeps moving.
 pub fn buildSendMessageBody(
     allocator: std.mem.Allocator,
     chat_id: i64,
     text: []const u8,
     reply_to_message_id: ?i64,
 ) ![]u8 {
+    const rendered = try toMarkdownV2(allocator, text);
+    defer allocator.free(rendered);
+
     var buf: std.array_list.Aligned(u8, null) = .empty;
     defer buf.deinit(allocator);
 
@@ -528,15 +533,164 @@ pub fn buildSendMessageBody(
     try stringify.objectField("chat_id");
     try stringify.write(chat_id);
     try stringify.objectField("text");
-    try stringify.write(text);
+    try stringify.write(rendered);
     try stringify.objectField("parse_mode");
-    try stringify.write("Markdown");
+    try stringify.write("MarkdownV2");
     if (reply_to_message_id) |r| {
         try stringify.objectField("reply_to_message_id");
         try stringify.write(r);
     }
     try stringify.endObject();
     return aw.toOwnedSlice();
+}
+
+/// Telegram MarkdownV2 reserves `_*[]()~`>#+-=|{}.!` and `\` outside
+/// entities. Inside inline-code / pre spans only `` ` `` and `\` are
+/// special; inside link URLs only `)` and `\` are special. This
+/// function walks the input as a tiny CommonMark-ish tokenizer and
+/// emits MarkdownV2 in one pass.
+pub fn toMarkdownV2(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.array_list.Aligned(u8, null) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+
+        // Fenced code block: ```lang\n...\n```
+        if (c == '`' and i + 2 < text.len and text[i + 1] == '`' and text[i + 2] == '`') {
+            const after_fence = i + 3;
+            const lang_end = std.mem.indexOfScalarPos(u8, text, after_fence, '\n') orelse text.len;
+            const lang = std.mem.trim(u8, text[after_fence..lang_end], " \t\r");
+            const body_start = if (lang_end < text.len) lang_end + 1 else text.len;
+            const close = std.mem.indexOfPos(u8, text, body_start, "```") orelse text.len;
+
+            try out.appendSlice(allocator, "```");
+            try appendEscapedCode(allocator, &out, lang);
+            try out.append(allocator, '\n');
+            try appendEscapedCode(allocator, &out, text[body_start..close]);
+            if (close < text.len) {
+                try out.appendSlice(allocator, "```");
+                i = close + 3;
+            } else {
+                i = text.len;
+            }
+            continue;
+        }
+
+        // Inline code: `...`
+        if (c == '`') {
+            const end = std.mem.indexOfScalarPos(u8, text, i + 1, '`') orelse {
+                // Unterminated — treat the backtick as literal.
+                try appendEscapedText(allocator, &out, text[i .. i + 1]);
+                i += 1;
+                continue;
+            };
+            try out.append(allocator, '`');
+            try appendEscapedCode(allocator, &out, text[i + 1 .. end]);
+            try out.append(allocator, '`');
+            i = end + 1;
+            continue;
+        }
+
+        // Bold: **text** → *text*
+        if (c == '*' and i + 1 < text.len and text[i + 1] == '*') {
+            const end = std.mem.indexOfPos(u8, text, i + 2, "**") orelse {
+                try appendEscapedText(allocator, &out, text[i .. i + 1]);
+                i += 1;
+                continue;
+            };
+            try out.append(allocator, '*');
+            try appendEscapedText(allocator, &out, text[i + 2 .. end]);
+            try out.append(allocator, '*');
+            i = end + 2;
+            continue;
+        }
+
+        // Italic: *text* or _text_ (single delimiters, not adjacent to another of the same).
+        if ((c == '*' or c == '_') and i + 1 < text.len and text[i + 1] != c) {
+            const end = std.mem.indexOfScalarPos(u8, text, i + 1, c) orelse {
+                try appendEscapedText(allocator, &out, text[i .. i + 1]);
+                i += 1;
+                continue;
+            };
+            try out.append(allocator, '_');
+            try appendEscapedText(allocator, &out, text[i + 1 .. end]);
+            try out.append(allocator, '_');
+            i = end + 1;
+            continue;
+        }
+
+        // Link: [label](url)
+        if (c == '[') {
+            if (std.mem.indexOfScalarPos(u8, text, i + 1, ']')) |label_end| {
+                if (label_end + 1 < text.len and text[label_end + 1] == '(') {
+                    if (std.mem.indexOfScalarPos(u8, text, label_end + 2, ')')) |url_end| {
+                        try out.append(allocator, '[');
+                        try appendEscapedText(allocator, &out, text[i + 1 .. label_end]);
+                        try out.appendSlice(allocator, "](");
+                        try appendEscapedUrl(allocator, &out, text[label_end + 2 .. url_end]);
+                        try out.append(allocator, ')');
+                        i = url_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        try appendEscapedText(allocator, &out, text[i .. i + 1]);
+        i += 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendEscapedText(
+    allocator: std.mem.Allocator,
+    out: *std.array_list.Aligned(u8, null),
+    s: []const u8,
+) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\' => {
+                try out.append(allocator, '\\');
+                try out.append(allocator, ch);
+            },
+            else => try out.append(allocator, ch),
+        }
+    }
+}
+
+fn appendEscapedCode(
+    allocator: std.mem.Allocator,
+    out: *std.array_list.Aligned(u8, null),
+    s: []const u8,
+) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '`', '\\' => {
+                try out.append(allocator, '\\');
+                try out.append(allocator, ch);
+            },
+            else => try out.append(allocator, ch),
+        }
+    }
+}
+
+fn appendEscapedUrl(
+    allocator: std.mem.Allocator,
+    out: *std.array_list.Aligned(u8, null),
+    s: []const u8,
+) !void {
+    for (s) |ch| {
+        switch (ch) {
+            ')', '\\' => {
+                try out.append(allocator, '\\');
+                try out.append(allocator, ch);
+            },
+            else => try out.append(allocator, ch),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -610,7 +764,43 @@ test "telegram: buildSendMessageBody without reply" {
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_id\":42") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"text\":\"hi there\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "reply_to_message_id") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"parse_mode\":\"Markdown\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"parse_mode\":\"MarkdownV2\"") != null);
+}
+
+test "telegram: toMarkdownV2 escapes reserved punctuation" {
+    const out = try toMarkdownV2(testing.allocator, "hello. world!");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("hello\\. world\\!", out);
+}
+
+test "telegram: toMarkdownV2 converts **bold** to *bold*" {
+    const out = try toMarkdownV2(testing.allocator, "be **loud** now");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("be *loud* now", out);
+}
+
+test "telegram: toMarkdownV2 maps *italic* to _italic_" {
+    const out = try toMarkdownV2(testing.allocator, "be *soft* now");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("be _soft_ now", out);
+}
+
+test "telegram: toMarkdownV2 preserves inline code and escapes only ` and \\" {
+    const out = try toMarkdownV2(testing.allocator, "run `foo.bar()` now.");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("run `foo.bar()` now\\.", out);
+}
+
+test "telegram: toMarkdownV2 preserves fenced code block with lang" {
+    const out = try toMarkdownV2(testing.allocator, "```zig\nconst x = 1;\n```");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("```zig\nconst x = 1;\n```", out);
+}
+
+test "telegram: toMarkdownV2 translates links" {
+    const out = try toMarkdownV2(testing.allocator, "see [docs](https://example.com/a.b)");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("see [docs](https://example.com/a.b)", out);
 }
 
 test "telegram: buildSendMessageBody with reply id" {
