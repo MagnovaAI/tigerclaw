@@ -495,7 +495,7 @@ fn drawStatusHint(
     selected: usize,
 ) void {
     var buf: [256]u8 = undefined;
-    const hint = if (agents.len > 1)
+    const full = if (agents.len > 1)
         (std.fmt.bufPrint(
             &buf,
             "ctrl-n/p cycle agent ({d}/{d})  ·  ctrl-e pick  ·  enter send  ·  ctrl-c quit",
@@ -503,6 +503,16 @@ fn drawStatusHint(
         ) catch "ctrl-c quit")
     else
         "enter send  ·  ctrl-c quit";
+
+    // Truncate the hint to one row: `printSegment` soft-wraps into
+    // the next row by default, and the next row here is the input
+    // box's top border. A wrap would leak tail bytes into cells
+    // that the input widget doesn't paint over, leaving the `:��`
+    // artefact visible to the user.
+    const avail: usize = if (win.width > 2) @as(usize, win.width) - 2 else 0;
+    if (avail == 0) return;
+    const n = safeUtf8Take(full, avail);
+    const hint = full[0..n];
 
     _ = win.printSegment(
         .{ .text = hint, .style = palette.hint },
