@@ -241,6 +241,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
+    // Library consumers (`@import("tigerclaw")` from tests) reach
+    // the TUI widgets re-exported from \`src/root.zig\`, which
+    // transitively @import vaxis. Give the library module the
+    // vaxis import too so those paths resolve.
+    tigerclaw_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
 
     // PCRE static library: compiled from vendored C sources. Koino's
     // CommonMark parser (see packages/koino) needs a Perl-compatible
@@ -657,6 +662,7 @@ pub fn build(b: *std.Build) void {
         "e2e_eval_full_cycle_test",
         "e2e_gateway_roundtrip_test",
         "e2e_telegram_dispatch_test",
+        "tui_conversation_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});
@@ -667,6 +673,11 @@ pub fn build(b: *std.Build) void {
         });
         mod.addImport("tigerclaw", tigerclaw_mod);
         mod.addImport("build_options", build_options_mod);
+        // The TUI conversation test drives a vxfw widget directly,
+        // so it needs vaxis as a peer import alongside tigerclaw.
+        if (std.mem.eql(u8, name, "tui_conversation_test")) {
+            mod.addImport("vaxis", vaxis_dep.module("vaxis"));
+        }
         const t = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }

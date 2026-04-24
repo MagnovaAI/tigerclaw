@@ -124,17 +124,17 @@ fn onSubmit(ctx: ?*anyopaque, text: []const u8) void {
 /// loop frees them after handling. We match on event.app.name
 /// to dispatch; the pointer data is cast to the matching
 /// payload struct.
-const ue_chunk = "tui.chunk";
-const ue_tool_start = "tui.tool_start";
-const ue_tool_done = "tui.tool_done";
-const ue_done = "tui.done";
-const ue_error = "tui.error";
-const ue_tick = "tui.tick";
+pub const ue_chunk = "tui.chunk";
+pub const ue_tool_start = "tui.tool_start";
+pub const ue_tool_done = "tui.tool_done";
+pub const ue_done = "tui.done";
+pub const ue_error = "tui.error";
+pub const ue_tick = "tui.tick";
 
-const ChunkPayload = struct { text: []u8 };
-const ToolStartPayload = struct { id: []u8, name: []u8 };
-const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8 };
-const ErrorPayload = struct { message: []u8 };
+pub const ChunkPayload = struct { text: []u8 };
+pub const ToolStartPayload = struct { id: []u8, name: []u8 };
+pub const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8 };
+pub const ErrorPayload = struct { message: []u8 };
 
 /// Context the worker thread carries. Allocated on heap;
 /// worker frees on exit.
@@ -369,11 +369,16 @@ fn eventHandler(
     }
 }
 
-fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent) !void {
+pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent) !void {
     if (std.mem.eql(u8, ue.name, ue_chunk)) {
         const p: *const ChunkPayload = @ptrCast(@alignCast(ue.data.?));
-        defer self.allocator.free(p.text);
+        // Defers run LIFO: capture `text` into a local so we can
+        // free it *after* destroying the payload allocation —
+        // otherwise the reverse-order destroy runs first, then
+        // `free(p.text)` reads a dangling `p`.
+        const text_slice = p.text;
         defer self.allocator.destroy(@as(*ChunkPayload, @constCast(p)));
+        defer self.allocator.free(text_slice);
 
         // Lazily create (or reuse) an agent line at the current
         // end of history. `pending_agent_line` is set on the
@@ -392,9 +397,13 @@ fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent) !vo
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_tool_start)) {
         const p: *const ToolStartPayload = @ptrCast(@alignCast(ue.data.?));
-        defer self.allocator.free(p.id);
-        defer self.allocator.free(p.name);
+        // Capture slices before scheduling the destroy defer so
+        // the pointer is still valid when the free defers fire.
+        const id_slice = p.id;
+        const name_slice = p.name;
         defer self.allocator.destroy(@as(*ToolStartPayload, @constCast(p)));
+        defer self.allocator.free(id_slice);
+        defer self.allocator.free(name_slice);
 
         // Tool call breaks the current agent-line accumulator.
         // Subsequent chunks (post-tool) create a fresh agent
@@ -419,10 +428,13 @@ fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent) !vo
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_tool_done)) {
         const p: *const ToolDonePayload = @ptrCast(@alignCast(ue.data.?));
-        defer self.allocator.free(p.id);
-        defer self.allocator.free(p.name);
-        defer self.allocator.free(p.output);
+        const id_slice = p.id;
+        const name_slice = p.name;
+        const output_slice = p.output;
         defer self.allocator.destroy(@as(*ToolDonePayload, @constCast(p)));
+        defer self.allocator.free(id_slice);
+        defer self.allocator.free(name_slice);
+        defer self.allocator.free(output_slice);
 
         // Walk history backwards, find the matching pending line
         // (by tool_id), promote it with the output preview.
@@ -447,8 +459,9 @@ fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent) !vo
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_error)) {
         const p: *const ErrorPayload = @ptrCast(@alignCast(ue.data.?));
-        defer self.allocator.free(p.message);
+        const message_slice = p.message;
         defer self.allocator.destroy(@as(*ErrorPayload, @constCast(p)));
+        defer self.allocator.free(message_slice);
 
         var buf: [256]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, "! turn failed: {s}", .{p.message}) catch "! turn failed";

@@ -92,6 +92,16 @@ const Event = union(enum) {
 const ToolStartPayload = struct { id: []u8, name: []u8 };
 const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8 };
 
+/// Re-export of the widget namespace. Tests drive widgets like
+/// `RootWidget` directly via \`tigerclaw.tui.widgets.root\`.
+pub const widgets = struct {
+    pub const root = @import("widgets/root.zig");
+    pub const header = @import("widgets/header.zig");
+    pub const history = @import("widgets/history.zig");
+    pub const input = @import("widgets/input.zig");
+    pub const thinking = @import("widgets/thinking.zig");
+};
+
 pub const Line = struct {
     role: Role,
     text: std.ArrayList(u8),
