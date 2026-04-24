@@ -363,8 +363,20 @@ pub const LiveAgentRunner = struct {
                 .tools = &builtin_tools,
             };
 
-            const resp = owned.provider.chat(self.allocator, chat_req) catch
-                return error.InternalError;
+            // Route every provider call through `chatStream` so the
+            // sink (if the caller supplied one on `req`) sees text
+            // deltas as soon as they decode. When the caller didn't
+            // set a sink we still go through chatStream — the vtable
+            // fallback fires once at end-of-turn, same shape as the
+            // old `chat` path.
+            const resp = blk: {
+                if (req.stream_sink) |s| {
+                    break :blk owned.provider.chatStream(self.allocator, chat_req, s, req.stream_sink_ctx) catch
+                        return error.InternalError;
+                }
+                break :blk owned.provider.chat(self.allocator, chat_req) catch
+                    return error.InternalError;
+            };
             defer resp.deinit(self.allocator);
             last_stop = resp.stop_reason;
 

@@ -52,6 +52,13 @@ pub const InFlightCounter = struct {
 
 // --- AgentRunner vtable ----------------------------------------------------
 
+/// Incremental-delta callback surfaced on every text fragment the
+/// runner produces during a turn. The gateway's streaming path sets
+/// this so text flows to the HTTP client before the turn completes;
+/// callers that don't care leave both fields null and the runner
+/// degrades to end-of-turn delivery.
+pub const StreamSink = *const fn (ctx: ?*anyopaque, fragment: []const u8) void;
+
 pub const TurnRequest = struct {
     /// Opaque session identifier. Concrete impls may parse this into
     /// a (`agent_name`, `channel_id`, `conversation_key`) triple.
@@ -59,6 +66,12 @@ pub const TurnRequest = struct {
     /// User-facing message; the runner is free to augment with
     /// system prompts, tool results, etc.
     input: []const u8,
+    /// Optional per-turn text sink. When set, the runner fires
+    /// `stream_sink(stream_sink_ctx, fragment)` for every text
+    /// fragment the provider streams back. The slice is borrowed
+    /// for the duration of the call only.
+    stream_sink: ?StreamSink = null,
+    stream_sink_ctx: ?*anyopaque = null,
 };
 
 pub const TurnResult = struct {
