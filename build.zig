@@ -351,6 +351,22 @@ pub fn build(b: *std.Build) void {
     const ctx_engine_tests = b.addTest(.{ .root_module = ctx_engine_test_mod });
     test_step.dependOn(&b.addRunArtifact(ctx_engine_tests).step);
 
+    const ctx_assemble_mod = b.addModule("ctx_assemble", .{
+        .root_source_file = b.path("src/context/assemble.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctx_assemble_mod.addImport("ctx_types", ctx_types_mod);
+    const ctx_assemble_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/context_assemble_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctx_assemble_test_mod.addImport("ctx_types", ctx_types_mod);
+    ctx_assemble_test_mod.addImport("ctx_assemble", ctx_assemble_mod);
+    const ctx_assemble_tests = b.addTest(.{ .root_module = ctx_assemble_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ctx_assemble_tests).step);
+
     const capabilities_mod = b.addModule("capabilities", .{
         .root_source_file = b.path("src/capabilities.zig"),
         .target = target,
