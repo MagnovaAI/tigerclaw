@@ -144,7 +144,7 @@ pub const palette = struct {
     // Core tiger colours — reused as field values in Style below. Kept
     // in one block so tweaking the theme means editing nine numbers,
     // not nine separate Style entries.
-    const orange: vaxis.Color = .{ .rgb = .{ 0xFF, 0x8C, 0x1A } }; // tiger orange
+    pub const orange: vaxis.Color = .{ .rgb = .{ 0xFF, 0x8C, 0x1A } }; // tiger orange
     const amber: vaxis.Color = .{ .rgb = .{ 0xD9, 0x6A, 0x00 } }; // deep amber
     const cream: vaxis.Color = .{ .rgb = .{ 0xF5, 0xE6, 0xD3 } }; // warm cream
     const gold: vaxis.Color = .{ .rgb = .{ 0xFF, 0xC8, 0x57 } }; // hot gold
@@ -166,8 +166,8 @@ pub const palette = struct {
     /// Tool-call trace lines. Dim moss — enough to read but clearly
     /// subordinate to the user/agent conversation.
     pub const tool: vaxis.Style = .{ .fg = moss, .italic = true };
-    const prompt: vaxis.Style = .{ .fg = orange, .bold = true };
-    const hint: vaxis.Style = .{ .fg = smoke, .italic = true };
+    pub const prompt: vaxis.Style = .{ .fg = orange, .bold = true };
+    pub const hint: vaxis.Style = .{ .fg = smoke, .italic = true };
     const picker_border: vaxis.Style = .{ .fg = orange };
     const picker_item: vaxis.Style = .{ .fg = cream };
     const picker_item_selected: vaxis.Style = .{ .fg = stripe, .bg = orange, .bold = true };
@@ -239,16 +239,14 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
 
     var root = RootWidget.init(allocator, default_agent);
     defer root.deinit();
+    root.wireSubmit();
 
-    // Seed a demo history so the History widget has something to
-    // show during the migration. Real runner-driven history lands
-    // in a follow-up once the streaming sinks get routed through
-    // vxfw UserEvents.
+    // Seed a short welcome so the history isn't empty on first
+    // launch. Real runner-driven replies land in a follow-up
+    // once the streaming sinks get routed through vxfw
+    // UserEvents.
     try root.appendLine(.system, "agent: tiger");
-    try root.appendLine(.user, "hey");
-    try root.appendLine(.agent, "Hey there! vxfw history widget is live. Press q to quit.");
-    try root.appendLine(.tool, "get_current_time → 2026-04-24T12:05:00Z");
-    try root.appendLine(.user, "try a longer line to test wrapping, with a nice sentence that will definitely need two rows on a narrow terminal and probably three rows on something even narrower than that");
+    try root.appendLine(.agent, "Type a message and press Enter. Ctrl-C quits.");
 
     try app.run(root.widget(), .{});
 }

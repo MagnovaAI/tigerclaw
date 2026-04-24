@@ -20,6 +20,7 @@ const vxfw = vaxis.vxfw;
 const tui = @import("../root.zig");
 const Header = @import("header.zig");
 const History = @import("history.zig");
+const Input = @import("input.zig");
 
 const Root = @This();
 
@@ -31,6 +32,7 @@ header: Header,
 /// response to key presses and runner events. The History
 /// widget borrows a slice of this list per frame.
 history: std.ArrayList(tui.Line) = .empty,
+input: Input,
 
 pub fn init(allocator: std.mem.Allocator, agent_name: []const u8) Root {
     return .{
@@ -40,6 +42,7 @@ pub fn init(allocator: std.mem.Allocator, agent_name: []const u8) Root {
             .pending = false,
             .spinner_tick = 0,
         },
+        .input = Input.init(allocator),
     };
 }
 
@@ -50,6 +53,24 @@ pub fn deinit(self: *Root) void {
         l.deinitToolId(self.allocator);
     }
     self.history.deinit(self.allocator);
+    self.input.deinit();
+}
+
+/// Install the Input's submit callback. Called from runVxfw
+/// after the Root is fully constructed — the callback captures
+/// `&root` via opaque ctx so it can mutate history on Enter.
+pub fn wireSubmit(self: *Root) void {
+    self.input.on_submit = onSubmit;
+    self.input.submit_ctx = self;
+}
+
+fn onSubmit(ctx: ?*anyopaque, text: []const u8) void {
+    const self: *Root = @ptrCast(@alignCast(ctx.?));
+    if (text.len == 0) return;
+    // Append the typed text as a user line. The runner
+    // integration that fires a turn in response lands in a
+    // follow-up; for now Enter is just visible feedback.
+    self.appendLine(.user, text) catch {};
 }
 
 /// Append a plain text line to the history, taking ownership
@@ -78,17 +99,24 @@ fn eventHandler(
     ctx: *vxfw.EventContext,
     event: vxfw.Event,
 ) anyerror!void {
-    _ = ptr;
+    const self: *Root = @ptrCast(@alignCast(ptr));
     switch (event) {
         .key_press => |key| {
-            // Ctrl-C / Ctrl-Q / lowercase q all quit.
+            // Hard-quit chord: Ctrl-C / Ctrl-Q. Plain `q`
+            // no longer quits now that the input box is live —
+            // it's a valid character to type in a message.
             if (key.matches('c', .{ .ctrl = true }) or
-                key.matches('q', .{ .ctrl = true }) or
-                key.matches('q', .{}))
+                key.matches('q', .{ .ctrl = true }))
             {
                 ctx.quit = true;
                 return;
             }
+            // Everything else is forwarded to the input widget's
+            // handler. vxfw's focus system would do this
+            // automatically once we call `request_focus` — we're
+            // manually bridging for now since Root is the only
+            // widget receiving events.
+            try self.input.widget().handleEvent(ctx, event);
         },
         .winsize => ctx.redraw = true,
         .init => ctx.redraw = true,
@@ -101,12 +129,15 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     const width = ctx.max.width orelse 0;
     const height = ctx.max.height orelse 0;
 
-    // Root surface spans the full terminal. Two children:
-    //   [0] HeaderWidget  — top 2 rows
-    //   [1] HistoryWidget — between header and the bottom footer
-    // The input box + picker lands in a follow-up; for now the
-    // history pane runs to the bottom of the screen.
-    const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
+    // Layout (top → bottom):
+    //   rows 0..1       header (2 rows)
+    //   rows 2..h-4     history (remaining minus input)
+    //   rows h-3..h-1   input box (3 rows: top border, text, bottom border)
+    const header_rows: u16 = 2;
+    const input_rows: u16 = 3;
+    const history_rows: u16 = if (height > header_rows + input_rows) height - header_rows - input_rows else 0;
+
+    const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
     const surface = try vxfw.Surface.initWithChildren(
         ctx.arena,
         self.widget(),
@@ -117,7 +148,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     // Header.
     const header_surface = try self.header.widget().draw(ctx.withConstraints(
         .{ .width = 0, .height = 0 },
-        .{ .width = width, .height = 2 },
+        .{ .width = width, .height = header_rows },
     ));
     surface.children[0] = .{
         .origin = .{ .row = 0, .col = 0 },
@@ -125,19 +156,28 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
         .z_index = 0,
     };
 
-    // History. Starts at row 2, fills to the bottom of the pane.
-    // Add a 1-cell side margin on each edge so lines don't kiss
-    // the terminal border.
-    const history_height: u16 = if (height > 2) height - 2 else 0;
+    // History with 1-cell side margin.
     const history_width: u16 = if (width > 2) width - 2 else width;
     const history_view: History = .{ .lines = self.history.items };
     const history_surface = try history_view.widget().draw(ctx.withConstraints(
         .{ .width = 0, .height = 0 },
-        .{ .width = history_width, .height = history_height },
+        .{ .width = history_width, .height = history_rows },
     ));
     surface.children[1] = .{
-        .origin = .{ .row = 2, .col = 1 },
+        .origin = .{ .row = @intCast(header_rows), .col = 1 },
         .surface = history_surface,
+        .z_index = 0,
+    };
+
+    // Input at the bottom. Full width; the widget draws its own
+    // border.
+    const input_surface = try self.input.widget().draw(ctx.withConstraints(
+        .{ .width = 0, .height = 0 },
+        .{ .width = width, .height = input_rows },
+    ));
+    surface.children[2] = .{
+        .origin = .{ .row = @intCast(height - input_rows), .col = 0 },
+        .surface = input_surface,
         .z_index = 0,
     };
 
