@@ -277,39 +277,108 @@ pub const LiveAgentRunner = struct {
             });
         }
 
-        const chat_req: llm.provider.ChatRequest = .{
-            .messages = messages.items,
-            .model = .{ .provider = @tagName(self.provider_kind), .model = self.model },
-            .system = self.system_prompt,
-            .max_output_tokens = 1024,
-        };
+        // Dispatch loop: the model may answer with tool_use instead of
+        // a final reply. Execute each tool locally, ingest the
+        // assistant + tool messages into history, and call the
+        // provider again. Cap the round-trip count so a malformed or
+        // persistently tool-using model can't wedge the request.
+        const max_tool_rounds: u8 = 3;
+        var round: u8 = 0;
+        var final_text: []u8 = &.{};
+        errdefer self.allocator.free(final_text);
+        var last_stop: types.StopReason = .end_turn;
 
-        const resp = owned.provider.chat(self.allocator, chat_req) catch
-            return error.InternalError;
-        defer if (resp.text) |t| self.allocator.free(t);
+        while (round < max_tool_rounds) : (round += 1) {
+            const chat_req: llm.provider.ChatRequest = .{
+                .messages = messages.items,
+                .model = .{ .provider = @tagName(self.provider_kind), .model = self.model },
+                .system = self.system_prompt,
+                .max_output_tokens = 1024,
+                .tools = &builtin_tools,
+            };
 
-        const text = resp.text orelse "";
-        // Take ownership of the response text so the handler can borrow
-        // it past the provider's lifetime.
-        self.last_output = self.allocator.dupe(u8, text) catch return error.OutOfMemory;
+            const resp = owned.provider.chat(self.allocator, chat_req) catch
+                return error.InternalError;
+            defer resp.deinit(self.allocator);
+            last_stop = resp.stop_reason;
 
-        // Record the assistant reply so it carries into the next turn.
-        if (text.len > 0) {
-            const asst_msg_id = self.nextMessageId() catch return error.OutOfMemory;
-            defer self.allocator.free(asst_msg_id);
-            _ = self.context_engine.engine().vtable.ingest(
-                &context_bundle,
-                self.context_engine.engine().ptr,
-                .{
-                    .session_id = req.session_id,
-                    .message_id = asst_msg_id,
-                    .role = .assistant,
-                    .content = text,
-                },
-            ) catch return error.InternalError;
+            const text = resp.text orelse "";
+
+            // Record whatever the assistant said (text and/or the
+            // tool-use intent). The default engine only stores the
+            // text, so we serialise a concise tool-call marker so the
+            // assistant turn is not lost on the next assemble call.
+            if (text.len > 0 or resp.tool_calls.len > 0) {
+                const marker = try renderAssistantTurn(self.allocator, text, resp.tool_calls);
+                defer self.allocator.free(marker);
+                const asst_msg_id = try self.nextMessageId();
+                defer self.allocator.free(asst_msg_id);
+                _ = self.context_engine.engine().vtable.ingest(
+                    &context_bundle,
+                    self.context_engine.engine().ptr,
+                    .{
+                        .session_id = req.session_id,
+                        .message_id = asst_msg_id,
+                        .role = .assistant,
+                        .content = marker,
+                    },
+                ) catch return error.InternalError;
+            }
+
+            if (resp.tool_calls.len == 0) {
+                self.allocator.free(final_text);
+                final_text = try self.allocator.dupe(u8, text);
+                break;
+            }
+
+            // Execute each tool, ingest the result as a tool-role
+            // message, and feed it back on the next round via the
+            // assembled messages slice.
+            messages.appendAssumeCapacity(.{
+                .role = .assistant,
+                .content = text,
+            });
+            for (resp.tool_calls) |tc| {
+                const result_text = dispatchBuiltinTool(
+                    self.allocator,
+                    clock_value,
+                    tc.name,
+                    tc.arguments_json,
+                ) catch |e| blk: {
+                    break :blk std.fmt.allocPrint(
+                        self.allocator,
+                        "tool {s} failed: {s}",
+                        .{ tc.name, @errorName(e) },
+                    ) catch return error.OutOfMemory;
+                };
+                defer self.allocator.free(result_text);
+
+                const tool_msg_id = try self.nextMessageId();
+                defer self.allocator.free(tool_msg_id);
+                _ = self.context_engine.engine().vtable.ingest(
+                    &context_bundle,
+                    self.context_engine.engine().ptr,
+                    .{
+                        .session_id = req.session_id,
+                        .message_id = tool_msg_id,
+                        .role = .tool,
+                        .content = result_text,
+                    },
+                ) catch return error.InternalError;
+
+                // Append to the in-flight message list too — the next
+                // `chat()` call sends whatever this slice contains,
+                // without re-running assemble. That keeps tool round
+                // trips inside one turn.
+                try messages.append(self.allocator, .{
+                    .role = .tool,
+                    .content = try self.allocator.dupe(u8, result_text),
+                });
+            }
         }
 
-        return .{ .output = self.last_output, .completed = resp.stop_reason != .refusal };
+        self.last_output = final_text;
+        return .{ .output = self.last_output, .completed = last_stop != .refusal };
     }
 
     /// Allocate a unique message id of the form `"msg-<counter>"`.
@@ -333,6 +402,88 @@ pub const LiveAgentRunner = struct {
         };
     }
 };
+
+/// The tool schemas the runner exposes to every agent. For now this
+/// is a hard-coded one-entry list; a real registry is future work.
+const builtin_tools = [_]types.Tool{
+    .{
+        .name = "get_current_time",
+        .description = "Return the current date and time as an ISO-8601 UTC string (for example `2026-04-23T23:45:12Z`). Takes no arguments.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+    },
+};
+
+/// Execute a built-in tool by name. Returns caller-owned text; errors
+/// bubble so the runner can record the failure as the tool result.
+fn dispatchBuiltinTool(
+    allocator: std.mem.Allocator,
+    clock: clock_mod.Clock,
+    name: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
+    _ = arguments_json; // only one tool, ignores args.
+    if (std.mem.eql(u8, name, "get_current_time")) {
+        return renderCurrentTimeIso8601(allocator, clock.nowNs());
+    }
+    return error.UnknownTool;
+}
+
+/// Format nanoseconds-since-epoch as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+/// Uses Howard Hinnant's `civil_from_days` algorithm so no libc tz
+/// dependency is needed and the result is stable across platforms.
+fn renderCurrentTimeIso8601(allocator: std.mem.Allocator, now_ns: i128) ![]u8 {
+    const secs: i64 = @intCast(@divTrunc(now_ns, std.time.ns_per_s));
+    const days: i64 = @divFloor(secs, 86_400);
+    const secs_of_day: i64 = @mod(secs, 86_400);
+    const hh: u8 = @intCast(@divTrunc(secs_of_day, 3600));
+    const mm: u8 = @intCast(@divTrunc(@mod(secs_of_day, 3600), 60));
+    const ss: u8 = @intCast(@mod(secs_of_day, 60));
+
+    const d0 = days + 719_468;
+    const era: i64 = if (d0 >= 0) @divFloor(d0, 146_097) else @divFloor(d0 - 146_096, 146_097);
+    const doe: u32 = @intCast(d0 - era * 146_097);
+    const yoe: u32 = (doe -% @divFloor(doe, 1460) +% @divFloor(doe, 36_524) -% @divFloor(doe, 146_096)) / 365;
+    const y: i64 = @as(i64, yoe) + era * 400;
+    const doy: u32 = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp: u32 = (5 * doy + 2) / 153;
+    const d: u32 = doy - (153 * mp + 2) / 5 + 1;
+    const m: u32 = if (mp < 10) mp + 3 else mp - 9;
+    const year: i64 = if (m <= 2) y + 1 else y;
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
+        .{ year, m, d, hh, mm, ss },
+    );
+}
+
+/// Produce a single-string representation of an assistant turn that
+/// contains both text and (optionally) tool_use intents. The context
+/// engine stores each ingested message as a flat string; this marker
+/// keeps enough detail that future assemble calls can reproduce the
+/// turn's intent to the model.
+fn renderAssistantTurn(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    tool_calls: []const types.ToolCall,
+) ![]u8 {
+    if (tool_calls.len == 0) return allocator.dupe(u8, text);
+
+    var buf: std.array_list.Aligned(u8, null) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, text);
+    for (tool_calls) |tc| {
+        if (buf.items.len > 0) try buf.append(allocator, '\n');
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "[tool_call {s} {s}({s})]",
+            .{ tc.id, tc.name, tc.arguments_json },
+        );
+        defer allocator.free(line);
+        try buf.appendSlice(allocator, line);
+    }
+    return buf.toOwnedSlice(allocator);
+}
 
 /// Parsed agent manifest. `model` is heap-allocated; caller owns.
 const AgentManifest = struct {
@@ -552,6 +703,43 @@ test "context engine: assemble returns prior turns in session order" {
     try testing.expect(saw_user_hello);
     try testing.expect(saw_asst_hi);
     try testing.expect(saw_prompt);
+}
+
+test "renderCurrentTimeIso8601: fixed timestamp renders canonically" {
+    const ns: i128 = 1_609_556_645 * @as(i128, std.time.ns_per_s);
+    const out = try renderCurrentTimeIso8601(testing.allocator, ns);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("2021-01-02T03:04:05Z", out);
+}
+
+test "dispatchBuiltinTool: get_current_time matches renderCurrentTimeIso8601" {
+    var fc = clock_mod.FixedClock{ .value_ns = 1_609_556_645 * @as(i128, std.time.ns_per_s) };
+    const out = try dispatchBuiltinTool(testing.allocator, fc.clock(), "get_current_time", "{}");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("2021-01-02T03:04:05Z", out);
+}
+
+test "dispatchBuiltinTool: unknown name returns UnknownTool" {
+    var fc = clock_mod.FixedClock{ .value_ns = 0 };
+    try testing.expectError(
+        error.UnknownTool,
+        dispatchBuiltinTool(testing.allocator, fc.clock(), "no_such_tool", "{}"),
+    );
+}
+
+test "renderAssistantTurn: text only passes through unchanged" {
+    const out = try renderAssistantTurn(testing.allocator, "hello", &.{});
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("hello", out);
+}
+
+test "renderAssistantTurn: adds bracketed markers for tool calls" {
+    const calls = [_]types.ToolCall{
+        .{ .id = "call_1", .name = "get_current_time", .arguments_json = "{}" },
+    };
+    const out = try renderAssistantTurn(testing.allocator, "", &calls);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("[tool_call call_1 get_current_time({})]", out);
 }
 
 test "context engine: sessions are isolated" {
