@@ -85,6 +85,11 @@ const Line = struct {
     /// markdown; streaming in progress keeps this null so the
     /// renderer falls back to a flat style.
     spans: ?[]md.Span = null,
+    /// Set on `tool` lines only — the Anthropic tool-call id the
+    /// line represents. `turn_tool_done` uses this to find its
+    /// matching pending line and promote it to the done state
+    /// without having to pattern-match on rendered text.
+    tool_id: ?[]u8 = null,
 
     fn deinitSpans(self: *Line, allocator: std.mem.Allocator) void {
         if (self.spans) |s| {
@@ -93,7 +98,14 @@ const Line = struct {
         }
     }
 
-    const Role = enum { user, agent, system };
+    fn deinitToolId(self: *Line, allocator: std.mem.Allocator) void {
+        if (self.tool_id) |id| {
+            allocator.free(id);
+            self.tool_id = null;
+        }
+    }
+
+    const Role = enum { user, agent, system, tool };
 };
 
 pub const Options = struct {
@@ -120,6 +132,9 @@ const palette = struct {
     const user: vaxis.Style = .{ .fg = .{ .index = 117 }, .bold = true };
     const agent: vaxis.Style = .{ .fg = .{ .index = 252 } };
     const system: vaxis.Style = .{ .fg = .{ .index = 244 }, .italic = true };
+    /// Tool-call trace lines. Dim cyan so they read as metadata
+    /// alongside the user/agent conversation, not as a reply.
+    const tool: vaxis.Style = .{ .fg = .{ .index = 108 }, .italic = true };
     const prompt: vaxis.Style = .{ .fg = .{ .index = 45 }, .bold = true };
     const hint: vaxis.Style = .{ .fg = .{ .index = 240 }, .italic = true };
     const picker_border: vaxis.Style = .{ .fg = .{ .index = 45 } };
@@ -190,6 +205,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
         for (history.items) |*l| {
             l.text.deinit(allocator);
             l.deinitSpans(allocator);
+            l.deinitToolId(allocator);
         }
         history.deinit(allocator);
     }
@@ -340,16 +356,62 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                 }
             },
             .turn_tool_start => |ts| {
-                // Commit 5 will render a pending tool line. For now
-                // we only own+free the payload so the wire path
-                // works end-to-end without leaking.
-                allocator.free(ts.id);
-                allocator.free(ts.name);
+                // Append a dim "pending" line before the next chunk
+                // lands. The line's `tool_id` is held so
+                // `turn_tool_done` can promote it in place.
+                defer allocator.free(ts.name);
+                errdefer allocator.free(ts.id);
+
+                var text: std.ArrayList(u8) = .empty;
+                errdefer text.deinit(allocator);
+                try text.appendSlice(allocator, "\u{21BB} ");
+                try text.appendSlice(allocator, ts.name);
+                try text.appendSlice(allocator, "   (pending)");
+
+                try history.append(allocator, .{
+                    .role = .tool,
+                    .text = text,
+                    .tool_id = ts.id,
+                });
             },
             .turn_tool_done => |td| {
-                allocator.free(td.id);
-                allocator.free(td.name);
-                allocator.free(td.output);
+                defer allocator.free(td.id);
+                defer allocator.free(td.name);
+                defer allocator.free(td.output);
+
+                // Find the most recent matching pending tool line.
+                // Walking backwards keeps the cost tiny in practice
+                // (the pending line is normally the last thing we
+                // appended before this event fires).
+                var match_idx: ?usize = null;
+                var i: usize = history.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const entry = &history.items[i];
+                    if (entry.role != .tool) continue;
+                    if (entry.tool_id) |id| {
+                        if (std.mem.eql(u8, id, td.id)) {
+                            match_idx = i;
+                            break;
+                        }
+                    }
+                }
+
+                if (match_idx) |idx| {
+                    var line = &history.items[idx];
+                    line.text.clearRetainingCapacity();
+                    try line.text.appendSlice(allocator, "\u{21BB} ");
+                    try line.text.appendSlice(allocator, td.name);
+                    try line.text.appendSlice(allocator, " \u{2192} ");
+                    // Cap the output preview so a noisy tool result
+                    // doesn't wreck the UI; the full output is still
+                    // in the agent's conversation context.
+                    const max_preview: usize = 80;
+                    const take = safeUtf8Take(td.output, max_preview);
+                    try line.text.appendSlice(allocator, td.output[0..take]);
+                    if (take < td.output.len) try line.text.appendSlice(allocator, "\u{2026}");
+                    line.deinitToolId(allocator);
+                }
             },
             .turn_done => {
                 if (!pending_saw_text) {
@@ -764,6 +826,7 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
             .user => "› ",
             .agent => "‹ ",
             .system => "· ",
+            .tool => "  ",
         };
 
         const width: usize = @intCast(pane.width);
@@ -795,6 +858,7 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
             .user => palette.user,
             .agent => palette.agent,
             .system => palette.system,
+            .tool => palette.tool,
         };
 
         var row = start_row;
