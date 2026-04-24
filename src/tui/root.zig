@@ -50,9 +50,7 @@ test {
     // Force body compilation of every vxfw widget in the subset
     // we plan to migrate onto, so any 0.16 API regression in
     // packages/vaxis/src/vxfw surfaces here at build time instead
-    // of blowing up mid-refactor. Taking a function pointer inside
-    // a non-dead test branch counts as a "use" for Zig's lazy
-    // analysis and pulls the body in.
+    // of blowing up mid-refactor.
     _ = &vxfw.App.init;
     _ = &vxfw.App.run;
     _ = &vxfw.FlexColumn.draw;
@@ -60,6 +58,9 @@ test {
     _ = &vxfw.Border.draw;
     _ = &vxfw.Padding.draw;
     _ = &vxfw.Spinner.draw;
+    // Pull the vxfw smoke test's public fn into the compile graph
+    // too, so any widget wiring we add there surfaces at build time.
+    _ = &@import("vxfw_hello.zig").run;
 }
 
 const Event = union(enum) {
