@@ -483,13 +483,16 @@ pub fn runGateway(
     if (opts.home_path.len > 0 or opts.workspace_path.len > 0) {
         if (agents_loader.load(allocator, io, opts.workspace_path, opts.home_path)) |loaded| {
             loaded_agents_opt = loaded;
-            gw_log.info("agents loader: {d} agents loaded, default={s}", .{
+            // Demoted to debug: the banner below already reports the
+            // loaded agents + default. Surfacing these as info pushed
+            // them above the banner in stderr / stdout interleaving.
+            gw_log.debug("agents loader: {d} agents loaded, default={s}", .{
                 loaded.config.entries.len,
                 loaded.config.default,
             });
             if (harness_agent_registry.build(allocator, loaded.config)) |built| {
                 harness_registry_opt = built;
-                gw_log.info("agents registry built with {d} entries", .{built.entries.len});
+                gw_log.debug("agents registry built with {d} entries", .{built.entries.len});
             } else |err| {
                 gw_log.warn("agents registry build failed: {s}", .{@errorName(err)});
             }
@@ -572,6 +575,10 @@ pub fn runGateway(
         .verbose = opts.verbose,
         .color = opts.color,
     });
+    // Flush stdout so the banner lands before any subsequent stderr
+    // log lines — the two streams are buffered independently and the
+    // terminal can otherwise interleave them out of order.
+    out.flush() catch {};
 
     // Post-banner diagnostics. Warnings surface regardless of
     // verbose; the per-agent dump only fires under `--verbose`
@@ -687,6 +694,14 @@ pub fn runStop(
         return error.NotRunning;
     }
 
+    // Wake any suspended (Ctrl-Z'd, SIGSTOP'd) process before
+    // signalling: a stopped process can only receive SIGKILL and
+    // SIGCONT, so SIGTERM would be queued but never delivered,
+    // leading to a five-second wait followed by a forced SIGKILL.
+    // Sending SIGCONT to a non-stopped process is a no-op; swallow
+    // any error from a race where the pid just exited.
+    std.posix.kill(pid, std.posix.SIG.CONT) catch {};
+
     const first_sig = if (opts.force)
         std.posix.SIG.KILL
     else
@@ -735,39 +750,32 @@ pub fn runStop(
     return error.Timeout;
 }
 
-/// Return `true` when `host:port` has anything accepting TCP. We
-/// reuse the CLI's HTTP client against `/health` so the probe
-/// travels the same code path as a regular verb and any answering
-/// listener — gateway, stranger, or half-dead daemon — reads as
-/// "live". Only `GatewayDown` (ConnectionRefused twice) counts as
-/// absent; everything else (2xx, 4xx, 5xx, malformed response,
-/// timeout) proves someone is there.
+/// Return `true` when `host:port` has anything accepting TCP. We use
+/// a raw `connect(2)` with a short timeout rather than an HTTP GET —
+/// a suspended (SIGSTOP'd) daemon leaves the kernel accept queue
+/// functional, so `connect` succeeds, but it never answers `recv`,
+/// which would hang an HTTP probe indefinitely. Connecting alone
+/// answers the "is anything bound?" question in milliseconds.
 fn probeGatewayPort(
     allocator: std.mem.Allocator,
     io: std.Io,
     host: []const u8,
     port: u16,
 ) bool {
-    var url_buf: [128]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://{s}:{d}/health", .{ host, port }) catch
-        return false;
-
-    const r = http_client.send(
-        allocator,
-        io,
-        .{ .method = .GET, .url = url },
-        null,
-        // Short retry: the whole point of the probe is to be snappy,
-        // not to wait out a legitimately-starting daemon.
-        .{ .retry_delay_ns = 10 * std.time.ns_per_ms },
-    );
-    return if (r) |_| true else |err| switch (err) {
-        error.GatewayDown => false,
-        // Anything else (Unauthorized / BadRequest / InternalError /
-        // InvalidResponse / OutOfMemory) means the socket accepted
-        // — which is all we care about here.
-        else => true,
-    };
+    _ = allocator;
+    const address = std.Io.net.IpAddress.parse(host, port) catch return false;
+    // No explicit timeout: Zig 0.16's posix Io has not implemented
+    // netConnectIpPosix with a timeout, and this probe targets localhost
+    // where the kernel returns ECONNREFUSED immediately if the port is
+    // unbound. A hanging connect is not a concern here.
+    const stream = address.connect(io, .{
+        .mode = .stream,
+    }) catch return false;
+    // Immediately close — we only cared whether the three-way
+    // handshake completed. Nothing to read or write.
+    var s = stream;
+    s.close(io);
+    return true;
 }
 
 // --- tests -----------------------------------------------------------------
