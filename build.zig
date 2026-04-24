@@ -410,12 +410,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // ctx_types references wire `types` for the structured
+    // `ContentBlock` slice on `Section.blocks` / `IngestParams.blocks`.
+    ctx_types_mod.addImport("types", types_mod);
     const ctx_types_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/context_types_test.zig"),
         .target = target,
         .optimize = optimize,
     });
     ctx_types_test_mod.addImport("ctx_types", ctx_types_mod);
+    ctx_types_test_mod.addImport("types", types_mod);
     const ctx_types_tests = b.addTest(.{ .root_module = ctx_types_test_mod });
     test_step.dependOn(&b.addRunArtifact(ctx_types_tests).step);
 
@@ -530,6 +534,9 @@ pub fn build(b: *std.Build) void {
     ctx_default_engine_mod.addImport("ctx_assemble", ctx_assemble_mod);
     ctx_default_engine_mod.addImport("ctx_compact", ctx_compact_mod);
     ctx_default_engine_mod.addImport("context", context_mod);
+    // Default engine persists structured ContentBlocks alongside the
+    // flat-text view, so it needs the wire `types` module.
+    ctx_default_engine_mod.addImport("types", types_mod);
 
     const ctx_root_mod = b.addModule("ctx_root", .{
         .root_source_file = b.path("src/context/root.zig"),

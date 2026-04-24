@@ -1,5 +1,6 @@
 const std = @import("std");
 const t = @import("ctx_types");
+const wire_types = @import("types");
 const engine_mod = @import("ctx_engine");
 const assemble = @import("ctx_assemble");
 const compact = @import("ctx_compact");
@@ -7,12 +8,65 @@ const context_mod = @import("context");
 const Context = context_mod.Context;
 
 /// A stored message entry. All string fields are owned (duped).
+/// `blocks`, when non-null, owns its outer slice and every inner
+/// allocation per the ContentBlock variant. `content` always
+/// holds a flat-text view for legacy consumers.
 const StoredMsg = struct {
     session_id: []const u8,
     message_id: []const u8,
     role: t.Role,
     content: []const u8,
+    blocks: ?[]wire_types.ContentBlock = null,
 };
+
+/// Free everything a `StoredMsg.blocks` owns. Mirrors
+/// `wire_types.Message.freeOwned` but operates on the engine's
+/// `[]ContentBlock` slice directly.
+fn freeStoredBlocks(allocator: std.mem.Allocator, blocks: []wire_types.ContentBlock) void {
+    for (blocks) |b| {
+        switch (b) {
+            .text => |s| allocator.free(s),
+            .tool_use => |tu| {
+                allocator.free(tu.id);
+                allocator.free(tu.name);
+                allocator.free(tu.input_json);
+            },
+            .tool_result => |tr| {
+                allocator.free(tr.tool_use_id);
+                allocator.free(tr.content);
+            },
+        }
+    }
+    allocator.free(blocks);
+}
+
+/// Deep-copy a slice of ContentBlocks into `allocator`. The returned
+/// slice owns every inner allocation per variant.
+fn dupeBlocks(
+    allocator: std.mem.Allocator,
+    src: []const wire_types.ContentBlock,
+) ![]wire_types.ContentBlock {
+    const out = try allocator.alloc(wire_types.ContentBlock, src.len);
+    var written: usize = 0;
+    errdefer freeStoredBlocks(allocator, out[0..written]);
+    for (src) |b| {
+        out[written] = switch (b) {
+            .text => |s| .{ .text = try allocator.dupe(u8, s) },
+            .tool_use => |tu| .{ .tool_use = .{
+                .id = try allocator.dupe(u8, tu.id),
+                .name = try allocator.dupe(u8, tu.name),
+                .input_json = try allocator.dupe(u8, tu.input_json),
+            } },
+            .tool_result => |tr| .{ .tool_result = .{
+                .tool_use_id = try allocator.dupe(u8, tr.tool_use_id),
+                .content = try allocator.dupe(u8, tr.content),
+                .is_error = tr.is_error,
+            } },
+        };
+        written += 1;
+    }
+    return out;
+}
 
 pub const DefaultEngine = struct {
     allocator: std.mem.Allocator,
@@ -47,6 +101,7 @@ pub const DefaultEngine = struct {
             self.allocator.free(m.session_id);
             self.allocator.free(m.message_id);
             self.allocator.free(m.content);
+            if (m.blocks) |bs| freeStoredBlocks(self.allocator, bs);
         }
         self.messages.deinit(self.allocator);
         self.markers.deinit();
@@ -88,11 +143,19 @@ pub const DefaultEngine = struct {
         errdefer self.allocator.free(mid);
         const cnt = try self.allocator.dupe(u8, params.content);
         errdefer self.allocator.free(cnt);
+        // Deep-copy structured blocks if the caller provided any —
+        // the engine owns them through `dispose`.
+        const owned_blocks: ?[]wire_types.ContentBlock = if (params.blocks) |bs|
+            try dupeBlocks(self.allocator, bs)
+        else
+            null;
+        errdefer if (owned_blocks) |bs| freeStoredBlocks(self.allocator, bs);
         try self.messages.append(self.allocator, .{
             .session_id = sid,
             .message_id = mid,
             .role = params.role,
             .content = cnt,
+            .blocks = owned_blocks,
         });
         return .{ .ingested = true };
     }
@@ -104,6 +167,11 @@ pub const DefaultEngine = struct {
 
         // Emit one history_turn section per stored message for this session,
         // skipping any message_id that falls inside a compaction marker range.
+        // Pass `m.blocks` through verbatim — the runner reads it on
+        // replay to reconstruct structured assistant tool_use /
+        // user tool_result wire shapes. The slice is borrowed from
+        // the stored message; the runner must finish consuming
+        // the assemble result before the engine deallocates.
         for (self.messages.items) |m| {
             if (!std.mem.eql(u8, m.session_id, params.session_id)) continue;
             if (self.markers.covers(m.message_id)) continue;
@@ -111,6 +179,7 @@ pub const DefaultEngine = struct {
                 .kind = .history_turn,
                 .role = m.role,
                 .content = m.content,
+                .blocks = m.blocks,
                 .priority = 50,
                 .token_estimate = estimateTokens(m.content),
                 .tags = &.{},

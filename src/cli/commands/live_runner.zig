@@ -360,17 +360,17 @@ pub const LiveAgentRunner = struct {
             // `current_prompt` duplicates the user message we just
             // ingested; skip it rather than send the same text twice.
             if (section.kind == .current_prompt) continue;
-            // The context engine stores history as flat strings (text
-            // only). Wrap each section in a single text block until
-            // the engine learns to persist structured content.
-            // History replay therefore loses tool_use/tool_result
-            // structure — the model only sees a serialized text
-            // marker. Fixing this is the next refactor phase.
-            try messages.append(self.allocator, try types.Message.allocText(
-                self.allocator,
-                mapRole(section.role),
-                section.content,
-            ));
+            // Prefer the engine's structured blocks when present —
+            // those preserve tool_use / tool_result linkage across
+            // turns. Fall back to wrapping flat content in a single
+            // text block for legacy text-only sections (system
+            // preamble, channel state, plain user/assistant turns
+            // ingested without structured blocks).
+            const msg = if (section.blocks) |bs|
+                try messageFromBlocks(self.allocator, mapRole(section.role), bs)
+            else
+                try types.Message.allocText(self.allocator, mapRole(section.role), section.content);
+            try messages.append(self.allocator, msg);
         }
 
         // Dispatch loop: the model may answer with tool_use instead of
@@ -414,12 +414,39 @@ pub const LiveAgentRunner = struct {
             const text = resp.text orelse "";
 
             // Record whatever the assistant said (text and/or the
-            // tool-use intent). The default engine only stores the
-            // text, so we serialise a concise tool-call marker so the
-            // assistant turn is not lost on the next assemble call.
+            // tool-use intent). We persist BOTH a flat-text marker
+            // (for legacy text-only consumers) AND the structured
+            // ContentBlock slice (for the runner to replay verbatim
+            // on the next turn). Persisting structured blocks is
+            // what closes the multi-turn loop — without it, history
+            // replay loses the tool_use_id link and the model can't
+            // correlate its own calls with the next turn's
+            // tool_result blocks.
             if (text.len > 0 or resp.tool_calls.len > 0) {
                 const marker = try renderAssistantTurn(self.allocator, text, resp.tool_calls);
                 defer self.allocator.free(marker);
+
+                // Build a borrowed view of the assistant blocks for
+                // the engine to deep-copy. Stack-style — the engine
+                // owns the persistent copy after `ingest` returns.
+                const has_text = text.len > 0;
+                const block_count = (if (has_text) @as(usize, 1) else 0) + resp.tool_calls.len;
+                const ingest_blocks = try self.allocator.alloc(types.ContentBlock, block_count);
+                defer self.allocator.free(ingest_blocks);
+                var ibi: usize = 0;
+                if (has_text) {
+                    ingest_blocks[ibi] = .{ .text = text };
+                    ibi += 1;
+                }
+                for (resp.tool_calls) |tc| {
+                    ingest_blocks[ibi] = .{ .tool_use = .{
+                        .id = tc.id,
+                        .name = tc.name,
+                        .input_json = tc.arguments_json,
+                    } };
+                    ibi += 1;
+                }
+
                 const asst_msg_id = try self.nextMessageId();
                 defer self.allocator.free(asst_msg_id);
                 _ = self.context_engine.engine().vtable.ingest(
@@ -430,6 +457,7 @@ pub const LiveAgentRunner = struct {
                         .message_id = asst_msg_id,
                         .role = .assistant,
                         .content = marker,
+                        .blocks = ingest_blocks,
                     },
                 ) catch return error.InternalError;
             }
@@ -521,20 +549,27 @@ pub const LiveAgentRunner = struct {
                     s(req.tool_event_sink_ctx, .finished, tc.id, tc.name, result_text);
                 }
 
-                // Persist the result in the context engine for
-                // future-turn replay. The engine still stores flat
-                // strings; we lose the structured tool_use_id link
-                // until the engine learns structured persistence.
+                // Persist the result with both a flat-text view AND
+                // a structured tool_result block. The structured
+                // block carries the tool_use_id so future turns can
+                // correlate it back to the assistant's tool_use
+                // call from this round.
                 const tool_msg_id = try self.nextMessageId();
                 defer self.allocator.free(tool_msg_id);
+                const ingest_tr_blocks = [_]types.ContentBlock{.{ .tool_result = .{
+                    .tool_use_id = tc.id,
+                    .content = result_text,
+                    .is_error = tool_failed,
+                } }};
                 _ = self.context_engine.engine().vtable.ingest(
                     &context_bundle,
                     self.context_engine.engine().ptr,
                     .{
                         .session_id = req.session_id,
                         .message_id = tool_msg_id,
-                        .role = .user,
+                        .role = .tool,
                         .content = result_text,
+                        .blocks = &ingest_tr_blocks,
                     },
                 ) catch return error.InternalError;
 
@@ -584,12 +619,10 @@ pub const LiveAgentRunner = struct {
     }
 
     /// Map context-engine Role to the LLM wire Role. The engine
-    /// has a `.tool` category for past tool results (still stored
-    /// as flat strings); on replay we collapse it to `.user`
-    /// because the wire shape no longer has a tool role — tool
-    /// results live as `tool_result` content blocks on user
-    /// messages. Until the engine learns structured persistence
-    /// the model sees tool results as plain user-role text.
+    /// has a `.tool` category for past tool results; on replay we
+    /// collapse it to `.user` because the wire shape no longer has
+    /// a tool role — tool results live as `tool_result` content
+    /// blocks on user messages.
     fn mapRole(r: context_root.types.Role) types.Role {
         return switch (r) {
             .system => .system,
@@ -598,6 +631,53 @@ pub const LiveAgentRunner = struct {
         };
     }
 };
+
+/// Build a heap-owned `types.Message` from a slice of borrowed
+/// `ContentBlock`s. Each inner allocation is duplicated into
+/// `allocator` so the returned message can be freed with
+/// `Message.freeOwned` independently of the source slice's
+/// lifetime — important because the blocks come straight off the
+/// engine's stored messages, which have their own ownership.
+fn messageFromBlocks(
+    allocator: std.mem.Allocator,
+    role: types.Role,
+    blocks: []const types.ContentBlock,
+) !types.Message {
+    const out = try allocator.alloc(types.ContentBlock, blocks.len);
+    var written: usize = 0;
+    errdefer {
+        for (out[0..written]) |b| switch (b) {
+            .text => |s| allocator.free(s),
+            .tool_use => |tu| {
+                allocator.free(tu.id);
+                allocator.free(tu.name);
+                allocator.free(tu.input_json);
+            },
+            .tool_result => |tr| {
+                allocator.free(tr.tool_use_id);
+                allocator.free(tr.content);
+            },
+        };
+        allocator.free(out);
+    }
+    for (blocks) |b| {
+        out[written] = switch (b) {
+            .text => |s| .{ .text = try allocator.dupe(u8, s) },
+            .tool_use => |tu| .{ .tool_use = .{
+                .id = try allocator.dupe(u8, tu.id),
+                .name = try allocator.dupe(u8, tu.name),
+                .input_json = try allocator.dupe(u8, tu.input_json),
+            } },
+            .tool_result => |tr| .{ .tool_result = .{
+                .tool_use_id = try allocator.dupe(u8, tr.tool_use_id),
+                .content = try allocator.dupe(u8, tr.content),
+                .is_error = tr.is_error,
+            } },
+        };
+        written += 1;
+    }
+    return .{ .role = role, .content = out };
+}
 
 /// The tool schemas the runner exposes to every agent. A real
 /// plug-based registry is future work; this table is intentionally

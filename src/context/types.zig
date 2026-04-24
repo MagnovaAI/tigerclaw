@@ -1,3 +1,10 @@
+const wire_types = @import("types");
+
+/// Wire roles tracked by the context engine. Mirrors `wire_types.Role`
+/// (system / user / assistant) plus a `tool` category that the engine
+/// uses internally to classify tool-result history; on assemble it
+/// surfaces such turns as user-role sections with structured
+/// tool_result blocks attached.
 pub const Role = enum { system, user, assistant, tool };
 
 pub const SectionKind = enum {
@@ -13,7 +20,17 @@ pub const SectionKind = enum {
 pub const Section = struct {
     kind: SectionKind,
     role: Role,
+    /// Flat-text view of the section's content. Always populated so
+    /// legacy consumers (token estimation, fit logic, plain-text
+    /// contributors like system_preamble) can read a single string.
     content: []const u8,
+    /// Optional structured content blocks. Set on history_turn
+    /// sections that originated from a structured `ingest` call —
+    /// the runner uses these to reconstruct proper assistant
+    /// tool_use / user tool_result wire shapes on replay. Null on
+    /// purely-text sections; in that case treat `content` as a
+    /// single text block.
+    blocks: ?[]const wire_types.ContentBlock = null,
     priority: u8,
     token_estimate: u32,
     tags: []const []const u8,
@@ -59,7 +76,20 @@ pub const IngestParams = struct {
     session_id: []const u8,
     message_id: []const u8,
     role: Role,
+    /// Flat-text view. The engine always copies this into its store
+    /// so legacy consumers / replay paths can read a string. When
+    /// `blocks` is also set, callers should ensure `content` contains
+    /// a sensible fallback (e.g. concatenated text segments) — the
+    /// engine does not synthesise it from `blocks`.
     content: []const u8,
+    /// Optional structured content blocks. When set, the engine
+    /// duplicates the slice into its own allocator and replays it
+    /// verbatim on `assemble` via `Section.blocks`. The runner uses
+    /// this to persist tool_use / tool_result block linkage across
+    /// turns; without it, multi-turn tool flows lose the
+    /// tool_use_id correlation and the model can't tell what it
+    /// has and hasn't called.
+    blocks: ?[]const wire_types.ContentBlock = null,
     is_heartbeat: bool = false,
 };
 
