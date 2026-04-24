@@ -213,7 +213,47 @@ const spinner_frames = [_][]const u8{
     "⠏",
 };
 
+const RootWidget = @import("widgets/root.zig");
+
+/// New TUI entry point driven by `vxfw.App.run`. Setting the
+/// environment variable `TIGERCLAW_VXFW=1` routes `run()` here
+/// instead of the hand-rolled loop below. Lets us iterate on the
+/// vxfw migration without breaking the working TUI; when feature
+/// parity lands, the hand-rolled path goes away and this becomes
+/// the one true entry point.
+fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
+    // Agent roster. Same logic as the old run() — the vxfw path
+    // needs the default agent name to hand to RootWidget.
+    var agents = AgentList.init(allocator);
+    defer agents.deinit();
+    try agents.loadFromDisk(io, opts.home);
+    const default_index = agents.findOrAppend(opts.agent) catch 0;
+    const default_agent = agents.name(default_index);
+
+    var app = try vxfw.App.init(allocator, io);
+    defer app.deinit();
+    // Force legacy SGR + RGB caps, same as the hand-rolled path,
+    // so Terminal.app renders the tiger palette correctly.
+    app.vx.sgr = .legacy;
+    app.vx.caps.rgb = true;
+
+    var root = RootWidget.init(allocator, default_agent);
+
+    try app.run(root.widget(), .{});
+}
+
 pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
+    // Route to the vxfw implementation when the env flag is set —
+    // lets us test the migration without changing the default.
+    // `std.posix.getenv` was removed in Zig 0.16; use libc's
+    // `getenv` directly.
+    if (std.c.getenv("TIGERCLAW_VXFW")) |vptr| {
+        const v = std.mem.span(vptr);
+        if (v.len > 0 and v[0] != '0') {
+            return runVxfw(allocator, io, opts);
+        }
+    }
+
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
     defer tty.deinit();

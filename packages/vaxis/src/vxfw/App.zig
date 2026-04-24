@@ -19,6 +19,11 @@ vx: vaxis.Vaxis,
 timers: std.ArrayList(vxfw.Tick),
 wants_focus: ?vxfw.Widget,
 buffer: [1024]u8,
+/// Pointer to the event loop, valid only while `run()` is active.
+/// Exposed so worker threads / async sources can post events
+/// (typically `.{ .app = UserEvent{...} }`) back into the main
+/// loop. Null before `run()` and after it returns.
+loop: ?*EventLoop = null,
 
 /// Runtime options
 pub const Options = struct {
@@ -70,6 +75,12 @@ pub fn run(self: *App, widget: vxfw.Widget, opts: Options) anyerror!void {
     var loop: EventLoop = .{ .tty = tty, .vaxis = vx };
     try loop.start();
     defer loop.stop();
+    // Expose the loop pointer so async sources (worker threads,
+    // timers driven outside the vxfw tick queue) can post events
+    // back into the main loop via `app.loop.?.postEvent(...)`.
+    // Cleared on exit so use-after-return is a null-deref.
+    self.loop = &loop;
+    defer self.loop = null;
 
     // Send the init event
     loop.postEvent(.init);
