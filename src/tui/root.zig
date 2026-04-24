@@ -333,6 +333,12 @@ fn drawFrame(
     picker_open: bool,
     picker_cursor: usize,
 ) !void {
+    // Wipe the cell buffer before every draw. Without this, cells from
+    // a prior frame linger wherever the current draw does not paint
+    // over them — which surfaces as the trailing `Z��` / `��8` junk
+    // in the row above the input box when a streamed reply ends and
+    // the old bytes are what's left in the grid.
+    vx.window().clear();
     try draw(vx, input, history, agents, selected, pending, spinner_tick, picker_open, picker_cursor);
     try vx.render(writer);
     try writer.flush();
