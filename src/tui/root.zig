@@ -148,7 +148,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     const default_index = agents.findOrAppend(opts.agent) catch 0;
     var selected: usize = default_index;
 
-    try appendLine(&history, allocator, .system, "connected · ctrl-n/p switch · ctrl-e pick · ctrl-c quit");
+    try appendLine(&history, allocator, .system, "connected. ctrl-c to quit.");
 
     var spinner_tick: u64 = 0;
     var picker_open: bool = false;
@@ -253,8 +253,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                 defer allocator.free(chunk);
                 if (pending_agent_line) |idx| {
                     var line = &history.items[idx];
-                    if (pending_saw_text) try line.text.append(allocator, '\n');
-                    try line.text.appendSlice(allocator, chunk);
+                    try appendSanitizedUtf8(&line.text, allocator, chunk);
                     pending_saw_text = true;
                 }
             },
@@ -354,7 +353,7 @@ fn currentInput(allocator: std.mem.Allocator, input: *vaxis.widgets.TextInput) !
 fn makeLine(allocator: std.mem.Allocator, role: Line.Role, text: []const u8) !Line {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-    try buf.appendSlice(allocator, text);
+    try appendSanitizedUtf8(&buf, allocator, text);
     return .{ .role = role, .text = buf };
 }
 
@@ -505,6 +504,66 @@ fn drawStatusHint(
     );
 }
 
+/// Return the largest byte count ≤ `max` that ends on a UTF-8
+/// codepoint boundary. Continuation bytes (`10xxxxxx`) never start a
+/// codepoint, so we walk back from `max` until we find a leading byte.
+/// ASCII-only strings return `max` in one pass.
+fn safeUtf8Take(bytes: []const u8, max: usize) usize {
+    if (max >= bytes.len) return bytes.len;
+    if (max == 0) return 0;
+    var n = max;
+    while (n > 0 and (bytes[n] & 0b1100_0000) == 0b1000_0000) : (n -= 1) {}
+    return n;
+}
+
+/// Copy `bytes` into `out`, replacing any byte that is not part of a
+/// valid UTF-8 sequence with `?`. This prevents corrupted input (stray
+/// escape-sequence bytes, partial sequences from a glitchy terminal,
+/// truncated provider chunks) from reaching the renderer and showing
+/// as `�`-glyphs in the chat history.
+fn appendSanitizedUtf8(
+    list: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) !void {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const b = bytes[i];
+        const seq_len: usize = if (b < 0x80)
+            1
+        else if ((b & 0b1110_0000) == 0b1100_0000)
+            2
+        else if ((b & 0b1111_0000) == 0b1110_0000)
+            3
+        else if ((b & 0b1111_1000) == 0b1111_0000)
+            4
+        else
+            0;
+
+        if (seq_len == 0 or i + seq_len > bytes.len) {
+            try list.append(allocator, '?');
+            i += 1;
+            continue;
+        }
+        if (std.unicode.utf8ValidateSlice(bytes[i .. i + seq_len])) {
+            // U+FFFD (encoded as EF BF BD) is the Unicode replacement
+            // character. Its presence always means an upstream layer
+            // already substituted it for invalid data — emitting it to
+            // the terminal produces the black-diamond-question-mark
+            // glyph. Drop it silently; nothing legitimate uses it.
+            if (seq_len == 3 and bytes[i] == 0xEF and bytes[i + 1] == 0xBF and bytes[i + 2] == 0xBD) {
+                i += 3;
+                continue;
+            }
+            try list.appendSlice(allocator, bytes[i .. i + seq_len]);
+            i += seq_len;
+        } else {
+            try list.append(allocator, '?');
+            i += 1;
+        }
+    }
+}
+
 fn drawHistory(pane: vaxis.Window, history: []const Line) void {
     // Walk newest-first, rendering upward. Long lines wrap at pane
     // width with a naive byte-based split — good enough for ASCII
@@ -560,7 +619,7 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
 
         var col_offset: usize = prefix.len;
         while (remaining.len > 0 and row < pane.height) {
-            const take = @min(remaining.len, avail);
+            const take = safeUtf8Take(remaining, avail);
             _ = pane.printSegment(
                 .{ .text = remaining[0..take], .style = style },
                 .{ .row_offset = @intCast(row), .col_offset = @intCast(col_offset) },
@@ -836,6 +895,67 @@ fn tickerMain(ctx: TickerCtx) void {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
+
+test "safeUtf8Take: ASCII is truncated at the requested byte count" {
+    try testing.expectEqual(@as(usize, 5), safeUtf8Take("hello world", 5));
+    try testing.expectEqual(@as(usize, 11), safeUtf8Take("hello world", 100));
+    try testing.expectEqual(@as(usize, 0), safeUtf8Take("x", 0));
+}
+
+test "safeUtf8Take: never splits a multi-byte codepoint" {
+    // "·" is U+00B7, encoded as 0xC2 0xB7 (2 bytes). A naive byte
+    // truncation at max=1 would leave a dangling 0xC2 — the helper
+    // must back up to the start of the codepoint instead.
+    const s = "a·b";
+    try testing.expectEqual(@as(usize, 1), safeUtf8Take(s, 1)); // "a"
+    try testing.expectEqual(@as(usize, 1), safeUtf8Take(s, 2)); // back up: "a"
+    try testing.expectEqual(@as(usize, 3), safeUtf8Take(s, 3)); // "a·"
+    try testing.expectEqual(@as(usize, 4), safeUtf8Take(s, 4)); // "a·b"
+}
+
+test "appendSanitizedUtf8: replaces stray lead byte with ?" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    // `z` + stray 0xE2 (lead byte with no continuation) + `y` — the
+    // real-world symptom the sanitizer exists to stop.
+    try appendSanitizedUtf8(&buf, testing.allocator, "z\xE2y");
+    try testing.expectEqualStrings("z?y", buf.items);
+}
+
+test "appendSanitizedUtf8: preserves valid multi-byte sequences" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try appendSanitizedUtf8(&buf, testing.allocator, "Hey \xF0\x9F\x91\x8B world");
+    try testing.expectEqualStrings("Hey \xF0\x9F\x91\x8B world", buf.items);
+}
+
+test "appendSanitizedUtf8: drops U+FFFD replacement characters" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    // EF BF BD is U+FFFD — upstream already substituted this for bad
+    // input, so we drop it rather than forwarding the black-diamond
+    // glyph to the terminal.
+    try appendSanitizedUtf8(&buf, testing.allocator, "ok\xEF\xBF\xBDS");
+    try testing.expectEqualStrings("okS", buf.items);
+}
+
+test "appendSanitizedUtf8: replaces truncated trailing lead byte" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    // Trailing 0xE2 with nothing after it — classic chunk-cut scenario.
+    try appendSanitizedUtf8(&buf, testing.allocator, "ok\xE2");
+    try testing.expectEqualStrings("ok?", buf.items);
+}
+
+test "safeUtf8Take: backs up through a 3-byte character" {
+    // "世" is U+4E16, encoded as 0xE4 0xB8 0x96 (3 bytes).
+    const s = "x世y";
+    try testing.expectEqual(@as(usize, 1), safeUtf8Take(s, 1)); // "x"
+    try testing.expectEqual(@as(usize, 1), safeUtf8Take(s, 2)); // back up: "x"
+    try testing.expectEqual(@as(usize, 1), safeUtf8Take(s, 3)); // back up: "x"
+    try testing.expectEqual(@as(usize, 4), safeUtf8Take(s, 4)); // "x世"
+    try testing.expectEqual(@as(usize, 5), safeUtf8Take(s, 5)); // "x世y"
+}
 
 test "makeLine/appendLine: round-trips text into owned storage" {
     var history: std.ArrayList(Line) = .empty;
