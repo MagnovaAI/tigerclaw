@@ -770,8 +770,10 @@ fn runLightpanda(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     // synchronous scripts settle, instead of the default `load` which
     // waits for every image/xhr/tracker. Pages with perpetual network
     // activity (Google, infinite scroll, ad-rotating SPAs) used to
-    // hang the subprocess indefinitely under `load`. 2000ms ceiling
-    // is a hard safety backstop.
+    // hang the subprocess indefinitely under `load`. `--wait_ms 2000`
+    // is lightpanda's own hard cap — it returns what it has rendered
+    // after 2 seconds no matter what. We rely on that rather than
+    // wrapping the subprocess in a shell-level watchdog.
     const cmd = std.fmt.bufPrintZ(
         &cmd_buf,
         "lightpanda fetch --dump markdown --wait_until domcontentloaded --wait_ms 2000 '{s}' 2>/dev/null",
@@ -799,7 +801,7 @@ fn runLightpanda(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     if (out.items.len == 0) {
         return std.fmt.allocPrint(
             allocator,
-            "lightpanda returned no output for {s}",
+            "lightpanda fetch timed out or returned no output for {s}",
             .{url},
         );
     }

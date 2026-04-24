@@ -384,7 +384,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
 
                 var text: std.ArrayList(u8) = .empty;
                 errdefer text.deinit(allocator);
-                try text.appendSlice(allocator, "\u{21BB} ");
+                // Role prefix (`↻ `) is added by drawHistory; the
+                // payload only carries the tool name + status.
                 try text.appendSlice(allocator, ts.name);
                 try text.appendSlice(allocator, "   (pending)");
 
@@ -420,7 +421,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                 if (match_idx) |idx| {
                     var line = &history.items[idx];
                     line.text.clearRetainingCapacity();
-                    try line.text.appendSlice(allocator, "\u{21BB} ");
                     try line.text.appendSlice(allocator, td.name);
                     try line.text.appendSlice(allocator, " \u{2192} ");
                     // Cap preview at 500 display columns (~5 wrapped
