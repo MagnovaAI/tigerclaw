@@ -764,6 +764,47 @@ fn safeUtf8Take(bytes: []const u8, max: usize) usize {
     return n;
 }
 
+/// Walk `bytes` codepoint by codepoint, accumulating display columns
+/// via vaxis's `gwidth` table. Stop just before exceeding `max_cols`.
+/// Returns the byte count and the column count consumed.
+///
+/// This is what you want for terminal layout — `safeUtf8Take` caps on
+/// bytes, which for multi-byte chars (emoji, em-dash) overshoots the
+/// visible width and causes wrapped-row overlap. Callers should use
+/// the `bytes` return for slicing and the `cols` return if they
+/// track remaining row space.
+fn takeCols(bytes: []const u8, max_cols: usize) struct { bytes: usize, cols: usize } {
+    if (max_cols == 0) return .{ .bytes = 0, .cols = 0 };
+    var i: usize = 0;
+    var cols: usize = 0;
+    while (i < bytes.len) {
+        const b = bytes[i];
+        const seq_len: usize = if (b < 0x80)
+            1
+        else if ((b & 0b1110_0000) == 0b1100_0000)
+            2
+        else if ((b & 0b1111_0000) == 0b1110_0000)
+            3
+        else if ((b & 0b1111_1000) == 0b1111_0000)
+            4
+        else
+            1;
+        if (i + seq_len > bytes.len) break;
+        const w: usize = @intCast(vaxis.gwidth.gwidth(bytes[i .. i + seq_len], .unicode));
+        if (cols + w > max_cols) break;
+        cols += w;
+        i += seq_len;
+    }
+    return .{ .bytes = i, .cols = cols };
+}
+
+/// Sum the total display columns across every byte of `bytes`. Used
+/// to compute how many terminal rows a history line will need when
+/// word-wrapped to a given column budget.
+fn measureCols(bytes: []const u8) usize {
+    return @intCast(vaxis.gwidth.gwidth(bytes, .unicode));
+}
+
 /// Copy `bytes` into `out`, replacing any byte that is not part of a
 /// valid UTF-8 sequence with `?`. This prevents corrupted input (stray
 /// escape-sequence bytes, partial sequences from a glitchy terminal,
@@ -832,13 +873,18 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
         const width: usize = @intCast(pane.width);
         const avail = if (width > prefix.len) width - prefix.len else 1;
 
+        // Rows needed is driven by *display columns*, not byte count.
+        // Using bytes over-estimates when the line contains multi-byte
+        // characters (emoji, em-dashes, non-ASCII) and causes wrapped
+        // rows to land on top of each other during streaming.
+        const total_cols = measureCols(line.text.items);
         var rows_needed: usize = 1;
-        var remaining = line.text.items;
-        if (remaining.len > avail) {
-            rows_needed = (remaining.len + avail - 1) / avail;
+        if (total_cols > avail) {
+            rows_needed = (total_cols + avail - 1) / avail;
         }
         if (rows_needed > 32) rows_needed = 32;
 
+        var remaining = line.text.items;
         var start_row = row_cursor - @as(i32, @intCast(rows_needed - 1));
         if (start_row < 0) {
             const drop = @as(usize, @intCast(-start_row));
@@ -846,11 +892,18 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
                 row_cursor -= @intCast(rows_needed);
                 continue;
             }
-            const skip_bytes = drop * avail;
-            if (skip_bytes < remaining.len) {
-                remaining = remaining[skip_bytes..];
-                rows_needed -= drop;
+            // Skip `drop` rows worth of columns off the front of the
+            // line. Walk by columns, not bytes, so multi-byte chars
+            // don't trigger the same sizing bug here.
+            var cols_to_skip: usize = drop * avail;
+            while (cols_to_skip > 0 and remaining.len > 0) {
+                const taken = takeCols(remaining, cols_to_skip);
+                if (taken.bytes == 0) break;
+                remaining = remaining[taken.bytes..];
+                cols_to_skip -= taken.cols;
+                if (taken.cols == 0) break;
             }
+            rows_needed -= drop;
             start_row = 0;
         }
 
@@ -876,7 +929,11 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
 
         var col_offset: usize = prefix.len;
         while (remaining.len > 0 and row < pane.height) {
-            const take = safeUtf8Take(remaining, avail);
+            // Wrap by display columns, not bytes, so a line containing
+            // emoji / em-dashes wraps at the right visual position
+            // instead of collapsing into the row above.
+            const taken = takeCols(remaining, avail);
+            const take = if (taken.bytes == 0) safeUtf8Take(remaining, 1) else taken.bytes;
             paintRow(
                 pane,
                 @intCast(row),
