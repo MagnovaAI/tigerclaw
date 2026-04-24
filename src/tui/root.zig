@@ -38,15 +38,14 @@
 
 const std = @import("std");
 const vaxis = @import("vaxis");
-const http_client = @import("../cli/commands/http_client.zig");
 const md = @import("md.zig");
-const sse_client = @import("sse_client.zig");
+const live_runner = @import("../cli/commands/live_runner.zig");
+const harness = @import("../harness/root.zig");
 
 test {
-    // Ensure md + sse_client tests are discovered when the unit-test
-    // binary walks references from this file.
+    // Ensure md tests are discovered when the unit-test binary
+    // walks references from this file.
     std.testing.refAllDecls(md);
-    std.testing.refAllDecls(sse_client);
 }
 
 const Event = union(enum) {
@@ -109,12 +108,12 @@ const Line = struct {
 };
 
 pub const Options = struct {
-    base_url: []const u8 = "http://127.0.0.1:8765",
     agent: []const u8 = "tiger",
-    /// Caller-resolved `$HOME`. Empty disables the agent-directory
-    /// scan; only the default agent will appear. Resolving HOME
-    /// itself is main.zig's job (matches the convention used by
-    /// diag / gateway / service commands).
+    /// Caller-resolved `$HOME`. The TUI instantiates a
+    /// `LiveAgentRunner` in-process against this root so there is no
+    /// gateway daemon to launch or port to bind; every turn flows
+    /// straight from the provider through the runner's streaming
+    /// sinks into the vaxis event queue.
     home: []const u8 = "",
 };
 
@@ -239,6 +238,29 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     const default_index = agents.findOrAppend(opts.agent) catch 0;
     var selected: usize = default_index;
 
+    // Load the in-process runner for the default agent. The TUI owns
+    // this lifecycle; swapping agents tears the runner down and
+    // rebuilds it so each agent sees its own system prompt, model
+    // config, and workspace sandbox. If the initial load fails
+    // (missing config.json, unknown provider) we surface the error
+    // to the user and exit so they can fix it — the TUI can't do
+    // useful work without a runner.
+    var live = live_runner.LiveAgentRunner.load(allocator, io, agents.name(selected), "", opts.home) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "tigerclaw tui: could not load agent '{s}': {s}\n", .{ agents.name(selected), @errorName(err) });
+        defer allocator.free(msg);
+        _ = std.c.write(2, msg.ptr, msg.len);
+        return err;
+    };
+    defer live.deinit();
+    var agent_runner: harness.AgentRunner = live.runner();
+    // Agent-switching via Ctrl-N / Ctrl-P / picker is still wired to
+    // `selected` for display purposes, but the in-process runner is
+    // pinned to the agent it was loaded with. Hot-reload on switch
+    // is future work; for now the user has to restart the TUI to
+    // change agents. Silence the never-mutated warning — a later
+    // commit will mutate this when reload lands.
+    _ = &agent_runner;
+
     try appendAgentLine(&history, allocator, agents.items(), selected);
 
     var spinner_tick: u64 = 0;
@@ -320,12 +342,16 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
 
                     const message_copy = try allocator.dupe(u8, typed);
                     const ctx = try allocator.create(WorkerCtx);
+                    // Use the agent's name as the session id so the
+                    // runner's context engine keyed per-session still
+                    // sees continuous history across turns. Swapping
+                    // agents starts a new session naturally.
                     ctx.* = .{
                         .allocator = allocator,
                         .io = io,
                         .loop = &loop,
-                        .base_url = opts.base_url,
-                        .agent = agents.name(selected),
+                        .runner = &agent_runner,
+                        .session_id = agents.name(selected),
                         .message = message_copy,
                     };
                     const t = std.Thread.spawn(.{}, workerMain, .{ctx}) catch |err| {
@@ -1215,8 +1241,11 @@ const WorkerCtx = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     loop: *EventLoop,
-    base_url: []const u8,
-    agent: []const u8,
+    /// Borrowed reference to the TUI's in-process runner. Shared
+    /// across every worker turn on the same agent; swapped out on
+    /// agent switch (see `reloadRunner`). Not owned here.
+    runner: *harness.AgentRunner,
+    session_id: []const u8,
     message: []u8,
 };
 
@@ -1242,77 +1271,63 @@ fn workerMain(ctx: *WorkerCtx) void {
 }
 
 fn runTurn(ctx: *WorkerCtx) !void {
-    var url_buf: [512]u8 = undefined;
-    const url = try std.fmt.bufPrint(
-        &url_buf,
-        "{s}/sessions/{s}/turns",
-        .{ ctx.base_url, ctx.agent },
-    );
-
-    const body_json = try std.json.Stringify.valueAlloc(ctx.allocator, .{
-        .agent = ctx.agent,
-        .message = ctx.message,
-    }, .{});
-    defer ctx.allocator.free(body_json);
-
-    // Buffer the full response, then walk it frame-by-frame through
-    // the SSE parser. Real incremental streaming over a long-lived
-    // reader is future work — for now the buffered-then-parsed shape
-    // matches the rest of the TUI worker's single-request model and
-    // avoids duplicating http_client's connection handling.
-    var resp_buf: std.Io.Writer.Allocating = .init(ctx.allocator);
-    defer resp_buf.deinit();
-
-    _ = try http_client.send(
-        ctx.allocator,
-        ctx.io,
-        .{
-            .method = .POST,
-            .url = url,
-            .json_body = body_json,
-            .accept = "text/event-stream",
-        },
-        &resp_buf.writer,
-        .{},
-    );
-
-    var parser = sse_client.Parser.init(ctx.allocator);
-    defer parser.deinit();
-    try parser.feed(resp_buf.written(), dispatchSseEvent, @ptrCast(ctx));
+    // No gateway round-trip: call the runner directly and let the
+    // sinks post events onto the vaxis loop as the provider streams.
+    // The runner still fires `stream_sink` per text delta and
+    // `tool_event_sink` on each tool-dispatch boundary.
+    const result = ctx.runner.run(.{
+        .session_id = ctx.session_id,
+        .input = ctx.message,
+        .stream_sink = chunkSink,
+        .stream_sink_ctx = @ptrCast(ctx),
+        .tool_event_sink = toolEventSink,
+        .tool_event_sink_ctx = @ptrCast(ctx),
+    }) catch |err| {
+        const name = @errorName(err);
+        const msg = try std.fmt.allocPrint(ctx.allocator, "runner: {s}", .{name});
+        ctx.loop.postEvent(.{ .turn_error = msg });
+        return;
+    };
+    _ = result;
 }
 
-/// Bridge from `sse_client.Event` to the vaxis event loop. Each
-/// event becomes a posted event on the main loop; slices in the
-/// parser's scratch buffer are duped so they outlive this callback.
-fn dispatchSseEvent(sink_ctx: ?*anyopaque, event: sse_client.Event) void {
+/// Sink adapter: each text fragment from the provider becomes one
+/// `turn_chunk` event on the vaxis loop. The fragment is duped
+/// because the runner borrows it across the callback only.
+fn chunkSink(sink_ctx: ?*anyopaque, fragment: []const u8) void {
     const ctx: *WorkerCtx = @ptrCast(@alignCast(sink_ctx.?));
-    switch (event) {
-        .chunk => |text| {
-            const owned = ctx.allocator.dupe(u8, text) catch return;
-            ctx.loop.postEvent(.{ .turn_chunk = owned });
+    const owned = ctx.allocator.dupe(u8, fragment) catch return;
+    ctx.loop.postEvent(.{ .turn_chunk = owned });
+}
+
+/// Sink adapter for tool-dispatch boundaries. Both phases produce
+/// owned slices so the main loop can free them after handling.
+fn toolEventSink(
+    sink_ctx: ?*anyopaque,
+    phase: harness.agent_runner.ToolEventPhase,
+    id: []const u8,
+    name: []const u8,
+    output: []const u8,
+) void {
+    const ctx: *WorkerCtx = @ptrCast(@alignCast(sink_ctx.?));
+    switch (phase) {
+        .started => {
+            const id_owned = ctx.allocator.dupe(u8, id) catch return;
+            errdefer ctx.allocator.free(id_owned);
+            const name_owned = ctx.allocator.dupe(u8, name) catch return;
+            ctx.loop.postEvent(.{ .turn_tool_start = .{ .id = id_owned, .name = name_owned } });
         },
-        .tool_start => |ts| {
-            const id = ctx.allocator.dupe(u8, ts.id) catch return;
-            errdefer ctx.allocator.free(id);
-            const name = ctx.allocator.dupe(u8, ts.name) catch return;
-            ctx.loop.postEvent(.{ .turn_tool_start = .{ .id = id, .name = name } });
-        },
-        .tool_done => |td| {
-            const id = ctx.allocator.dupe(u8, td.id) catch return;
-            errdefer ctx.allocator.free(id);
-            const name = ctx.allocator.dupe(u8, td.name) catch return;
-            errdefer ctx.allocator.free(name);
-            const output = ctx.allocator.dupe(u8, td.output) catch return;
-            ctx.loop.postEvent(.{ .turn_tool_done = .{ .id = id, .name = name, .output = output } });
-        },
-        .done => {
-            // `done` is signalled via the closed stream in
-            // `runTurn`'s caller — `workerMain` posts `turn_done`
-            // after `runTurn` returns, so we don't re-post here.
-        },
-        .err => |msg| {
-            const owned = ctx.allocator.dupe(u8, msg) catch return;
-            ctx.loop.postEvent(.{ .turn_error = owned });
+        .finished => {
+            const id_owned = ctx.allocator.dupe(u8, id) catch return;
+            errdefer ctx.allocator.free(id_owned);
+            const name_owned = ctx.allocator.dupe(u8, name) catch return;
+            errdefer ctx.allocator.free(name_owned);
+            const output_owned = ctx.allocator.dupe(u8, output) catch return;
+            ctx.loop.postEvent(.{ .turn_tool_done = .{
+                .id = id_owned,
+                .name = name_owned,
+                .output = output_owned,
+            } });
         },
     }
 }

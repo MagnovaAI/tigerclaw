@@ -41,9 +41,11 @@ pub fn main(init: std.process.Init) !u8 {
     defer stderr_w.interface.flush() catch {};
 
     if (argv.len < 2) {
-        // Auto-start gateway as child process if /health is unreachable,
-        // then run the TUI.
-        return runTuiWithGateway(arena, io, init);
+        // Default (`tigerclaw` with no args) launches the in-process
+        // TUI — no gateway daemon, no HTTP round-trip. The runner
+        // lives inside the TUI's process and talks to the provider
+        // directly.
+        return runTuiLocal(arena, io, init);
     }
 
     // Convert [:0]const u8 slices to []const u8 for the parser.
@@ -613,7 +615,7 @@ test "shouldEnableColor: windows/wasi stay monochrome without force" {
 
 const tui = @import("tui/root.zig");
 
-fn runTuiWithGateway(arena: std.mem.Allocator, io: std.Io, init: std.process.Init) !u8 {
+fn runTuiLocal(arena: std.mem.Allocator, io: std.Io, init: std.process.Init) !u8 {
     const home = init.environ_map.get("HOME") orelse "";
     tui.run(arena, io, .{ .home = home }) catch |err| {
         // The tty is now in an undefined state if vaxis bailed
