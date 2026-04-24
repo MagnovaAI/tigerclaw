@@ -18,6 +18,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const tui = @import("../root.zig");
+const harness = @import("../../harness/root.zig");
 const Header = @import("header.zig");
 const History = @import("history.zig");
 const Input = @import("input.zig");
@@ -33,6 +34,22 @@ header: Header,
 /// widget borrows a slice of this list per frame.
 history: std.ArrayList(tui.Line) = .empty,
 input: Input,
+/// Borrowed runner. Set by \`attachRunner\` before \`App.run\`;
+/// null during tests that don't spin up a real runner.
+runner: ?*harness.AgentRunner = null,
+/// Agent session id — normally the agent name. Reused across
+/// turns so the context engine keeps continuity.
+session_id: []const u8 = "tiger",
+/// Borrowed App pointer. Used by worker-thread sinks to post
+/// UserEvents back into the main loop via \`app.loop.?.postEvent\`.
+app: ?*vxfw.App = null,
+/// History index of the line currently being streamed into. Set
+/// when a turn starts; reset on done/error.
+pending_agent_line: ?usize = null,
+/// Whether any text has been streamed into the pending agent
+/// line yet. If the turn finishes with zero text (tool-only
+/// reply, error mid-stream), we drop the empty placeholder.
+pending_saw_text: bool = false,
 
 pub fn init(allocator: std.mem.Allocator, agent_name: []const u8) Root {
     return .{
@@ -43,7 +60,15 @@ pub fn init(allocator: std.mem.Allocator, agent_name: []const u8) Root {
             .spinner_tick = 0,
         },
         .input = Input.init(allocator),
+        .session_id = agent_name,
     };
+}
+
+/// Wire the runner + app so submit actually fires a turn. Call
+/// after \`init\` and before \`app.run(root.widget(), .{})\`.
+pub fn attachRunner(self: *Root, runner: *harness.AgentRunner, app: *vxfw.App) void {
+    self.runner = runner;
+    self.app = app;
 }
 
 pub fn deinit(self: *Root) void {
@@ -67,10 +92,200 @@ pub fn wireSubmit(self: *Root) void {
 fn onSubmit(ctx: ?*anyopaque, text: []const u8) void {
     const self: *Root = @ptrCast(@alignCast(ctx.?));
     if (text.len == 0) return;
-    // Append the typed text as a user line. The runner
-    // integration that fires a turn in response lands in a
-    // follow-up; for now Enter is just visible feedback.
-    self.appendLine(.user, text) catch {};
+    // Don't start a second turn while one is in flight. The user
+    // can type the next message — it'll just queue up as another
+    // history line but the runner won't fire.
+    if (self.header.pending) {
+        self.appendLine(.user, text) catch {};
+        return;
+    }
+    self.beginTurn(text) catch |err| {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "! could not start turn: {s}", .{@errorName(err)}) catch "! turn failed";
+        self.appendLine(.system, msg) catch {};
+    };
+}
+
+// --- Turn orchestration ----------------------------------------------------
+//
+// When the input fires \`on_submit\`, we append the user line,
+// reserve an empty agent line, flip the spinner on, and spawn a
+// worker thread that calls \`runner.run(...)\` with sinks that
+// post UserEvents back into the App's main loop. The event
+// handler consumes those UserEvents, mutating history in place.
+
+/// Tag for the UserEvent payloads we post from worker threads.
+/// Each variant carries owned heap-allocated slices — the main
+/// loop frees them after handling. We match on event.app.name
+/// to dispatch; the pointer data is cast to the matching
+/// payload struct.
+const ue_chunk = "tui.chunk";
+const ue_tool_start = "tui.tool_start";
+const ue_tool_done = "tui.tool_done";
+const ue_done = "tui.done";
+const ue_error = "tui.error";
+const ue_tick = "tui.tick";
+
+const ChunkPayload = struct { text: []u8 };
+const ToolStartPayload = struct { id: []u8, name: []u8 };
+const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8 };
+const ErrorPayload = struct { message: []u8 };
+
+/// Context the worker thread carries. Allocated on heap;
+/// worker frees on exit.
+const WorkerCtx = struct {
+    allocator: std.mem.Allocator,
+    root: *Root,
+    app: *vxfw.App,
+    message: []u8,
+    session_id: []const u8,
+};
+
+fn beginTurn(self: *Root, typed: []const u8) !void {
+    const runner = self.runner orelse return error.NoRunner;
+    const app = self.app orelse return error.NoApp;
+
+    try self.appendLine(.user, typed);
+    // Reserve a placeholder agent line so streamed chunks have a
+    // stable slot to accumulate into.
+    const agent_line_idx = self.history.items.len;
+    try self.appendLine(.agent, "");
+    self.pending_agent_line = agent_line_idx;
+    self.pending_saw_text = false;
+
+    self.header.pending = true;
+
+    // Dup the message so the worker owns it independent of the
+    // input buffer (which clears right after on_submit returns).
+    const message_copy = try self.allocator.dupe(u8, typed);
+    errdefer self.allocator.free(message_copy);
+
+    const ctx = try self.allocator.create(WorkerCtx);
+    errdefer self.allocator.destroy(ctx);
+    ctx.* = .{
+        .allocator = self.allocator,
+        .root = self,
+        .app = app,
+        .message = message_copy,
+        .session_id = self.session_id,
+    };
+    _ = runner;
+
+    var thread = try std.Thread.spawn(.{}, workerMain, .{ctx});
+    thread.detach();
+}
+
+fn workerMain(ctx: *WorkerCtx) void {
+    defer {
+        ctx.allocator.free(ctx.message);
+        ctx.allocator.destroy(ctx);
+    }
+
+    const runner = ctx.root.runner orelse {
+        postError(ctx, "no runner");
+        postDone(ctx);
+        return;
+    };
+
+    const result = runner.run(.{
+        .session_id = ctx.session_id,
+        .input = ctx.message,
+        .stream_sink = chunkSink,
+        .stream_sink_ctx = @ptrCast(ctx),
+        .tool_event_sink = toolEventSink,
+        .tool_event_sink_ctx = @ptrCast(ctx),
+    }) catch |err| {
+        postError(ctx, @errorName(err));
+        postDone(ctx);
+        return;
+    };
+    _ = result;
+    postDone(ctx);
+}
+
+// Runner sinks — run on the worker thread. Each one heap-
+// allocates a payload struct, attaches it to a \`UserEvent\`, and
+// posts to the main loop. The loop's event handler casts the
+// pointer back and frees.
+
+fn chunkSink(sink_ctx: ?*anyopaque, fragment: []const u8) void {
+    const ctx: *WorkerCtx = @ptrCast(@alignCast(sink_ctx.?));
+    const payload = ctx.allocator.create(ChunkPayload) catch return;
+    payload.* = .{ .text = ctx.allocator.dupe(u8, fragment) catch {
+        ctx.allocator.destroy(payload);
+        return;
+    } };
+    postUserEvent(ctx, ue_chunk, payload);
+}
+
+fn toolEventSink(
+    sink_ctx: ?*anyopaque,
+    phase: harness.agent_runner.ToolEventPhase,
+    id: []const u8,
+    name: []const u8,
+    output: []const u8,
+) void {
+    const ctx: *WorkerCtx = @ptrCast(@alignCast(sink_ctx.?));
+    switch (phase) {
+        .started => {
+            const payload = ctx.allocator.create(ToolStartPayload) catch return;
+            payload.* = .{
+                .id = ctx.allocator.dupe(u8, id) catch {
+                    ctx.allocator.destroy(payload);
+                    return;
+                },
+                .name = ctx.allocator.dupe(u8, name) catch {
+                    ctx.allocator.free(payload.id);
+                    ctx.allocator.destroy(payload);
+                    return;
+                },
+            };
+            postUserEvent(ctx, ue_tool_start, payload);
+        },
+        .finished => {
+            const payload = ctx.allocator.create(ToolDonePayload) catch return;
+            payload.* = .{
+                .id = ctx.allocator.dupe(u8, id) catch {
+                    ctx.allocator.destroy(payload);
+                    return;
+                },
+                .name = ctx.allocator.dupe(u8, name) catch {
+                    ctx.allocator.free(payload.id);
+                    ctx.allocator.destroy(payload);
+                    return;
+                },
+                .output = ctx.allocator.dupe(u8, output) catch {
+                    ctx.allocator.free(payload.id);
+                    ctx.allocator.free(payload.name);
+                    ctx.allocator.destroy(payload);
+                    return;
+                },
+            };
+            postUserEvent(ctx, ue_tool_done, payload);
+        },
+    }
+}
+
+fn postError(ctx: *WorkerCtx, message: []const u8) void {
+    const payload = ctx.allocator.create(ErrorPayload) catch return;
+    payload.* = .{ .message = ctx.allocator.dupe(u8, message) catch {
+        ctx.allocator.destroy(payload);
+        return;
+    } };
+    postUserEvent(ctx, ue_error, payload);
+}
+
+fn postDone(ctx: *WorkerCtx) void {
+    postUserEvent(ctx, ue_done, null);
+}
+
+fn postUserEvent(ctx: *WorkerCtx, name: []const u8, data: ?*const anyopaque) void {
+    const loop = ctx.app.loop orelse {
+        // App loop is gone — nothing we can do. Leak the payload;
+        // the process is probably tearing down anyway.
+        return;
+    };
+    loop.postEvent(.{ .app = .{ .name = name, .data = data } });
 }
 
 /// Append a plain text line to the history, taking ownership
@@ -119,8 +334,118 @@ fn eventHandler(
             try self.input.widget().handleEvent(ctx, event);
         },
         .winsize => ctx.redraw = true,
-        .init => ctx.redraw = true,
+        .init => {
+            // Kick off the spinner tick loop so the header
+            // spinner animates while a turn is pending.
+            try ctx.tick(80, self.widget());
+            ctx.redraw = true;
+        },
+        .tick => {
+            if (self.header.pending) {
+                self.header.spinner_tick +%= 1;
+                ctx.redraw = true;
+            }
+            // Keep the tick chain alive so the spinner keeps
+            // ticking as soon as pending flips back on.
+            try ctx.tick(80, self.widget());
+        },
+        .app => |ue| try self.handleUserEvent(ctx, ue),
         else => {},
+    }
+}
+
+fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent) !void {
+    if (std.mem.eql(u8, ue.name, ue_chunk)) {
+        const p: *const ChunkPayload = @ptrCast(@alignCast(ue.data.?));
+        defer self.allocator.free(p.text);
+        defer self.allocator.destroy(@as(*ChunkPayload, @constCast(p)));
+
+        if (self.pending_agent_line) |idx| {
+            var line = &self.history.items[idx];
+            try line.text.appendSlice(self.allocator, p.text);
+            self.pending_saw_text = true;
+        }
+        ctx.redraw = true;
+    } else if (std.mem.eql(u8, ue.name, ue_tool_start)) {
+        const p: *const ToolStartPayload = @ptrCast(@alignCast(ue.data.?));
+        defer self.allocator.free(p.id);
+        defer self.allocator.free(p.name);
+        defer self.allocator.destroy(@as(*ToolStartPayload, @constCast(p)));
+
+        // Append a pending tool line. We own the id so tool_done
+        // can find its matching entry.
+        var text: std.ArrayList(u8) = .empty;
+        errdefer text.deinit(self.allocator);
+        try text.appendSlice(self.allocator, p.name);
+        try text.appendSlice(self.allocator, "   (pending)");
+
+        const id_owned = try self.allocator.dupe(u8, p.id);
+        errdefer self.allocator.free(id_owned);
+
+        try self.history.append(self.allocator, .{
+            .role = .tool,
+            .text = text,
+            .tool_id = id_owned,
+        });
+        ctx.redraw = true;
+    } else if (std.mem.eql(u8, ue.name, ue_tool_done)) {
+        const p: *const ToolDonePayload = @ptrCast(@alignCast(ue.data.?));
+        defer self.allocator.free(p.id);
+        defer self.allocator.free(p.name);
+        defer self.allocator.free(p.output);
+        defer self.allocator.destroy(@as(*ToolDonePayload, @constCast(p)));
+
+        // Walk history backwards, find the matching pending line
+        // (by tool_id), promote it with the output preview.
+        var i: usize = self.history.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = &self.history.items[i];
+            if (entry.role != .tool) continue;
+            if (entry.tool_id) |id| {
+                if (std.mem.eql(u8, id, p.id)) {
+                    entry.text.clearRetainingCapacity();
+                    try entry.text.appendSlice(self.allocator, p.name);
+                    try entry.text.appendSlice(self.allocator, " → ");
+                    const cap: usize = @min(p.output.len, 500);
+                    try entry.text.appendSlice(self.allocator, p.output[0..cap]);
+                    if (cap < p.output.len) try entry.text.appendSlice(self.allocator, "…");
+                    entry.deinitToolId(self.allocator);
+                    break;
+                }
+            }
+        }
+        ctx.redraw = true;
+    } else if (std.mem.eql(u8, ue.name, ue_error)) {
+        const p: *const ErrorPayload = @ptrCast(@alignCast(ue.data.?));
+        defer self.allocator.free(p.message);
+        defer self.allocator.destroy(@as(*ErrorPayload, @constCast(p)));
+
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "! turn failed: {s}", .{p.message}) catch "! turn failed";
+        try self.appendLine(.system, line);
+        ctx.redraw = true;
+    } else if (std.mem.eql(u8, ue.name, ue_done)) {
+        // Drop the empty placeholder if the turn produced no
+        // text (e.g. a tool-only reply or an error mid-stream).
+        if (!self.pending_saw_text) {
+            if (self.pending_agent_line) |idx| {
+                // Only drop if it's actually still the last-ish
+                // line we reserved — inserting tool lines above
+                // shifts the index forward but the placeholder
+                // stays at the original idx.
+                if (idx < self.history.items.len) {
+                    var dropped = self.history.orderedRemove(idx);
+                    dropped.text.deinit(self.allocator);
+                    dropped.deinitSpans(self.allocator);
+                    dropped.deinitToolId(self.allocator);
+                }
+            }
+        }
+        self.pending_agent_line = null;
+        self.pending_saw_text = false;
+        self.header.pending = false;
+        ctx.redraw = true;
     }
 }
 

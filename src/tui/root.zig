@@ -230,6 +230,18 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     const default_index = agents.findOrAppend(opts.agent) catch 0;
     const default_agent = agents.name(default_index);
 
+    // Load the in-process runner for the default agent. Same
+    // error-path as the hand-rolled run(): print to stderr and
+    // exit so the user can fix their config.
+    var live = live_runner.LiveAgentRunner.load(allocator, io, default_agent, "", opts.home) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "tigerclaw tui: could not load agent '{s}': {s}\n", .{ default_agent, @errorName(err) });
+        defer allocator.free(msg);
+        _ = std.c.write(2, msg.ptr, msg.len);
+        return err;
+    };
+    defer live.deinit();
+    var agent_runner: harness.AgentRunner = live.runner();
+
     var app = try vxfw.App.init(allocator, io);
     defer app.deinit();
     // Force legacy SGR + RGB caps, same as the hand-rolled path,
@@ -240,11 +252,10 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     var root = RootWidget.init(allocator, default_agent);
     defer root.deinit();
     root.wireSubmit();
+    root.attachRunner(&agent_runner, &app);
 
     // Seed a short welcome so the history isn't empty on first
-    // launch. Real runner-driven replies land in a follow-up
-    // once the streaming sinks get routed through vxfw
-    // UserEvents.
+    // launch.
     try root.appendLine(.system, "agent: tiger");
     try root.appendLine(.agent, "Type a message and press Enter. Ctrl-C quits.");
 
