@@ -188,6 +188,13 @@ pub const LiveAgentRunner = struct {
             \\ask them to clarify or apologise. If the user's intent is unambiguous,
             \\make the tool call on the first try.
             \\
+            \\`fetch_url` does not work well against search engines (Google, Bing,
+            \\DuckDuckGo etc.) — they serve consent walls or anti-bot pages to
+            \\headless browsers. Prefer direct URLs (the restaurant's own site,
+            \\Wikipedia, official sources). When the user asks to "search the web",
+            \\ask them for a site to try, or suggest one from memory, rather than
+            \\fetching a Google results page.
+            \\
             \\
         );
         for (builtin_tools) |t| {
@@ -759,9 +766,15 @@ fn runLightpanda(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     // 8 KiB is enough for the full command line; a URL longer than
     // that is almost certainly malformed.
     var cmd_buf: [8 * 1024]u8 = undefined;
+    // `--wait_until domcontentloaded` returns as soon as the HTML +
+    // synchronous scripts settle, instead of the default `load` which
+    // waits for every image/xhr/tracker. Pages with perpetual network
+    // activity (Google, infinite scroll, ad-rotating SPAs) used to
+    // hang the subprocess indefinitely under `load`. 2000ms ceiling
+    // is a hard safety backstop.
     const cmd = std.fmt.bufPrintZ(
         &cmd_buf,
-        "lightpanda fetch --dump markdown --wait_ms 3000 '{s}' 2>/dev/null",
+        "lightpanda fetch --dump markdown --wait_until domcontentloaded --wait_ms 2000 '{s}' 2>/dev/null",
         .{url},
     ) catch return error.InvalidUrl;
 
