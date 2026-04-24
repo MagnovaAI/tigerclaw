@@ -664,8 +664,25 @@ pub fn runStop(
         // "not running" message.
         error.FileMissing => {
             if (probeGatewayPort(opts.allocator, io, opts.host, opts.port)) {
+                // Try to identify and kill the orphan via `lsof -ti`.
+                // Shelling out is ugly but beats the alternative of
+                // linking against libproc or asking the operator to
+                // run lsof themselves every time. Only fires when
+                // --force is set so casual `gateway stop` calls still
+                // require a conscious confirmation from the operator.
+                if (opts.force) {
+                    if (findOrphanPid(opts.allocator, opts.port)) |orphan_pid| {
+                        std.posix.kill(orphan_pid, std.posix.SIG.CONT) catch {};
+                        std.posix.kill(orphan_pid, std.posix.SIG.KILL) catch {};
+                        try out.print(
+                            "gateway orphan (pid {d}) on {s}:{d} killed\n",
+                            .{ orphan_pid, opts.host, opts.port },
+                        );
+                        return;
+                    }
+                }
                 try out.print(
-                    "pidfile missing but {s}:{d} has a live listener — orphan process holding the port\n",
+                    "pidfile missing but {s}:{d} has a live listener — orphan process holding the port; pass --force to kill it\n",
                     .{ opts.host, opts.port },
                 );
                 return error.OrphanListener;
@@ -748,6 +765,46 @@ pub fn runStop(
     }
     pidfile.remove(io, state_dir, pidfile_name) catch {};
     return error.Timeout;
+}
+
+// libc declarations for orphan-pid discovery. Zig 0.16's
+// `std.process.Child` API is in transition and doesn't yet expose a
+// stable spawn-and-read pipeline, so we shell out via `popen(3)` and
+// parse the first line of lsof output ourselves.
+const LIBC_FILE = opaque {};
+extern "c" fn popen(cmd: [*:0]const u8, mode: [*:0]const u8) ?*LIBC_FILE;
+extern "c" fn pclose(stream: *LIBC_FILE) c_int;
+extern "c" fn fread(ptr: [*]u8, size: usize, n: usize, stream: *LIBC_FILE) usize;
+
+/// Ask `lsof` who's listening on `port`. Returns the first matching
+/// pid, or null if nothing is listening or lsof isn't installed. Only
+/// used on the orphan-recovery path; the normal stop flow walks the
+/// pidfile.
+fn findOrphanPid(allocator: std.mem.Allocator, port: u16) ?std.posix.pid_t {
+    _ = allocator;
+    var cmd_buf: [64]u8 = undefined;
+    const cmd = std.fmt.bufPrintZ(
+        &cmd_buf,
+        "lsof -ti TCP:{d} -sTCP:LISTEN 2>/dev/null",
+        .{port},
+    ) catch return null;
+
+    const f = popen(cmd.ptr, "r") orelse return null;
+    defer _ = pclose(f);
+
+    var out_buf: [64]u8 = undefined;
+    const n = fread(&out_buf, 1, out_buf.len, f);
+    if (n == 0) return null;
+
+    const trimmed = std.mem.trim(u8, out_buf[0..n], " \t\r\n");
+    var it = std.mem.splitScalar(u8, trimmed, '\n');
+    const first = it.next() orelse return null;
+    const pid = std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, first, " \t\r"),
+        10,
+    ) catch return null;
+    return pid;
 }
 
 /// Return `true` when `host:port` has anything accepting TCP. We use
