@@ -400,13 +400,22 @@ fn rewriteFile(
     channel_id: spec.ChannelId,
     records: []const Record,
 ) AckError!void {
-    outbox.state_root.createDirPath(outbox.io, outbox_dir_name) catch return error.IoFailure;
+    const rewrite_log = std.log.scoped(.outbox_rewrite);
+    outbox.state_root.createDirPath(outbox.io, outbox_dir_name) catch |e| {
+        rewrite_log.warn("createDirPath failed: {s}", .{@errorName(e)});
+        return error.IoFailure;
+    };
 
     var path_buf: [64]u8 = undefined;
-    const path = outboxFilePath(&path_buf, channel_id) catch return error.IoFailure;
-
-    var atomic = outbox.state_root.createFileAtomic(outbox.io, path, .{ .replace = true }) catch
+    const path = outboxFilePath(&path_buf, channel_id) catch |e| {
+        rewrite_log.warn("outboxFilePath failed: {s}", .{@errorName(e)});
         return error.IoFailure;
+    };
+
+    var atomic = outbox.state_root.createFileAtomic(outbox.io, path, .{ .replace = true }) catch |e| {
+        rewrite_log.warn("createFileAtomic failed: {s}", .{@errorName(e)});
+        return error.IoFailure;
+    };
     defer atomic.deinit(outbox.io);
 
     var write_buf: [1024]u8 = undefined;
@@ -416,11 +425,23 @@ fn rewriteFile(
         const line = std.json.Stringify.valueAlloc(outbox.allocator, r, .{}) catch
             return error.OutOfMemory;
         defer outbox.allocator.free(line);
-        writer.interface.writeAll(line) catch return error.IoFailure;
-        writer.interface.writeAll("\n") catch return error.IoFailure;
+        writer.interface.writeAll(line) catch |e| {
+            rewrite_log.warn("writeAll(line) failed: {s}", .{@errorName(e)});
+            return error.IoFailure;
+        };
+        writer.interface.writeAll("\n") catch |e| {
+            rewrite_log.warn("writeAll(newline) failed: {s}", .{@errorName(e)});
+            return error.IoFailure;
+        };
     }
-    writer.interface.flush() catch return error.IoFailure;
-    atomic.replace(outbox.io) catch return error.IoFailure;
+    writer.interface.flush() catch |e| {
+        rewrite_log.warn("flush failed: {s}", .{@errorName(e)});
+        return error.IoFailure;
+    };
+    atomic.replace(outbox.io) catch |e| {
+        rewrite_log.warn("atomic.replace failed: {s}", .{@errorName(e)});
+        return error.IoFailure;
+    };
 }
 
 /// Wire-format record written to disk. Private to the module; the

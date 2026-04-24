@@ -506,8 +506,13 @@ pub const Bot = struct {
 };
 
 /// Pure helper exposed so the wire shape can be pinned in tests without
-/// standing up an HTTP client. Emits the canonical sendMessage body; we
-/// deliberately omit `parse_mode` — plain text is the safe default.
+/// standing up an HTTP client. Emits the canonical sendMessage body
+/// with `parse_mode: "Markdown"` so agent replies render `**bold**`,
+/// `*italic*`, inline code, and bullet lists in the client. Legacy
+/// Markdown (not MarkdownV2) — v2 requires escaping a long list of
+/// punctuation that LLM output routinely violates. If Telegram rejects
+/// a particular message as unparseable the outbox logs BadRequest and
+/// skips it; the dispatch queue keeps moving.
 pub fn buildSendMessageBody(
     allocator: std.mem.Allocator,
     chat_id: i64,
@@ -524,6 +529,8 @@ pub fn buildSendMessageBody(
     try stringify.write(chat_id);
     try stringify.objectField("text");
     try stringify.write(text);
+    try stringify.objectField("parse_mode");
+    try stringify.write("Markdown");
     if (reply_to_message_id) |r| {
         try stringify.objectField("reply_to_message_id");
         try stringify.write(r);
@@ -603,7 +610,7 @@ test "telegram: buildSendMessageBody without reply" {
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_id\":42") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"text\":\"hi there\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "reply_to_message_id") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "parse_mode") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"parse_mode\":\"Markdown\"") != null);
 }
 
 test "telegram: buildSendMessageBody with reply id" {

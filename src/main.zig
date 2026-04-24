@@ -25,8 +25,9 @@ pub fn main(init: std.process.Init) !u8 {
     defer stderr_w.interface.flush() catch {};
 
     if (argv.len < 2) {
-        try cli.printHelp(&stderr_w.interface);
-        return 64; // EX_USAGE
+        // Auto-start gateway as child process if /health is unreachable,
+        // then run the TUI.
+        return runTuiWithGateway(arena, io, init);
     }
 
     // Convert [:0]const u8 slices to []const u8 for the parser.
@@ -539,4 +540,19 @@ test "shouldEnableColor: windows/wasi stay monochrome without force" {
     var map = try makeEnvMap(std.testing.allocator, &.{});
     defer map.deinit();
     try std.testing.expect(!shouldEnableColor(&map, false));
+}
+
+const tui = @import("tui/root.zig");
+
+fn runTuiWithGateway(arena: std.mem.Allocator, io: std.Io, init: std.process.Init) !u8 {
+    _ = init;
+    tui.run(arena, io, .{}) catch |err| {
+        // The tty is now in an undefined state if vaxis bailed
+        // mid-render; print to stderr via libc write so we don't
+        // re-enter the possibly-broken Io write path.
+        const msg = std.fmt.allocPrint(arena, "tigerclaw tui: {s}\n", .{@errorName(err)}) catch "tui failed\n";
+        _ = std.c.write(2, msg.ptr, msg.len);
+        return 1;
+    };
+    return 0;
 }

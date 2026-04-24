@@ -234,6 +234,14 @@ pub fn build(b: *std.Build) void {
         exe_mod.addImport("memory_tigerclaw", m);
         exe_mod.linkSystemLibrary("sqlite3", .{});
     }
+
+    // Vaxis TUI dependency
+    const vaxis_dep = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
+
     const exe = b.addExecutable(.{
         .name = "tigerclaw",
         .root_module = exe_mod,

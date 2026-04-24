@@ -38,6 +38,14 @@ pub const Sender = struct {
     poll_interval_ns: u64 = 200 * std.time.ns_per_ms,
     cancel: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    /// Record ids whose on-disk ack persistence failed. Kept in
+    /// process memory so we don't re-send the same reply every
+    /// poll pass while the ack path is broken. Bounded at a small
+    /// size — once we run out of slots new failures just retry.
+    /// Survives only for the sender's lifetime; a daemon restart
+    /// will see the unacked records and retry once (acceptable).
+    failed_acks: std.ArrayList([]u8) = .empty,
+    failed_allocator: ?std.mem.Allocator = null,
 
     pub fn init(
         io: std.Io,
@@ -53,6 +61,32 @@ pub const Sender = struct {
         };
     }
 
+    /// Attach an allocator for the failed-ack dedupe list. Called
+    /// from start(). Separate from init() so the struct can be
+    /// constructed without an allocator on the hot path.
+    fn ensureFailedAcksAllocator(self: *Sender) void {
+        if (self.failed_allocator == null) self.failed_allocator = self.outbox.allocator;
+    }
+
+    /// Record an id whose ack persistence failed so subsequent drain
+    /// passes skip it instead of re-delivering forever. Bounded at
+    /// 1024 slots — new failures silently drop once full (we'd
+    /// rather re-send than OOM).
+    fn rememberFailedAck(self: *Sender, id: []const u8) void {
+        self.ensureFailedAcksAllocator();
+        const alloc = self.failed_allocator orelse return;
+        if (self.failed_acks.items.len >= 1024) return;
+        const dup = alloc.dupe(u8, id) catch return;
+        self.failed_acks.append(alloc, dup) catch alloc.free(dup);
+    }
+
+    fn hasFailedAck(self: *const Sender, id: []const u8) bool {
+        for (self.failed_acks.items) |f| {
+            if (std.mem.eql(u8, f, id)) return true;
+        }
+        return false;
+    }
+
     pub fn start(self: *Sender) std.Thread.SpawnError!void {
         if (self.thread != null) return;
         self.cancel.store(false, .release);
@@ -64,6 +98,10 @@ pub const Sender = struct {
         if (self.thread) |t| {
             t.join();
             self.thread = null;
+        }
+        if (self.failed_allocator) |alloc| {
+            for (self.failed_acks.items) |f| alloc.free(f);
+            self.failed_acks.deinit(alloc);
         }
     }
 };
@@ -114,6 +152,13 @@ fn drainOnce(self: *Sender, ch: spec.Channel) !void {
     while (true) {
         const pending = (try cursor.next()) orelse return;
 
+        // Skip records whose ack persistence previously failed. The
+        // user-visible message already landed on the channel; the
+        // only unfinished work is flipping the on-disk ack bit, and
+        // retrying the send would duplicate. Data loss on daemon
+        // restart is preferable to duplicated delivery.
+        if (self.hasFailedAck(pending.id)) continue;
+
         const sent = ch.send(.{
             .conversation_key = pending.conversation_key,
             .thread_key = pending.thread_key,
@@ -128,6 +173,7 @@ fn drainOnce(self: *Sender, ch: spec.Channel) !void {
                 log.warn("outbox: non-retryable {s}; acking and moving on", .{@errorName(err)});
                 cursor.ack(pending.id) catch |ack_err| {
                     log.warn("outbox: ack after fatal failed: {s}", .{@errorName(ack_err)});
+                    self.rememberFailedAck(pending.id);
                 };
                 continue;
             },
@@ -144,6 +190,7 @@ fn drainOnce(self: *Sender, ch: spec.Channel) !void {
 
         cursor.ack(pending.id) catch |err| {
             log.warn("outbox: ack failed after successful send: {s}", .{@errorName(err)});
+            self.rememberFailedAck(pending.id);
         };
     }
 }

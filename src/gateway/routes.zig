@@ -250,7 +250,7 @@ fn sessionsTurnHandler(
         return renderSseFromOutput(result.output);
     }
 
-    return http.Response.jsonOk("{\"status\":\"ok\"}");
+    return renderJsonFromOutput(result.output);
 }
 
 /// Pull `message` out of the request body JSON. Empty body → empty
@@ -274,6 +274,30 @@ fn extractMessage(body: []const u8) error{BadRequest}![]const u8 {
     const needle = m.string;
     const start = std.mem.indexOf(u8, body, needle) orelse return error.BadRequest;
     return body[start .. start + needle.len];
+}
+
+/// Shared buffer for both the SSE and JSON renderers. Threadlocal
+/// so two concurrent requests on different TCP-server threads don't
+/// stomp each other; each handler consumes its own thread's buffer
+/// before the thread services the next request.
+threadlocal var render_body_buf: [16 * 1024]u8 = undefined;
+
+/// Build a plain JSON response carrying the runner's output. The
+/// TUI / CLI clients consume this without having to parse SSE; the
+/// `output` field is a JSON-escaped string, so newlines and quotes
+/// round-trip cleanly.
+fn renderJsonFromOutput(output: []const u8) http.Response {
+    // JSON-escape `output` into the thread-local buffer. We leave
+    // 64 bytes of headroom for the surrounding {"output":""} shell.
+    const budget = render_body_buf.len - 64;
+    const src = if (output.len > budget) output[0..budget] else output;
+
+    var w = std.Io.Writer.fixed(&render_body_buf);
+    w.writeAll("{\"output\":") catch return .{ .status = .internal_server_error, .body = "render failed\n" };
+    std.json.Stringify.encodeJsonString(src, .{}, &w) catch
+        return .{ .status = .internal_server_error, .body = "render failed\n" };
+    w.writeAll("}") catch return .{ .status = .internal_server_error, .body = "render failed\n" };
+    return http.Response.jsonOk(w.buffered());
 }
 
 /// Build the SSE response body for a one-shot runner output. Memory

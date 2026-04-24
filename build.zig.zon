@@ -3,7 +3,11 @@
     .version = "0.1.0-alpha",
     .fingerprint = 0xcb01b61abf0205ee,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .vaxis = .{
+            .path = "packages/vaxis",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
