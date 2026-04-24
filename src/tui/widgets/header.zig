@@ -94,16 +94,11 @@ pub fn draw(self: *const Header, ctx: vxfw.DrawContext) std.mem.Allocator.Error!
     // whatever bytes happened to survive in the popped frame.
     const agent_chip = try std.fmt.allocPrint(ctx.arena, " {s} ", .{self.agent_name});
 
-    const spinner = spinner_frames[@intCast(self.spinner_tick % spinner_frames.len)];
-    // Same-width padding on the idle chip keeps the status chip's
-    // column-span stable across pending→ready transitions, which
-    // used to leave trailing "dy" / "king" glyphs with the
-    // hand-rolled renderer.
-    const status_text = if (self.pending)
-        try std.fmt.allocPrint(ctx.arena, " {s} thinking ", .{spinner})
-    else
-        " ● ready    ";
-    const status_style = if (self.pending) status_busy_style else status_idle_style;
+    // Header chip is ready-only now — the "thinking" UX moved
+    // to the ThinkingWidget above the input, closer to where
+    // the user's attention naturally lives during a turn.
+    const status_text = " ● ready ";
+    const status_style = status_idle_style;
 
     const chip_cols = gwidth(ctx, agent_chip);
     const status_cols = gwidth(ctx, status_text);

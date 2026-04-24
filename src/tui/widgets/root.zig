@@ -22,6 +22,7 @@ const harness = @import("../../harness/root.zig");
 const Header = @import("header.zig");
 const History = @import("history.zig");
 const Input = @import("input.zig");
+const Thinking = @import("thinking.zig");
 
 const Root = @This();
 
@@ -34,6 +35,10 @@ header: Header,
 /// widget borrows a slice of this list per frame.
 history: std.ArrayList(tui.Line) = .empty,
 input: Input,
+thinking: Thinking = .{},
+/// Wall-clock instant the current turn started, in ms since
+/// the Unix epoch. 0 when no turn is in flight.
+turn_started_ms: i64 = 0,
 /// Borrowed runner. Set by \`attachRunner\` before \`App.run\`;
 /// null during tests that don't spin up a real runner.
 runner: ?*harness.AgentRunner = null,
@@ -154,6 +159,13 @@ fn beginTurn(self: *Root, typed: []const u8) !void {
     self.pending_saw_text = false;
 
     self.header.pending = true;
+    self.thinking.pending = true;
+    self.thinking.spinner_tick = 0;
+    // Rotate verb per turn via a cheap LCG; anything is fine here
+    // since we just want the verb to change each time.
+    self.thinking.verb_index = @intCast(@mod(vxfw.milliTimestamp(), 0xFF));
+    self.thinking.elapsed_ms = 0;
+    self.turn_started_ms = vxfw.milliTimestamp();
 
     // Dup the message so the worker owns it independent of the
     // input buffer (which clears right after on_submit returns).
@@ -341,8 +353,9 @@ fn eventHandler(
             ctx.redraw = true;
         },
         .tick => {
-            if (self.header.pending) {
-                self.header.spinner_tick +%= 1;
+            if (self.thinking.pending) {
+                self.thinking.spinner_tick +%= 1;
+                self.thinking.elapsed_ms = @intCast(@max(0, vxfw.milliTimestamp() - self.turn_started_ms));
                 ctx.redraw = true;
             }
             // Keep the tick chain alive so the spinner keeps
@@ -445,6 +458,8 @@ fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent) !vo
         self.pending_agent_line = null;
         self.pending_saw_text = false;
         self.header.pending = false;
+        self.thinking.pending = false;
+        self.turn_started_ms = 0;
         ctx.redraw = true;
     }
 }
@@ -455,14 +470,17 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     const height = ctx.max.height orelse 0;
 
     // Layout (top → bottom):
-    //   rows 0..1       header (2 rows)
-    //   rows 2..h-4     history (remaining minus input)
-    //   rows h-3..h-1   input box (3 rows: top border, text, bottom border)
+    //   rows 0..1                    header (2 rows)
+    //   rows 2..history_end-1        history
+    //   thinking_row                 thinking row (1 row when pending, 0 else)
+    //   bottom 3 rows                input box
     const header_rows: u16 = 2;
     const input_rows: u16 = 3;
-    const history_rows: u16 = if (height > header_rows + input_rows) height - header_rows - input_rows else 0;
+    const thinking_rows: u16 = if (self.thinking.pending) 1 else 0;
+    const reserved: u16 = header_rows + thinking_rows + input_rows;
+    const history_rows: u16 = if (height > reserved) height - reserved else 0;
 
-    const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
+    const children = try ctx.arena.alloc(vxfw.SubSurface, 4);
     const surface = try vxfw.Surface.initWithChildren(
         ctx.arena,
         self.widget(),
@@ -494,13 +512,24 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
         .z_index = 0,
     };
 
-    // Input at the bottom. Full width; the widget draws its own
-    // border.
+    // Thinking row — draws nothing when not pending.
+    const thinking_surface = try self.thinking.widget().draw(ctx.withConstraints(
+        .{ .width = 0, .height = 0 },
+        .{ .width = width, .height = thinking_rows },
+    ));
+    const thinking_row: u16 = @intCast(header_rows + history_rows);
+    surface.children[2] = .{
+        .origin = .{ .row = @intCast(thinking_row), .col = 0 },
+        .surface = thinking_surface,
+        .z_index = 0,
+    };
+
+    // Input at the bottom.
     const input_surface = try self.input.widget().draw(ctx.withConstraints(
         .{ .width = 0, .height = 0 },
         .{ .width = width, .height = input_rows },
     ));
-    surface.children[2] = .{
+    surface.children[3] = .{
         .origin = .{ .row = @intCast(height - input_rows), .col = 0 },
         .surface = input_surface,
         .z_index = 0,
