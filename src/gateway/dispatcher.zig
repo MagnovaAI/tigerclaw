@@ -18,13 +18,27 @@ pub const HandlerError = error{
     InternalServerError,
 };
 
-/// Handlers receive the request plus the matched route parameters.
-/// Return an in-process `http.Response`; the caller writes it to the
-/// wire.
+/// Opaque stream hook: a pointer to the underlying
+/// `std.http.Server.Request` when the gateway is running against a
+/// real TCP connection, null when the dispatcher is being driven by
+/// in-process tests. Handlers that want to stream a chunked body
+/// (SSE, long-running downloads) can cast this back via
+/// `streaming.cast()` and call `respondStreaming` directly. When a
+/// handler has responded via the stream hook it must return
+/// `streaming_handled_sentinel` so the tcp_server skips the
+/// buffered-response path.
+pub const StreamHook = ?*anyopaque;
+
+/// Handlers receive the request plus the matched route parameters
+/// and an optional stream hook. Return an in-process `http.Response`;
+/// if the handler used the stream hook to respond, it must return
+/// `http.Response.streamingHandled()` so the caller knows not to
+/// write a second response.
 pub const Handler = *const fn (
     req: http.Request,
     params: []const router.Param,
     tail: ?[]const u8,
+    stream_hook: StreamHook,
 ) HandlerError!http.Response;
 
 pub const HandlerEntry = struct {
@@ -43,6 +57,7 @@ pub fn dispatch(
     routes: []const router.Route,
     handlers: HandlerMap,
     req: http.Request,
+    stream_hook: StreamHook,
 ) DispatchError!http.Response {
     var params_buffer: [router.max_params]router.Param = undefined;
     const resolved = try router.resolve(routes, req.method, req.target, &params_buffer);
@@ -51,7 +66,7 @@ pub fn dispatch(
         .match => |m| {
             for (handlers) |entry| {
                 if (std.mem.eql(u8, entry.tag, m.route.tag)) {
-                    return entry.handler(req, m.params, m.tail);
+                    return entry.handler(req, m.params, m.tail, stream_hook);
                 }
             }
             return error.HandlerMissing;
@@ -81,6 +96,7 @@ fn healthHandler(
     _: http.Request,
     _: []const router.Param,
     _: ?[]const u8,
+    _: StreamHook,
 ) HandlerError!http.Response {
     return http.Response.jsonOk(canned_ok_body);
 }
@@ -89,6 +105,7 @@ fn echoIdHandler(
     _: http.Request,
     params: []const router.Param,
     _: ?[]const u8,
+    _: StreamHook,
 ) HandlerError!http.Response {
     // Verify the dispatcher forwarded the captured :id param.
     for (params) |p| {
@@ -111,26 +128,26 @@ const test_handlers = [_]HandlerEntry{
 
 test "dispatch: literal route invokes the matching handler" {
     const req: http.Request = .{ .method = .GET, .target = "/health", .headers = &.{} };
-    const resp = try dispatch(&test_routes, &test_handlers, req);
+    const resp = try dispatch(&test_routes, &test_handlers, req, null);
     try testing.expectEqual(http.Status.ok, resp.status);
     try testing.expectEqualStrings(canned_ok_body, resp.body);
 }
 
 test "dispatch: param route forwards captured params to the handler" {
     const req: http.Request = .{ .method = .GET, .target = "/sessions/abc-123", .headers = &.{} };
-    const resp = try dispatch(&test_routes, &test_handlers, req);
+    const resp = try dispatch(&test_routes, &test_handlers, req, null);
     try testing.expectEqualStrings("abc-123", resp.body);
 }
 
 test "dispatch: unknown path returns 404 from Response.notFound" {
     const req: http.Request = .{ .method = .GET, .target = "/missing", .headers = &.{} };
-    const resp = try dispatch(&test_routes, &test_handlers, req);
+    const resp = try dispatch(&test_routes, &test_handlers, req, null);
     try testing.expectEqual(http.Status.not_found, resp.status);
 }
 
 test "dispatch: wrong method returns a 405 body" {
     const req: http.Request = .{ .method = .DELETE, .target = "/health", .headers = &.{} };
-    const resp = try dispatch(&test_routes, &test_handlers, req);
+    const resp = try dispatch(&test_routes, &test_handlers, req, null);
     try testing.expectEqual(http.Status.method_not_allowed, resp.status);
 }
 
@@ -141,6 +158,6 @@ test "dispatch: missing handler tag surfaces HandlerMissing" {
     const req: http.Request = .{ .method = .GET, .target = "/orphan", .headers = &.{} };
     try testing.expectError(
         error.HandlerMissing,
-        dispatch(&routes, &test_handlers, req),
+        dispatch(&routes, &test_handlers, req, null),
     );
 }

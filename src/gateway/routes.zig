@@ -121,6 +121,7 @@ fn healthHandler(
     _: http.Request,
     _: []const router.Param,
     _: ?[]const u8,
+    _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     const ctx = try contextOrInternal();
     // Surface the in-flight turn count so ops can watch drain.
@@ -138,6 +139,7 @@ fn configReloadHandler(
     _: http.Request,
     _: []const router.Param,
     _: ?[]const u8,
+    _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     const ctx = try contextOrInternal();
     if (ctx.reload_callback) |cb| cb(ctx.reload_userdata);
@@ -153,6 +155,7 @@ fn sessionsListHandler(
     _: http.Request,
     _: []const router.Param,
     _: ?[]const u8,
+    _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     // The mock gateway does not persist sessions; return an empty
     // array so clients can smoke-test the shape.
@@ -163,6 +166,7 @@ fn sessionsCreateHandler(
     _: http.Request,
     _: []const router.Param,
     _: ?[]const u8,
+    _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     // Always returns a fixed mock id so tests are deterministic.
     return .{
@@ -176,6 +180,7 @@ fn sessionsGetHandler(
     _: http.Request,
     params: []const router.Param,
     _: ?[]const u8,
+    _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     const id = findParam(params, "id") orelse return error.BadRequest;
     if (std.mem.eql(u8, id, "mock-session")) {
@@ -188,6 +193,7 @@ fn sessionsDeleteHandler(
     _: http.Request,
     params: []const router.Param,
     _: ?[]const u8,
+    _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     _ = findParam(params, "id") orelse return error.BadRequest;
     return .{ .status = .no_content };
@@ -197,6 +203,7 @@ fn sessionsMessageHandler(
     _: http.Request,
     params: []const router.Param,
     _: ?[]const u8,
+    _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     _ = findParam(params, "id") orelse return error.BadRequest;
     return .{ .status = .accepted };
@@ -206,6 +213,7 @@ fn sessionsTurnHandler(
     req: http.Request,
     params: []const router.Param,
     _: ?[]const u8,
+    _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     const ctx = try contextOrInternal();
     const id = findParam(params, "id") orelse return error.BadRequest;
@@ -348,6 +356,7 @@ fn sessionsTurnCancelHandler(
     _: http.Request,
     params: []const router.Param,
     _: ?[]const u8,
+    _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     const ctx = try contextOrInternal();
     _ = findParam(params, "id") orelse return error.BadRequest;
@@ -394,7 +403,7 @@ fn withMockContext(comptime body: fn (runner: *harness.MockAgentRunner) anyerror
 
 fn runHealth(_: *harness.MockAgentRunner) anyerror!void {
     const req: http.Request = .{ .method = .GET, .target = "/health", .headers = &.{} };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.ok, resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"ok\"") != null);
 }
@@ -405,7 +414,7 @@ test "routes: GET /health returns 200" {
 
 fn runList(_: *harness.MockAgentRunner) anyerror!void {
     const req: http.Request = .{ .method = .GET, .target = "/sessions", .headers = &.{} };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.ok, resp.status);
     try testing.expectEqualStrings("{\"sessions\":[]}", resp.body);
 }
@@ -416,7 +425,7 @@ test "routes: GET /sessions returns an empty list in mock mode" {
 
 fn runCreate(_: *harness.MockAgentRunner) anyerror!void {
     const req: http.Request = .{ .method = .POST, .target = "/sessions", .headers = &.{} };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.created, resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "mock-session") != null);
 }
@@ -427,7 +436,7 @@ test "routes: POST /sessions returns 201 with the canned id" {
 
 fn runGet(_: *harness.MockAgentRunner) anyerror!void {
     const req: http.Request = .{ .method = .GET, .target = "/sessions/mock-session", .headers = &.{} };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.ok, resp.status);
 }
 
@@ -437,7 +446,7 @@ test "routes: GET /sessions/mock-session returns 200" {
 
 fn runGetMissing(_: *harness.MockAgentRunner) anyerror!void {
     const req: http.Request = .{ .method = .GET, .target = "/sessions/unknown", .headers = &.{} };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.not_found, resp.status);
 }
 
@@ -447,7 +456,7 @@ test "routes: GET /sessions/unknown returns 404" {
 
 fn runTurn(runner: *harness.MockAgentRunner) anyerror!void {
     const req: http.Request = .{ .method = .POST, .target = "/sessions/s1/turns", .headers = &.{} };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.ok, resp.status);
     try testing.expect(runner.in_flight.isZero());
 }
@@ -470,7 +479,7 @@ test "routes: POST /sessions/:id/turns returns 429 when the budget is exhausted"
         .target = "/sessions/s1/turns",
         .headers = &.{},
     };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.too_many_requests, resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "budget_exceeded") != null);
 
@@ -485,7 +494,7 @@ fn runTurnSse(runner: *harness.MockAgentRunner) anyerror!void {
         .target = "/sessions/s1/turns",
         .headers = &accept,
     };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.ok, resp.status);
     try testing.expect(runner.in_flight.isZero());
 
@@ -521,7 +530,7 @@ fn runTurnAcceptMixed(_: *harness.MockAgentRunner) anyerror!void {
         .target = "/sessions/s1/turns",
         .headers = &accept,
     };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "event: token") != null);
 }
 
@@ -535,7 +544,7 @@ fn runTurnCancel(_: *harness.MockAgentRunner) anyerror!void {
         .target = "/sessions/s1/turns/current",
         .headers = &.{},
     };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.no_content, resp.status);
 }
 
@@ -552,7 +561,7 @@ fn runTurnCancelMissingId(_: *harness.MockAgentRunner) anyerror!void {
         .target = "/sessions//turns/current",
         .headers = &.{},
     };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     // Empty :id segment is matched by the router but the handler
     // captures it as an empty string; we still 204 — the mock runner
     // doesn't care about the id and the cancel is best-effort.
@@ -565,7 +574,7 @@ test "routes: DELETE /sessions//turns/current degrades to 204 or 404" {
 
 fn runDelete(_: *harness.MockAgentRunner) anyerror!void {
     const req: http.Request = .{ .method = .DELETE, .target = "/sessions/s1", .headers = &.{} };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.no_content, resp.status);
 }
 
@@ -576,7 +585,7 @@ test "routes: DELETE /sessions/:id returns 204" {
 fn runConfigReload(_: *harness.MockAgentRunner) anyerror!void {
     const before = reload_generation.load(.monotonic);
     const req: http.Request = .{ .method = .POST, .target = "/config/reload", .headers = &.{} };
-    const resp = try dispatcher.dispatch(&routes, &handlers, req);
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
     try testing.expectEqual(http.Status.accepted, resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"reload\":\"queued\"") != null);
     try testing.expectEqual(before + 1, reload_generation.load(.monotonic));
@@ -605,8 +614,8 @@ test "routes: POST /config/reload fires the context's reload_callback per reques
     defer clearContext();
 
     const req: http.Request = .{ .method = .POST, .target = "/config/reload", .headers = &.{} };
-    _ = try dispatcher.dispatch(&routes, &handlers, req);
-    _ = try dispatcher.dispatch(&routes, &handlers, req);
+    _ = try dispatcher.dispatch(&routes, &handlers, req, null);
+    _ = try dispatcher.dispatch(&routes, &handlers, req, null);
 
     try testing.expectEqual(@as(u32, 2), reload_cb_counter);
 }

@@ -93,6 +93,20 @@ pub const Response = struct {
     /// injected by the adapter.
     headers: []const Header = &.{},
     body: []const u8 = "",
+    /// When true, the handler has already written the response via
+    /// the stream hook on `dispatcher.StreamHook`; the tcp_server
+    /// must not emit a second response. Status/headers/body are
+    /// ignored in that case. This is the streaming completion
+    /// signal — handlers set it via `Response.streamingHandled()`.
+    streaming_handled: bool = false,
+
+    /// Sentinel for handlers that have already finished responding
+    /// through a streaming hook. Returned instead of a normal
+    /// response so the dispatcher/tcp_server can tell the two
+    /// paths apart without a second response-envelope write.
+    pub fn streamingHandled() Response {
+        return .{ .status = .ok, .streaming_handled = true };
+    }
 
     pub fn jsonOk(body: []const u8) Response {
         return .{

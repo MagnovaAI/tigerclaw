@@ -25,6 +25,7 @@ fn pingHandler(
     _: gateway.http.Request,
     _: []const gateway.router.Param,
     _: ?[]const u8,
+    _: gateway.dispatcher.StreamHook,
 ) gateway.dispatcher.HandlerError!gateway.http.Response {
     return gateway.http.Response.jsonOk("{\"pong\":true}");
 }

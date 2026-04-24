@@ -181,7 +181,7 @@ fn handleConnection(
         .body = body_storage,
     };
 
-    const resp = dispatcher.dispatch(routes, handlers, our_req) catch |err| switch (err) {
+    const resp = dispatcher.dispatch(routes, handlers, our_req, @ptrCast(&request)) catch |err| switch (err) {
         error.HandlerMissing, error.InternalServerError => {
             try respondStatus(&request, .internal_server_error, "internal error\n");
             return;
@@ -195,6 +195,11 @@ fn handleConnection(
             return;
         },
     };
+
+    // If the handler already streamed its response, the connection's
+    // BodyWriter has been closed by the handler itself — don't try to
+    // write a second response envelope.
+    if (resp.streaming_handled) return;
 
     try respondResolved(&request, resp);
 }
@@ -286,6 +291,7 @@ fn pingHandler(
     _: http.Request,
     _: []const router.Param,
     _: ?[]const u8,
+    _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     return http.Response.jsonOk("{\"pong\":true}");
 }
@@ -294,6 +300,7 @@ fn echoBodyHandler(
     req: http.Request,
     _: []const router.Param,
     _: ?[]const u8,
+    _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     return .{
         .status = .ok,
