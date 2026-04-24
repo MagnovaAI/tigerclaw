@@ -155,6 +155,17 @@ fn parseStreamInner(
     var err_text: ?[]const u8 = null;
     defer if (err_text) |e| allocator.free(e);
 
+    // Tool-use accumulator. Anthropic streams tool_use as a content
+    // block: `content_block_start` announces the id+name, then one
+    // or more `content_block_delta` events with `input_json_delta`
+    // chunks build up the arguments JSON. We buffer by index because
+    // multiple blocks can be active across interleaved events.
+    var tool_builders: std.ArrayListUnmanaged(ToolBuilder) = .empty;
+    defer {
+        for (tool_builders.items) |*b| b.deinit(allocator);
+        tool_builders.deinit(allocator);
+    }
+
     switch (input) {
         .literal => |bytes| try parser.feed(allocator, bytes),
         .reader => |r| {
@@ -168,13 +179,19 @@ fn parseStreamInner(
     }
 
     while (try parser.nextEvent(allocator)) |ev| {
-        if (std.mem.eql(u8, ev.name, "content_block_delta")) {
+        if (std.mem.eql(u8, ev.name, "content_block_start")) {
+            try absorbContentBlockStart(allocator, &tool_builders, ev.data);
+        } else if (std.mem.eql(u8, ev.name, "content_block_delta")) {
+            // `content_block_delta` carries either `text_delta` (user
+            // text) or `input_json_delta` (tool-call arguments). The
+            // absorb functions short-circuit on the wrong type.
             const before = text.items.len;
             try absorbDelta(allocator, &text, ev.data);
             if (sink) |s| {
                 const fragment = text.items[before..];
                 if (fragment.len > 0) s(sink_ctx, fragment);
             }
+            try absorbInputJsonDelta(allocator, &tool_builders, ev.data);
         } else if (std.mem.eql(u8, ev.name, "message_delta")) {
             try absorbMessageDelta(&usage, &stop, ev.data);
         } else if (std.mem.eql(u8, ev.name, "message_start")) {
@@ -196,11 +213,108 @@ fn parseStreamInner(
         };
     }
 
+    // Finalise tool calls. Anthropic emits an empty string for
+    // arguments when the tool takes no input; normalise that to "{}"
+    // so callers can always json-parse the field.
+    var tool_calls: std.ArrayListUnmanaged(types.ToolCall) = .empty;
+    errdefer {
+        for (tool_calls.items) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments_json);
+        }
+        tool_calls.deinit(allocator);
+    }
+    for (tool_builders.items) |*b| {
+        if (b.id.len == 0 or b.name.len == 0) continue;
+        const args = if (b.input.items.len == 0)
+            try allocator.dupe(u8, "{}")
+        else
+            try allocator.dupe(u8, b.input.items);
+        errdefer allocator.free(args);
+        try tool_calls.append(allocator, .{
+            .id = try allocator.dupe(u8, b.id),
+            .name = try allocator.dupe(u8, b.name),
+            .arguments_json = args,
+        });
+    }
+
     return .{
         .text = try text.toOwnedSlice(allocator),
+        .tool_calls = try tool_calls.toOwnedSlice(allocator),
         .usage = usage,
         .stop_reason = stop,
     };
+}
+
+/// Per-content-block accumulator for a tool_use response.
+const ToolBuilder = struct {
+    index: u32,
+    id: []const u8,
+    name: []const u8,
+    input: std.array_list.Aligned(u8, null),
+
+    fn deinit(self: *ToolBuilder, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        self.input.deinit(allocator);
+    }
+};
+
+fn absorbContentBlockStart(
+    allocator: std.mem.Allocator,
+    builders: *std.ArrayListUnmanaged(ToolBuilder),
+    data: []const u8,
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return;
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return;
+    const block = root.object.get("content_block") orelse return;
+    if (block != .object) return;
+    const kind = block.object.get("type") orelse return;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "tool_use")) return;
+
+    const idx_v = root.object.get("index") orelse return;
+    if (idx_v != .integer) return;
+    const id_v = block.object.get("id") orelse return;
+    if (id_v != .string) return;
+    const name_v = block.object.get("name") orelse return;
+    if (name_v != .string) return;
+
+    try builders.append(allocator, .{
+        .index = @intCast(idx_v.integer),
+        .id = try allocator.dupe(u8, id_v.string),
+        .name = try allocator.dupe(u8, name_v.string),
+        .input = .empty,
+    });
+}
+
+fn absorbInputJsonDelta(
+    allocator: std.mem.Allocator,
+    builders: *std.ArrayListUnmanaged(ToolBuilder),
+    data: []const u8,
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return;
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return;
+    const idx_v = root.object.get("index") orelse return;
+    if (idx_v != .integer) return;
+    const delta = root.object.get("delta") orelse return;
+    if (delta != .object) return;
+    const kind = delta.object.get("type") orelse return;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "input_json_delta")) return;
+    const partial = delta.object.get("partial_json") orelse return;
+    if (partial != .string) return;
+
+    const idx: u32 = @intCast(idx_v.integer);
+    for (builders.items) |*b| {
+        if (b.index == idx) {
+            try b.input.appendSlice(allocator, partial.string);
+            return;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +498,33 @@ pub fn buildRequestBody(
         try stringify.endObject();
     }
     try stringify.endArray();
+
+    if (request.tools.len > 0) {
+        try stringify.objectField("tools");
+        try stringify.beginArray();
+        for (request.tools) |tool| {
+            try stringify.beginObject();
+            try stringify.objectField("name");
+            try stringify.write(tool.name);
+            try stringify.objectField("description");
+            try stringify.write(tool.description);
+            // `input_schema_json` is already-encoded JSON. Round-trip
+            // it through `std.json.Value` so the Stringify state
+            // machine (which tracks field/value expectations and
+            // emits separating commas) sees it as a single value.
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                tool.input_schema_json,
+                .{},
+            );
+            defer parsed.deinit();
+            try stringify.objectField("input_schema");
+            try stringify.write(parsed.value);
+            try stringify.endObject();
+        }
+        try stringify.endArray();
+    }
 
     try stringify.objectField("stream");
     try stringify.write(true);
@@ -610,8 +751,57 @@ test "anthropic: buildRequestBody renders canonical wire shape" {
     try testing.expect(std.mem.indexOf(u8, body, "\"system\":[{") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"content\":[{\"type\":\"text\",\"text\":\"hi there\"}]") != null);
+    // Tools absent by default.
+    try testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
     // Loose match: avoid coupling to f32 → JSON formatting precision.
     try testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.6") != null);
+}
+
+test "anthropic: buildRequestBody serialises tools with a nested object schema" {
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = "what time is it" },
+    };
+    const tools = [_]types.Tool{
+        .{
+            .name = "get_current_time",
+            .description = "Return the current UTC time.",
+            .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+        },
+    };
+    const req: ChatRequest = .{
+        .messages = &messages,
+        .model = .{ .provider = "anthropic", .model = "claude-opus-4-7" },
+        .tools = &tools,
+    };
+
+    const body = try buildRequestBody(testing.allocator, req, 1024);
+    defer testing.allocator.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"get_current_time\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"description\":\"Return the current UTC time.\"") != null);
+    // The schema is spliced as a nested object, not a string.
+    try testing.expect(std.mem.indexOf(u8, body, "\"input_schema\":{\"type\":\"object\"") != null);
+}
+
+test "anthropic: parseStream captures a tool_use block as a ToolCall" {
+    // Minimal Anthropic tool-use stream: message_start, a tool_use
+    // content_block_start, one input_json_delta, message_delta with
+    // stop_reason=tool_use.
+    const bytes =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n" ++
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_current_time\"}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n";
+
+    const resp = try parseStream(testing.allocator, .{ .literal = bytes });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(types.StopReason.tool_use, resp.stop_reason);
+    try testing.expectEqual(@as(usize, 1), resp.tool_calls.len);
+    try testing.expectEqualStrings("toolu_1", resp.tool_calls[0].id);
+    try testing.expectEqualStrings("get_current_time", resp.tool_calls[0].name);
+    try testing.expectEqualStrings("{}", resp.tool_calls[0].arguments_json);
 }
 
 const ServerArgs = struct {
