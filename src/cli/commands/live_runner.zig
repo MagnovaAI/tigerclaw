@@ -342,6 +342,7 @@ pub const LiveAgentRunner = struct {
             for (resp.tool_calls) |tc| {
                 const result_text = dispatchBuiltinTool(
                     self.allocator,
+                    self.io,
                     clock_value,
                     tc.name,
                     tc.arguments_json,
@@ -404,13 +405,29 @@ pub const LiveAgentRunner = struct {
     }
 };
 
-/// The tool schemas the runner exposes to every agent. For now this
-/// is a hard-coded one-entry list; a real registry is future work.
+/// The tool schemas the runner exposes to every agent. A real
+/// plug-based registry is future work; this table is intentionally
+/// small so the model gets short, memorable tool names.
 const builtin_tools = [_]types.Tool{
     .{
         .name = "get_current_time",
         .description = "Return the current date and time as an ISO-8601 UTC string (for example `2026-04-23T23:45:12Z`). Takes no arguments.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+    },
+    .{
+        .name = "calculate",
+        .description = "Evaluate a numeric expression. Supports `+ - * / %` and parentheses on decimal numbers. Returns the result as a decimal string.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"expression\":{\"type\":\"string\",\"description\":\"The arithmetic expression to evaluate, e.g. (2 + 3) * 4.\"}},\"required\":[\"expression\"]}",
+    },
+    .{
+        .name = "random_number",
+        .description = "Return a pseudorandom integer in the inclusive range [min, max]. Uses the session clock as seed so outputs are deterministic across a given turn.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"min\":{\"type\":\"integer\"},\"max\":{\"type\":\"integer\"}},\"required\":[\"min\",\"max\"]}",
+    },
+    .{
+        .name = "fetch_url",
+        .description = "HTTP GET the URL and return the response body as text (max 64 KB). Only http:// and https:// schemes are allowed; private and loopback addresses are refused.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute URL to fetch.\"}},\"required\":[\"url\"]}",
     },
 };
 
@@ -418,15 +435,263 @@ const builtin_tools = [_]types.Tool{
 /// bubble so the runner can record the failure as the tool result.
 fn dispatchBuiltinTool(
     allocator: std.mem.Allocator,
+    io: std.Io,
     clock: clock_mod.Clock,
     name: []const u8,
     arguments_json: []const u8,
 ) ![]u8 {
-    _ = arguments_json; // only one tool, ignores args.
     if (std.mem.eql(u8, name, "get_current_time")) {
         return renderCurrentTimeIso8601(allocator, clock.nowNs());
     }
+    if (std.mem.eql(u8, name, "calculate")) {
+        return runCalculate(allocator, arguments_json);
+    }
+    if (std.mem.eql(u8, name, "random_number")) {
+        return runRandomNumber(allocator, clock.nowNs(), arguments_json);
+    }
+    if (std.mem.eql(u8, name, "fetch_url")) {
+        return runFetchUrl(allocator, io, arguments_json);
+    }
     return error.UnknownTool;
+}
+
+// ---------------------------------------------------------------------------
+// calculate
+
+/// Evaluate the arithmetic expression under `"expression"`. The
+/// grammar is the classic precedence-climbing one:
+///   expr    = term  { ('+' | '-') term }
+///   term    = factor { ('*' | '/' | '%') factor }
+///   factor  = ['-'] primary
+///   primary = number | '(' expr ')'
+fn runCalculate(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
+    const Args = struct { expression: []const u8 };
+    var parsed = try std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    var p = ExprParser{ .src = parsed.value.expression, .pos = 0 };
+    const value = try p.parseExpr();
+    p.skipSpaces();
+    if (p.pos != p.src.len) return error.TrailingInput;
+
+    return std.fmt.allocPrint(allocator, "{d}", .{value});
+}
+
+const ExprParser = struct {
+    src: []const u8,
+    pos: usize,
+
+    fn skipSpaces(self: *ExprParser) void {
+        while (self.pos < self.src.len and (self.src[self.pos] == ' ' or self.src[self.pos] == '\t')) {
+            self.pos += 1;
+        }
+    }
+
+    fn parseExpr(self: *ExprParser) anyerror!f64 {
+        var lhs = try self.parseTerm();
+        while (true) {
+            self.skipSpaces();
+            if (self.pos >= self.src.len) break;
+            const op = self.src[self.pos];
+            if (op != '+' and op != '-') break;
+            self.pos += 1;
+            const rhs = try self.parseTerm();
+            lhs = if (op == '+') lhs + rhs else lhs - rhs;
+        }
+        return lhs;
+    }
+
+    fn parseTerm(self: *ExprParser) anyerror!f64 {
+        var lhs = try self.parseFactor();
+        while (true) {
+            self.skipSpaces();
+            if (self.pos >= self.src.len) break;
+            const op = self.src[self.pos];
+            if (op != '*' and op != '/' and op != '%') break;
+            self.pos += 1;
+            const rhs = try self.parseFactor();
+            lhs = switch (op) {
+                '*' => lhs * rhs,
+                '/' => if (rhs == 0) return error.DivisionByZero else lhs / rhs,
+                '%' => if (rhs == 0) return error.DivisionByZero else @mod(lhs, rhs),
+                else => unreachable,
+            };
+        }
+        return lhs;
+    }
+
+    fn parseFactor(self: *ExprParser) anyerror!f64 {
+        self.skipSpaces();
+        if (self.pos < self.src.len and self.src[self.pos] == '-') {
+            self.pos += 1;
+            return -try self.parseFactor();
+        }
+        return self.parsePrimary();
+    }
+
+    fn parsePrimary(self: *ExprParser) anyerror!f64 {
+        self.skipSpaces();
+        if (self.pos >= self.src.len) return error.UnexpectedEnd;
+        if (self.src[self.pos] == '(') {
+            self.pos += 1;
+            const v = try self.parseExpr();
+            self.skipSpaces();
+            if (self.pos >= self.src.len or self.src[self.pos] != ')') return error.UnmatchedParen;
+            self.pos += 1;
+            return v;
+        }
+        // Number
+        const start = self.pos;
+        while (self.pos < self.src.len and
+            (std.ascii.isDigit(self.src[self.pos]) or self.src[self.pos] == '.'))
+        {
+            self.pos += 1;
+        }
+        if (self.pos == start) return error.ExpectedNumber;
+        return std.fmt.parseFloat(f64, self.src[start..self.pos]) catch return error.InvalidNumber;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// random_number
+
+/// Deterministic PRNG: mix the session clock with the min/max bounds
+/// via `std.Random.DefaultPrng`. Each turn's output is stable given
+/// the same clock reading, and the model can't tell the difference
+/// from a hardware RNG.
+fn runRandomNumber(allocator: std.mem.Allocator, now_ns: i128, arguments_json: []const u8) ![]u8 {
+    const Args = struct { min: i64, max: i64 };
+    var parsed = try std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    const min = parsed.value.min;
+    const max = parsed.value.max;
+    if (max < min) return error.EmptyRange;
+
+    const seed: u64 = @intCast(@mod(now_ns, std.math.maxInt(i64)));
+    var prng = std.Random.DefaultPrng.init(seed);
+    const span: u64 = @intCast(max - min + 1);
+    const pick: u64 = prng.random().uintLessThan(u64, span);
+    const value: i64 = min + @as(i64, @intCast(pick));
+    return std.fmt.allocPrint(allocator, "{d}", .{value});
+}
+
+// ---------------------------------------------------------------------------
+// fetch_url
+
+/// Minimal HTTP GET tool. Refuses non-http(s) URLs and any hostname
+/// that resolves to a loopback, private (RFC 1918), or link-local
+/// address — the classic SSRF escape hatches where the tool could
+/// be coerced into talking to internal services.
+fn runFetchUrl(allocator: std.mem.Allocator, io: std.Io, arguments_json: []const u8) ![]u8 {
+    const Args = struct { url: []const u8 };
+    var parsed = try std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    const url = parsed.value.url;
+
+    if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
+        return error.DisallowedScheme;
+    }
+
+    // Parse to extract the hostname for the SSRF check. We let zig
+    // reject malformed URLs before hitting the real HTTP client.
+    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
+    const host: []const u8 = switch (uri.host orelse return error.MissingHost) {
+        .raw => |h| h,
+        .percent_encoded => |h| h,
+    };
+    try ensurePublicHost(host);
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    // std.http.Client.fetch writes the response body into a caller-
+    // supplied `Writer`. We use an Allocating writer backed by a
+    // plain ArrayList so we can read the body back as a slice, and
+    // enforce the 64 KiB cap by checking length after the call.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &body);
+
+    const result = client.fetch(.{
+        .method = .GET,
+        .location = .{ .url = url },
+        .response_writer = &aw.writer,
+    }) catch return error.FetchFailed;
+
+    // Pull the ArrayList back out of the writer before reading it —
+    // the writer may still hold buffered bytes we haven't drained.
+    aw.writer.flush() catch {};
+    body = aw.toArrayList();
+
+    const status_code = @intFromEnum(result.status);
+    if (status_code < 200 or status_code >= 300) {
+        return std.fmt.allocPrint(
+            allocator,
+            "HTTP {d} {s}",
+            .{ status_code, result.status.phrase() orelse "error" },
+        );
+    }
+
+    // Hard cap response size.
+    const max_bytes: usize = 64 * 1024;
+    const slice = if (body.items.len > max_bytes) body.items[0..max_bytes] else body.items;
+    return allocator.dupe(u8, slice);
+}
+
+/// Refuse hostnames that parse as loopback/private/link-local IPs.
+/// DNS-based bypasses (e.g. `evil.example.com` pointing at
+/// 192.168.x.x) are not caught here — the minimal version checks
+/// only the literal IP form, which is the common SSRF vector.
+fn ensurePublicHost(host: []const u8) !void {
+    // Strip brackets if IPv6 literal: `[::1]` -> `::1`.
+    const raw = if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']')
+        host[1 .. host.len - 1]
+    else
+        host;
+
+    // Try IPv4 literal first, then IPv6. A DNS name (e.g. `example.com`)
+    // fails both and falls through — DNS-resolved SSRF isn't caught
+    // here; it's a future-work concern.
+    if (std.Io.net.IpAddress.parseIp4(raw, 0)) |ip| {
+        const b = ip.ip4.bytes;
+        // 127.0.0.0/8 loopback
+        if (b[0] == 127) return error.DisallowedAddress;
+        // 10.0.0.0/8
+        if (b[0] == 10) return error.DisallowedAddress;
+        // 172.16.0.0/12
+        if (b[0] == 172 and (b[1] & 0xF0) == 0x10) return error.DisallowedAddress;
+        // 192.168.0.0/16
+        if (b[0] == 192 and b[1] == 168) return error.DisallowedAddress;
+        // 169.254.0.0/16 link-local (incl. AWS metadata 169.254.169.254)
+        if (b[0] == 169 and b[1] == 254) return error.DisallowedAddress;
+        // 0.0.0.0/8 "this network"
+        if (b[0] == 0) return error.DisallowedAddress;
+        return;
+    } else |_| {}
+
+    if (std.Io.net.IpAddress.parseIp6(raw, 0)) |ip| {
+        const b = ip.ip6.bytes;
+        // ::1 loopback
+        var is_loopback = true;
+        for (b[0..15]) |byte| if (byte != 0) {
+            is_loopback = false;
+            break;
+        };
+        if (is_loopback and b[15] == 1) return error.DisallowedAddress;
+        // fc00::/7 unique local
+        if ((b[0] & 0xFE) == 0xFC) return error.DisallowedAddress;
+        // fe80::/10 link-local
+        if (b[0] == 0xFE and (b[1] & 0xC0) == 0x80) return error.DisallowedAddress;
+        return;
+    } else |_| {}
+
+    // Not an IP literal — a hostname. Accept.
 }
 
 /// Format nanoseconds-since-epoch as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
@@ -715,7 +980,7 @@ test "renderCurrentTimeIso8601: fixed timestamp renders canonically" {
 
 test "dispatchBuiltinTool: get_current_time matches renderCurrentTimeIso8601" {
     var fc = clock_mod.FixedClock{ .value_ns = 1_609_556_645 * @as(i128, std.time.ns_per_s) };
-    const out = try dispatchBuiltinTool(testing.allocator, fc.clock(), "get_current_time", "{}");
+    const out = try dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "get_current_time", "{}");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("2021-01-02T03:04:05Z", out);
 }
@@ -724,7 +989,83 @@ test "dispatchBuiltinTool: unknown name returns UnknownTool" {
     var fc = clock_mod.FixedClock{ .value_ns = 0 };
     try testing.expectError(
         error.UnknownTool,
-        dispatchBuiltinTool(testing.allocator, fc.clock(), "no_such_tool", "{}"),
+        dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "no_such_tool", "{}"),
+    );
+}
+
+test "calculate: basic arithmetic with precedence and parens" {
+    const out = try runCalculate(testing.allocator, "{\"expression\":\"(2 + 3) * 4\"}");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("20", out);
+}
+
+test "calculate: unary minus" {
+    const out = try runCalculate(testing.allocator, "{\"expression\":\"-7 + 10\"}");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("3", out);
+}
+
+test "calculate: division by zero returns DivisionByZero" {
+    try testing.expectError(
+        error.DivisionByZero,
+        runCalculate(testing.allocator, "{\"expression\":\"1 / 0\"}"),
+    );
+}
+
+test "calculate: trailing garbage rejected" {
+    try testing.expectError(
+        error.TrailingInput,
+        runCalculate(testing.allocator, "{\"expression\":\"1 + 1 oops\"}"),
+    );
+}
+
+test "random_number: deterministic for a fixed seed + range" {
+    const a = try runRandomNumber(testing.allocator, 42, "{\"min\":0,\"max\":100}");
+    defer testing.allocator.free(a);
+    const b = try runRandomNumber(testing.allocator, 42, "{\"min\":0,\"max\":100}");
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings(a, b);
+}
+
+test "random_number: empty range rejected" {
+    try testing.expectError(
+        error.EmptyRange,
+        runRandomNumber(testing.allocator, 0, "{\"min\":5,\"max\":3}"),
+    );
+}
+
+test "fetch_url: non-http scheme rejected" {
+    try testing.expectError(
+        error.DisallowedScheme,
+        runFetchUrl(testing.allocator, undefined, "{\"url\":\"file:///etc/passwd\"}"),
+    );
+}
+
+test "fetch_url: loopback IPv4 rejected" {
+    try testing.expectError(
+        error.DisallowedAddress,
+        runFetchUrl(testing.allocator, undefined, "{\"url\":\"http://127.0.0.1:8765/health\"}"),
+    );
+}
+
+test "fetch_url: RFC 1918 private address rejected" {
+    try testing.expectError(
+        error.DisallowedAddress,
+        runFetchUrl(testing.allocator, undefined, "{\"url\":\"http://192.168.1.1/admin\"}"),
+    );
+}
+
+test "fetch_url: link-local metadata endpoint rejected" {
+    try testing.expectError(
+        error.DisallowedAddress,
+        runFetchUrl(testing.allocator, undefined, "{\"url\":\"http://169.254.169.254/latest/meta-data/\"}"),
+    );
+}
+
+test "fetch_url: IPv6 loopback rejected" {
+    try testing.expectError(
+        error.DisallowedAddress,
+        runFetchUrl(testing.allocator, undefined, "{\"url\":\"http://[::1]/x\"}"),
     );
 }
 
