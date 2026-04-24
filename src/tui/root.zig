@@ -120,30 +120,47 @@ pub const Options = struct {
 
 const EventLoop = vaxis.Loop(Event);
 
-/// Palette tuned for dark terminals. Indexes into the terminal's
-/// own 256-color map rather than hard-coded RGB so the colors
-/// remain coherent under the user's scheme.
+/// Tiger palette — warm amber + black-stripe charcoal + cream on
+/// black, inspired by a Bengal tiger's coat. 24-bit truecolor; the
+/// terminal needs `COLORTERM=truecolor` (default on iTerm2, Ghostty,
+/// WezTerm, Kitty, modern Terminal.app). On a non-truecolor term the
+/// sequences gracefully degrade to the nearest 256-color index.
 const palette = struct {
-    const title: vaxis.Style = .{ .fg = .{ .index = 45 }, .bold = true };
-    const agent_chip: vaxis.Style = .{ .fg = .{ .index = 16 }, .bg = .{ .index = 45 }, .bold = true };
-    const status_idle: vaxis.Style = .{ .fg = .{ .index = 42 }, .bold = true };
-    const status_busy: vaxis.Style = .{ .fg = .{ .index = 214 }, .bold = true };
-    const separator: vaxis.Style = .{ .fg = .{ .index = 240 } };
-    const user: vaxis.Style = .{ .fg = .{ .index = 117 }, .bold = true };
-    const agent: vaxis.Style = .{ .fg = .{ .index = 252 } };
-    const system: vaxis.Style = .{ .fg = .{ .index = 244 }, .italic = true };
-    /// Tool-call trace lines. Dim cyan so they read as metadata
-    /// alongside the user/agent conversation, not as a reply.
-    const tool: vaxis.Style = .{ .fg = .{ .index = 108 }, .italic = true };
-    const prompt: vaxis.Style = .{ .fg = .{ .index = 45 }, .bold = true };
-    const hint: vaxis.Style = .{ .fg = .{ .index = 240 }, .italic = true };
-    const picker_border: vaxis.Style = .{ .fg = .{ .index = 45 } };
-    const picker_item: vaxis.Style = .{ .fg = .{ .index = 252 } };
-    const picker_item_selected: vaxis.Style = .{ .fg = .{ .index = 16 }, .bg = .{ .index = 45 }, .bold = true };
+    // Core tiger colours — reused as field values in Style below. Kept
+    // in one block so tweaking the theme means editing nine numbers,
+    // not nine separate Style entries.
+    const orange: vaxis.Color = .{ .rgb = .{ 0xFF, 0x8C, 0x1A } }; // tiger orange
+    const amber: vaxis.Color = .{ .rgb = .{ 0xD9, 0x6A, 0x00 } }; // deep amber
+    const cream: vaxis.Color = .{ .rgb = .{ 0xF5, 0xE6, 0xD3 } }; // warm cream
+    const gold: vaxis.Color = .{ .rgb = .{ 0xFF, 0xC8, 0x57 } }; // hot gold
+    const green: vaxis.Color = .{ .rgb = .{ 0x6B, 0xAF, 0x58 } }; // jungle green
+    const stripe: vaxis.Color = .{ .rgb = .{ 0x1A, 0x12, 0x10 } }; // charcoal stripe
+    const smoke: vaxis.Color = .{ .rgb = .{ 0x6B, 0x5E, 0x56 } }; // smoke gray
+    const ember: vaxis.Color = .{ .rgb = .{ 0xE8, 0x60, 0x3C } }; // ember red
+    const moss: vaxis.Color = .{ .rgb = .{ 0x4A, 0x6B, 0x40 } }; // moss dim
+    const code_bg: vaxis.Color = .{ .rgb = .{ 0x2A, 0x1F, 0x1A } }; // inline-code background
+
+    const title: vaxis.Style = .{ .fg = stripe, .bg = orange, .bold = true };
+    const agent_chip: vaxis.Style = .{ .fg = stripe, .bg = gold, .bold = true };
+    const status_idle: vaxis.Style = .{ .fg = green, .bold = true };
+    const status_busy: vaxis.Style = .{ .fg = amber, .bold = true };
+    const separator: vaxis.Style = .{ .fg = smoke };
+    const user: vaxis.Style = .{ .fg = gold, .bold = true };
+    const agent: vaxis.Style = .{ .fg = cream };
+    const system: vaxis.Style = .{ .fg = smoke, .italic = true };
+    /// Tool-call trace lines. Dim moss — enough to read but clearly
+    /// subordinate to the user/agent conversation.
+    const tool: vaxis.Style = .{ .fg = moss, .italic = true };
+    const prompt: vaxis.Style = .{ .fg = orange, .bold = true };
+    const hint: vaxis.Style = .{ .fg = smoke, .italic = true };
+    const picker_border: vaxis.Style = .{ .fg = orange };
+    const picker_item: vaxis.Style = .{ .fg = cream };
+    const picker_item_selected: vaxis.Style = .{ .fg = stripe, .bg = orange, .bold = true };
+
     // Markdown span overlays. Each function composes the span style
     // on top of the caller's base style (typically `palette.agent`)
     // so text still reads as the speaker's line colour with the
-    // markdown flavour applied.
+    // markdown flavour applied on top.
     fn mdStyle(base: vaxis.Style, kind: md.StyleKind) vaxis.Style {
         var s = base;
         switch (kind) {
@@ -151,15 +168,18 @@ const palette = struct {
             .bold => s.bold = true,
             .italic => s.italic = true,
             .code => {
-                s.fg = .{ .index = 214 };
-                s.bg = .{ .index = 236 };
+                s.fg = gold;
+                s.bg = code_bg;
             },
             .link => {
-                s.fg = .{ .index = 45 };
+                s.fg = orange;
                 s.ul_style = .single;
             },
-            .heading => s.bold = true,
-            .block_quote => s.fg = .{ .index = 244 },
+            .heading => {
+                s.fg = orange;
+                s.bold = true;
+            },
+            .block_quote => s.fg = smoke,
         }
         return s;
     }
@@ -679,15 +699,19 @@ fn draw(
     // are documented in tigerclaw --help.
 
     if (win.height >= 3) {
+        // Orange-bordered input box so the prompt stands out against
+        // the dim-smoke history scroll. A tiger-striped prompt glyph
+        // sits at the left edge; placeholder text appears when the
+        // buffer is empty so new users know what the box is for.
         const input_child = win.child(.{
             .x_off = 0,
             .y_off = @intCast(@as(i32, @intCast(win.height)) - 3),
             .width = win.width,
             .height = 3,
-            .border = .{ .where = .all, .style = palette.separator },
+            .border = .{ .where = .all, .style = .{ .fg = palette.orange } },
         });
         _ = input_child.printSegment(
-            .{ .text = "› ", .style = palette.prompt },
+            .{ .text = "❯ ", .style = palette.prompt },
             .{ .row_offset = 0, .col_offset = 0 },
         );
         const input_inner = input_child.child(.{
@@ -696,6 +720,16 @@ fn draw(
             .width = if (input_child.width > 2) input_child.width - 2 else 1,
             .height = 1,
         });
+        // Paint placeholder first when the buffer is empty, so the
+        // input widget's subsequent draw only paints the cursor cell
+        // (1 col) — leaving the placeholder text visible under it.
+        const input_empty = input.buf.firstHalf().len + input.buf.secondHalf().len == 0;
+        if (input_empty) {
+            _ = input_inner.printSegment(
+                .{ .text = "message the tiger…", .style = palette.hint },
+                .{ .row_offset = 0, .col_offset = 1 },
+            );
+        }
         input.draw(input_inner);
     }
 
@@ -711,9 +745,10 @@ fn drawHeader(
     pending: bool,
     spinner_tick: u64,
 ) void {
-    // Left: title.
+    // Left: title. Padded with unicode blocks to give the orange
+    // background a clear left edge that reads like a badge.
     _ = win.printSegment(
-        .{ .text = " tigerclaw ", .style = palette.title },
+        .{ .text = "  🐯 tigerclaw  ", .style = palette.title },
         .{ .row_offset = 0, .col_offset = 0 },
     );
 
@@ -746,11 +781,19 @@ fn drawHeader(
         );
     }
 
+    // Separator rule: left quarter in tiger orange, rest in smoke.
+    // The coloured prefix echoes the title badge and gives the
+    // header some visual weight without dominating the chat scroll.
     if (win.height > 1 and win.width > 0) {
+        const accent_cols: u16 = @min(@as(u16, @intCast(win.width)), 18);
         var col: u16 = 0;
         while (col < win.width) : (col += 1) {
+            const style: vaxis.Style = if (col < accent_cols)
+                .{ .fg = palette.orange }
+            else
+                palette.separator;
             _ = win.printSegment(
-                .{ .text = "─", .style = palette.separator },
+                .{ .text = "━", .style = style },
                 .{ .row_offset = 1, .col_offset = col },
             );
         }
@@ -868,15 +911,23 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
     while (i > 0 and row_cursor >= 0) {
         i -= 1;
         const line = history[i];
+        // Speaker glyphs — tuned for the tiger palette. The user's
+        // right-caret is heavier than the agent's left-caret so the
+        // user stands out as the "active" speaker.
         const prefix = switch (line.role) {
-            .user => "› ",
-            .agent => "‹ ",
-            .system => "· ",
-            .tool => "  ",
+            .user => "❯ ",
+            .agent => "🐯 ",
+            .system => "∙ ",
+            .tool => "↻ ",
         };
 
         const width: usize = @intCast(pane.width);
-        const avail = if (width > prefix.len) width - prefix.len else 1;
+        // Prefix width in *display columns*, not bytes. Emoji glyphs
+        // (e.g. the agent's 🐯) are 4 bytes but ~2 display cells, so
+        // using \`prefix.len\` here would over-estimate by 2 cells
+        // per emoji prefix and throw every wrap calculation off.
+        const prefix_cols: usize = measureCols(prefix);
+        const avail = if (width > prefix_cols) width - prefix_cols else 1;
 
         // Rows needed is driven by *display columns*, not byte count.
         // Using bytes over-estimates when the line contains multi-byte
@@ -932,7 +983,7 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
         const total_len = line.text.items.len;
         const span_offset_start: usize = total_len - remaining.len;
 
-        var col_offset: usize = prefix.len;
+        var col_offset: usize = prefix_cols;
         while (remaining.len > 0 and row < pane.height) {
             // Wrap by display columns, not bytes, so a line containing
             // emoji / em-dashes wraps at the right visual position
@@ -950,7 +1001,7 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
             );
             remaining = remaining[take..];
             row += 1;
-            col_offset = prefix.len;
+            col_offset = prefix_cols;
         }
 
         row_cursor -= @intCast(rows_needed);
@@ -993,7 +1044,10 @@ fn paintRow(
             .{ .text = slice, .style = style },
             .{ .row_offset = row, .col_offset = col },
         );
-        col += @intCast(slice.len);
+        // Advance column by *display width*, not byte count — a
+        // styled span containing emoji used to over-advance and
+        // push following spans off the right edge of the row.
+        col += @intCast(measureCols(slice));
         i = j;
     }
 }
