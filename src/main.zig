@@ -145,6 +145,26 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: diag --lines requires a non-negative integer\n");
             return 64;
         },
+        error.DebugMissingSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: debug requires a subcommand (runner)\n");
+            return 64;
+        },
+        error.DebugUnknownSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown debug subcommand\n");
+            return 64;
+        },
+        error.DebugUnknownFlag => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown flag for debug subcommand\n");
+            return 64;
+        },
+        error.DebugMissingFlagValue => {
+            try stderr_w.interface.writeAll("tigerclaw: debug flag requires a value\n");
+            return 64;
+        },
+        error.DebugMissingMessage => {
+            try stderr_w.interface.writeAll("tigerclaw: debug runner requires --message\n");
+            return 64;
+        },
         error.GatewayLogsInvalidTailCount => {
             try stderr_w.interface.writeAll("tigerclaw: gateway logs --tail requires a non-negative integer\n");
             return 64;
@@ -355,6 +375,20 @@ pub fn main(init: std.process.Init) !u8 {
             ) catch |e| switch (e) {
                 error.NotFound, error.FileReadFailed => return 1,
                 error.OutOfMemory, error.WriteFailed => return e,
+            };
+        },
+        .debug => |sub| {
+            const home = init.environ_map.get("HOME") orelse "";
+            cli.commands.debug.run(
+                arena,
+                io,
+                sub,
+                home,
+                &stdout_w.interface,
+                &stderr_w.interface,
+            ) catch |e| {
+                try stderr_w.interface.print("tigerclaw: debug failed: {s}\n", .{@errorName(e)});
+                return 1;
             };
         },
         .gateway => |opts| {

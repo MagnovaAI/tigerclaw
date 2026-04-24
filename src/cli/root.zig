@@ -26,6 +26,7 @@ pub const commands = struct {
     pub const providers = @import("commands/providers.zig");
     pub const models = @import("commands/models.zig");
     pub const diag = @import("commands/diag.zig");
+    pub const debug = @import("commands/debug.zig");
     pub const uninstall = @import("commands/uninstall.zig");
 };
 
@@ -62,6 +63,7 @@ pub const Command = union(enum) {
     providers: commands.providers.Subcommand,
     models: commands.models.Subcommand,
     diag: commands.diag.Subcommand,
+    debug: commands.debug.Subcommand,
     gateway: commands.gateway.RunOptions,
     gateway_logs: commands.gateway.LogsOptions,
     gateway_stop: commands.gateway.StopOptions,
@@ -93,6 +95,11 @@ pub const ParseError = error{
     DiagUnknownSubcommand,
     DiagMissingEventId,
     DiagInvalidLineCount,
+    DebugMissingSubcommand,
+    DebugUnknownSubcommand,
+    DebugUnknownFlag,
+    DebugMissingFlagValue,
+    DebugMissingMessage,
     GatewayLogsInvalidTailCount,
     GatewayInvalidPort,
     AgentMissingName,
@@ -109,6 +116,7 @@ pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "providers", .summary = "List LLM providers and probe reachability" },
     .{ .name = "models", .summary = "List known models, show the default, override per session" },
     .{ .name = "diag", .summary = "Inspect recent diagnostic events" },
+    .{ .name = "debug", .summary = "Non-TUI entry points for stepping through the runtime under a debugger" },
     .{ .name = "gateway", .summary = "Run the gateway daemon (or `gateway logs` to tail)" },
     .{ .name = "uninstall", .summary = "Remove the binary and the local state directory" },
     .{ .name = "version", .summary = "Print the version and exit" },
@@ -208,6 +216,16 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
             error.InvalidLineCount => return error.DiagInvalidLineCount,
         };
         return .{ .diag = sub };
+    }
+    if (std.mem.eql(u8, match.descriptor.name, "debug")) {
+        const sub = commands.debug.parse(match.argv[1..]) catch |err| switch (err) {
+            error.MissingSubcommand => return error.DebugMissingSubcommand,
+            error.UnknownSubcommand => return error.DebugUnknownSubcommand,
+            error.UnknownFlag => return error.DebugUnknownFlag,
+            error.MissingFlagValue => return error.DebugMissingFlagValue,
+            error.MissingMessage => return error.DebugMissingMessage,
+        };
+        return .{ .debug = sub };
     }
     if (std.mem.eql(u8, match.descriptor.name, "gateway")) {
         const verb = commands.gateway.parse(match.argv[1..]) catch |err| switch (err) {
