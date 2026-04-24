@@ -259,14 +259,37 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     app.vx.sgr = .legacy;
     app.vx.caps.rgb = true;
 
-    var root = RootWidget.init(allocator, default_agent);
+    // Build the banner's model line — "<provider> <model>"
+    // — and use the process's cwd as a stand-in for the
+    // workspace path. Both are displayed in the right column
+    // of the 4-row startup banner.
+    const model_line = try std.fmt.allocPrint(
+        allocator,
+        "{s} {s}",
+        .{ @tagName(live.provider_kind), live.model },
+    );
+    defer allocator.free(model_line);
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len);
+    // `getcwd` writes a NUL-terminated path into cwd_buf; find
+    // the terminator to get the length.
+    const cwd: []const u8 = if (cwd_ptr != null) blk: {
+        const n = std.mem.indexOfScalar(u8, &cwd_buf, 0) orelse cwd_buf.len;
+        break :blk cwd_buf[0..n];
+    } else "";
+
+    var root = RootWidget.init(allocator, .{
+        .agent_name = default_agent,
+        .model_line = model_line,
+        .workspace = cwd,
+    });
     defer root.deinit();
     root.wireSubmit();
     root.attachRunner(&agent_runner, &app);
 
     // Seed a short welcome so the history isn't empty on first
     // launch.
-    try root.appendLine(.system, "agent: tiger");
     try root.appendLine(.agent, "Type a message and press Enter. Ctrl-C quits.");
 
     try app.run(root.widget(), .{});
@@ -882,10 +905,10 @@ fn drawHeaderVxfw(
 ) !void {
     const agent_name = if (agents.len > 0) agents[selected] else "—";
 
+    _ = pending;
+    _ = spinner_tick;
     const hdr: HeaderWidget = .{
         .agent_name = agent_name,
-        .pending = pending,
-        .spinner_tick = spinner_tick,
     };
 
     // vxfw allocates Surface cell buffers out of the DrawContext's

@@ -56,16 +56,22 @@ pending_agent_line: ?usize = null,
 /// reply, error mid-stream), we drop the empty placeholder.
 pending_saw_text: bool = false,
 
-pub fn init(allocator: std.mem.Allocator, agent_name: []const u8) Root {
+pub const InitOptions = struct {
+    agent_name: []const u8 = "tiger",
+    model_line: []const u8 = "",
+    workspace: []const u8 = "",
+};
+
+pub fn init(allocator: std.mem.Allocator, opts: InitOptions) Root {
     return .{
         .allocator = allocator,
         .header = .{
-            .agent_name = agent_name,
-            .pending = false,
-            .spinner_tick = 0,
+            .agent_name = opts.agent_name,
+            .model_line = opts.model_line,
+            .workspace = opts.workspace,
         },
         .input = Input.init(allocator),
-        .session_id = agent_name,
+        .session_id = opts.agent_name,
     };
 }
 
@@ -100,7 +106,7 @@ fn onSubmit(ctx: ?*anyopaque, text: []const u8) void {
     // Don't start a second turn while one is in flight. The user
     // can type the next message — it'll just queue up as another
     // history line but the runner won't fire.
-    if (self.header.pending) {
+    if (self.thinking.pending) {
         self.appendLine(.user, text) catch {};
         return;
     }
@@ -160,7 +166,6 @@ fn beginTurn(self: *Root, typed: []const u8) !void {
     self.pending_agent_line = null;
     self.pending_saw_text = false;
 
-    self.header.pending = true;
     self.thinking.pending = true;
     self.thinking.spinner_tick = 0;
     // Rotate verb per turn via a cheap LCG; anything is fine here
@@ -410,12 +415,14 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         // line below the tool entry.
         self.pending_agent_line = null;
 
-        // Append a pending tool line. We own the id so tool_done
-        // can find its matching entry.
+        // Append a pending tool line. Just the tool name —
+        // when the tool completes, \`tool_done\` promotes this
+        // line with " → <output preview>". The thinking row
+        // above the input already signals "busy"; no need for
+        // a "(pending)" suffix here.
         var text: std.ArrayList(u8) = .empty;
         errdefer text.deinit(self.allocator);
         try text.appendSlice(self.allocator, p.name);
-        try text.appendSlice(self.allocator, "   (pending)");
 
         const id_owned = try self.allocator.dupe(u8, p.id);
         errdefer self.allocator.free(id_owned);
@@ -473,7 +480,6 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         // line behind.
         self.pending_agent_line = null;
         self.pending_saw_text = false;
-        self.header.pending = false;
         self.thinking.pending = false;
         self.turn_started_ms = 0;
         ctx.redraw = true;
@@ -490,7 +496,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     //   rows 2..history_end-1        history
     //   thinking_row                 thinking row (1 row when pending, 0 else)
     //   bottom 3 rows                input box
-    const header_rows: u16 = 2;
+    const header_rows: u16 = Header.banner_rows;
     const input_rows: u16 = 3;
     const thinking_rows: u16 = if (self.thinking.pending) 1 else 0;
     const reserved: u16 = header_rows + thinking_rows + input_rows;

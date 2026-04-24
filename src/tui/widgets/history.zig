@@ -240,11 +240,18 @@ fn writeGraphemes(
 }
 
 fn prefixFor(role: tui.Line.Role) []const u8 {
+    // Line glyph scheme:
+    //   ⏺  every action/utterance (agent + tool)
+    //   ❯  the user's input echo
+    //   ∙  system notices
+    // Single-cell ASCII-adjacent glyphs only — no wide emoji,
+    // no braille spinners inline. Animation lives in the
+    // dedicated thinking row above the input.
     return switch (role) {
         .user => "❯ ",
-        .agent => "✦ ",
+        .agent => "⏺ ",
         .system => "∙ ",
-        .tool => "↻ ",
+        .tool => "⎿ ",
     };
 }
 
