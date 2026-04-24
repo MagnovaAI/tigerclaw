@@ -40,11 +40,13 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const http_client = @import("../cli/commands/http_client.zig");
 const md = @import("md.zig");
+const sse_client = @import("sse_client.zig");
 
 test {
-    // Ensure md's tests are discovered when the unit-test binary
-    // walks references from this file.
+    // Ensure md + sse_client tests are discovered when the unit-test
+    // binary walks references from this file.
     std.testing.refAllDecls(md);
+    std.testing.refAllDecls(sse_client);
 }
 
 const Event = union(enum) {
@@ -52,10 +54,15 @@ const Event = union(enum) {
     winsize: vaxis.Winsize,
     focus_in,
     focus_out,
-    /// One decoded SSE token frame. Slice is heap-allocated on the
+    /// One decoded SSE chunk frame. Slice is heap-allocated on the
     /// worker thread; the main loop takes ownership and frees after
     /// appending to history.
     turn_chunk: []u8,
+    /// A tool call is about to run. Both slices are heap-allocated
+    /// and owned by the main loop after receipt.
+    turn_tool_start: ToolStartPayload,
+    /// A tool call completed. All slices heap-allocated + owned.
+    turn_tool_done: ToolDonePayload,
     /// Stream terminator. Re-enables input.
     turn_done,
     /// Worker hit a transport / protocol error. Slice is owned and
@@ -66,6 +73,9 @@ const Event = union(enum) {
     /// incoming keys.
     tick,
 };
+
+const ToolStartPayload = struct { id: []u8, name: []u8 };
+const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8 };
 
 const Line = struct {
     role: Role,
@@ -328,6 +338,18 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                     try appendSanitizedUtf8(&line.text, allocator, chunk);
                     pending_saw_text = true;
                 }
+            },
+            .turn_tool_start => |ts| {
+                // Commit 5 will render a pending tool line. For now
+                // we only own+free the payload so the wire path
+                // works end-to-end without leaking.
+                allocator.free(ts.id);
+                allocator.free(ts.name);
+            },
+            .turn_tool_done => |td| {
+                allocator.free(td.id);
+                allocator.free(td.name);
+                allocator.free(td.output);
             },
             .turn_done => {
                 if (!pending_saw_text) {
@@ -1053,6 +1075,11 @@ fn runTurn(ctx: *WorkerCtx) !void {
     }, .{});
     defer ctx.allocator.free(body_json);
 
+    // Buffer the full response, then walk it frame-by-frame through
+    // the SSE parser. Real incremental streaming over a long-lived
+    // reader is future work — for now the buffered-then-parsed shape
+    // matches the rest of the TUI worker's single-request model and
+    // avoids duplicating http_client's connection handling.
     var resp_buf: std.Io.Writer.Allocating = .init(ctx.allocator);
     defer resp_buf.deinit();
 
@@ -1069,40 +1096,44 @@ fn runTurn(ctx: *WorkerCtx) !void {
         .{},
     );
 
-    try dispatchSseBody(ctx, resp_buf.written());
+    var parser = sse_client.Parser.init(ctx.allocator);
+    defer parser.deinit();
+    try parser.feed(resp_buf.written(), dispatchSseEvent, @ptrCast(ctx));
 }
 
-/// Walk the SSE body, posting one `turn_chunk` per `event: token`.
-/// Duplicates the `renderSse` framing grammar (rather than routing
-/// through the shared helper) so we can emit per-frame events
-/// instead of a single concatenated string.
-fn dispatchSseBody(ctx: *WorkerCtx, body: []const u8) !void {
-    var it = std.mem.splitSequence(u8, body, "\n\n");
-    while (it.next()) |frame| {
-        var event_name: []const u8 = "message";
-        var data: []const u8 = "";
-        var had_data: bool = false;
-
-        var lines = std.mem.splitScalar(u8, frame, '\n');
-        while (lines.next()) |line| {
-            const clean = std.mem.trimEnd(u8, line, "\r");
-            if (clean.len == 0) continue;
-            if (std.mem.startsWith(u8, clean, "event:")) {
-                event_name = std.mem.trim(u8, clean[6..], " \t");
-            } else if (std.mem.startsWith(u8, clean, "data:")) {
-                var payload = clean[5..];
-                if (payload.len > 0 and payload[0] == ' ') payload = payload[1..];
-                data = payload;
-                had_data = true;
-            }
-        }
-
-        if (std.mem.eql(u8, event_name, "token") and had_data) {
-            const owned = try ctx.allocator.dupe(u8, data);
+/// Bridge from `sse_client.Event` to the vaxis event loop. Each
+/// event becomes a posted event on the main loop; slices in the
+/// parser's scratch buffer are duped so they outlive this callback.
+fn dispatchSseEvent(sink_ctx: ?*anyopaque, event: sse_client.Event) void {
+    const ctx: *WorkerCtx = @ptrCast(@alignCast(sink_ctx.?));
+    switch (event) {
+        .chunk => |text| {
+            const owned = ctx.allocator.dupe(u8, text) catch return;
             ctx.loop.postEvent(.{ .turn_chunk = owned });
-        } else if (std.mem.eql(u8, event_name, "done")) {
-            return;
-        }
+        },
+        .tool_start => |ts| {
+            const id = ctx.allocator.dupe(u8, ts.id) catch return;
+            errdefer ctx.allocator.free(id);
+            const name = ctx.allocator.dupe(u8, ts.name) catch return;
+            ctx.loop.postEvent(.{ .turn_tool_start = .{ .id = id, .name = name } });
+        },
+        .tool_done => |td| {
+            const id = ctx.allocator.dupe(u8, td.id) catch return;
+            errdefer ctx.allocator.free(id);
+            const name = ctx.allocator.dupe(u8, td.name) catch return;
+            errdefer ctx.allocator.free(name);
+            const output = ctx.allocator.dupe(u8, td.output) catch return;
+            ctx.loop.postEvent(.{ .turn_tool_done = .{ .id = id, .name = name, .output = output } });
+        },
+        .done => {
+            // `done` is signalled via the closed stream in
+            // `runTurn`'s caller — `workerMain` posts `turn_done`
+            // after `runTurn` returns, so we don't re-post here.
+        },
+        .err => |msg| {
+            const owned = ctx.allocator.dupe(u8, msg) catch return;
+            ctx.loop.postEvent(.{ .turn_error = owned });
+        },
     }
 }
 
