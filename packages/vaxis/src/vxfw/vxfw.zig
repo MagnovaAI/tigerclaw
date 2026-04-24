@@ -8,7 +8,7 @@ const assert = std.debug.assert;
 
 const Allocator = std.mem.Allocator;
 
-fn milliTimestamp() i64 {
+pub fn milliTimestamp() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);

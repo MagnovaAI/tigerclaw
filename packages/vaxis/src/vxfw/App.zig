@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("../main.zig");
 const vxfw = @import("vxfw.zig");
 
@@ -12,6 +13,7 @@ const Widget = vxfw.Widget;
 const App = @This();
 
 allocator: Allocator,
+io: std.Io,
 tty: vaxis.Tty,
 vx: vaxis.Vaxis,
 timers: std.ArrayList(vxfw.Tick),
@@ -27,9 +29,10 @@ pub const Options = struct {
 /// Create an application. We require stable pointers to do the set up, so this will create an App
 /// object on the heap. Call destroy when the app is complete to reset terminal state and release
 /// resources
-pub fn init(allocator: Allocator) !App {
+pub fn init(allocator: Allocator, io: std.Io) !App {
     var app: App = .{
         .allocator = allocator,
+        .io = io,
         .tty = undefined,
         .vx = try vaxis.init(allocator, .{
             .system_clipboard_allocator = allocator,
@@ -37,11 +40,20 @@ pub fn init(allocator: Allocator) !App {
                 .report_events = true,
             },
         }),
-        .timers = std.ArrayList(vxfw.Tick){},
+        .timers = .empty,
         .wants_focus = null,
         .buffer = undefined,
     };
-    app.tty = try vaxis.Tty.init(&app.buffer);
+    // Zig 0.16 `Tty.init` signature is platform-dependent:
+    // PosixTty takes `(io, buffer)`, WindowsTty and TestTty take
+    // just `(buffer)`. Branch on the build configuration so vxfw
+    // compiles in both unit-test builds (TestTty) and real
+    // binaries (PosixTty/WindowsTty).
+    if (builtin.is_test or builtin.os.tag == .windows) {
+        app.tty = try vaxis.Tty.init(&app.buffer);
+    } else {
+        app.tty = try vaxis.Tty.init(io, &app.buffer);
+    }
     return app;
 }
 
@@ -103,7 +115,7 @@ pub fn run(self: *App, widget: vxfw.Widget, opts: Options) anyerror!void {
     var ctx: vxfw.EventContext = .{
         .alloc = self.allocator,
         .phase = .capturing,
-        .cmds = vxfw.CommandList{},
+        .cmds = .empty,
         .consume_event = false,
         .redraw = false,
         .quit = false,
@@ -116,8 +128,10 @@ pub fn run(self: *App, widget: vxfw.Widget, opts: Options) anyerror!void {
             // Deadline exceeded. Schedule the next frame
             next_frame_ms = now_ms + tick_ms;
         } else {
-            // Sleep until the deadline
-            std.Thread.sleep((next_frame_ms - now_ms) * 1_000_000);
+            // Sleep until the deadline. 0.16 moved the sleep primitive
+            // onto `std.Io` — use the app's io handle.
+            const sleep_ns: u64 = (next_frame_ms - now_ms) * 1_000_000;
+            std.Io.sleep(self.io, std.Io.Duration.fromNanoseconds(sleep_ns), .awake) catch {};
             next_frame_ms += tick_ms;
         }
 
@@ -342,7 +356,7 @@ const MouseHandler = struct {
         // For mouse events we store the last frame and use that for hit testing
         const last_frame = surface;
 
-        var hits = std.ArrayList(vxfw.HitResult){};
+        var hits: std.ArrayList(vxfw.HitResult) = .empty;
         defer hits.deinit(app.allocator);
         const sub: vxfw.SubSurface = .{
             .origin = .{ .row = 0, .col = 0 },
@@ -401,7 +415,7 @@ const MouseHandler = struct {
         const last_frame = self.last_frame;
         self.mouse = mouse;
 
-        var hits = std.ArrayList(vxfw.HitResult){};
+        var hits: std.ArrayList(vxfw.HitResult) = .empty;
         defer hits.deinit(app.allocator);
         const sub: vxfw.SubSurface = .{
             .origin = .{ .row = 0, .col = 0 },
@@ -516,7 +530,7 @@ const FocusHandler = struct {
         return .{
             .root = root,
             .focused_widget = root,
-            .path_to_focused = std.ArrayList(Widget){},
+            .path_to_focused = .empty,
         };
     }
 

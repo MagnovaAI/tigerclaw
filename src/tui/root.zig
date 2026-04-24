@@ -38,6 +38,7 @@
 
 const std = @import("std");
 const vaxis = @import("vaxis");
+const vxfw = vaxis.vxfw;
 const md = @import("md.zig");
 const live_runner = @import("../cli/commands/live_runner.zig");
 const harness = @import("../harness/root.zig");
@@ -46,6 +47,19 @@ test {
     // Ensure md tests are discovered when the unit-test binary
     // walks references from this file.
     std.testing.refAllDecls(md);
+    // Force body compilation of every vxfw widget in the subset
+    // we plan to migrate onto, so any 0.16 API regression in
+    // packages/vaxis/src/vxfw surfaces here at build time instead
+    // of blowing up mid-refactor. Taking a function pointer inside
+    // a non-dead test branch counts as a "use" for Zig's lazy
+    // analysis and pulls the body in.
+    _ = &vxfw.App.init;
+    _ = &vxfw.App.run;
+    _ = &vxfw.FlexColumn.draw;
+    _ = &vxfw.Text.draw;
+    _ = &vxfw.Border.draw;
+    _ = &vxfw.Padding.draw;
+    _ = &vxfw.Spinner.draw;
 }
 
 const Event = union(enum) {
