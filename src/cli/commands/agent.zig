@@ -177,28 +177,40 @@ pub fn cancelTurn(
 }
 
 /// Walk the SSE body in `body` and write the `data:` payload of every
-/// `event: token` event to `out`. Terminates on a `done` event or end
-/// of input. Tolerates trailing whitespace and empty lines per the SSE
-/// grammar — matches what the gateway emits.
+/// `event: token` event to `out`. Consecutive token events are joined
+/// with `\n` — the gateway splits multi-line replies into one frame
+/// per source line (SSE disallows literal newlines in `data:`) and
+/// relies on the client to reinsert them. Terminates on a `done` event
+/// or end of input.
 pub fn renderSse(out: *std.Io.Writer, body: []const u8) Error!void {
     var it = std.mem.splitSequence(u8, body, "\n\n");
+    var token_seen: bool = false;
     while (it.next()) |frame| {
         var event_name: []const u8 = "message";
         var data: []const u8 = "";
+        var had_data: bool = false;
 
         var lines = std.mem.splitScalar(u8, frame, '\n');
         while (lines.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (trimmed.len == 0) continue;
-            if (std.mem.startsWith(u8, trimmed, "event:")) {
-                event_name = std.mem.trim(u8, trimmed[6..], " \t");
-            } else if (std.mem.startsWith(u8, trimmed, "data:")) {
-                data = std.mem.trim(u8, trimmed[5..], " \t");
+            // Trim only the CR so trailing spaces in `data:` survive.
+            const clean = std.mem.trimEnd(u8, line, "\r");
+            if (clean.len == 0) continue;
+            if (std.mem.startsWith(u8, clean, "event:")) {
+                event_name = std.mem.trim(u8, clean[6..], " \t");
+            } else if (std.mem.startsWith(u8, clean, "data:")) {
+                // Strip the single optional space after the colon per
+                // the SSE grammar; keep everything else verbatim.
+                var payload = clean[5..];
+                if (payload.len > 0 and payload[0] == ' ') payload = payload[1..];
+                data = payload;
+                had_data = true;
             }
         }
 
-        if (std.mem.eql(u8, event_name, "token")) {
+        if (std.mem.eql(u8, event_name, "token") and had_data) {
+            if (token_seen) out.writeAll("\n") catch return error.InvalidResponse;
             out.writeAll(data) catch return error.InvalidResponse;
+            token_seen = true;
         } else if (std.mem.eql(u8, event_name, "done")) {
             return;
         }
@@ -209,16 +221,31 @@ pub fn renderSse(out: *std.Io.Writer, body: []const u8) Error!void {
 
 const testing = std.testing;
 
-test "renderSse: writes the data of every token event in order" {
+test "renderSse: joins consecutive token frames with newlines" {
+    // Gateway splits multi-line replies into one frame per source
+    // line; the client reinserts the newlines between them.
     const body =
         "event: token\ndata: hello\n\n" ++
-        "event: token\ndata:  world\n\n" ++
+        "event: token\ndata: world\n\n" ++
         "event: done\ndata: {\"completed\":true}\n\n";
 
     var buf: [128]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try renderSse(&w, body);
-    try testing.expectEqualStrings("hello world", w.buffered());
+    try testing.expectEqualStrings("hello\nworld", w.buffered());
+}
+
+test "renderSse: preserves leading space in data after the colon" {
+    // SSE strips a single optional space after `data:`; anything
+    // beyond that is part of the payload.
+    const body =
+        "event: token\ndata:  indented\n\n" ++
+        "event: done\ndata: {}\n\n";
+
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderSse(&w, body);
+    try testing.expectEqualStrings(" indented", w.buffered());
 }
 
 test "renderSse: stops at the done event" {

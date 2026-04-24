@@ -13,7 +13,23 @@ const Mouse = vaxis.Mouse;
 const Parser = vaxis.Parser;
 const Winsize = vaxis.Winsize;
 
-/// The target TTY implementation
+// NOTE: Windows support is currently bit-rotted on Zig 0.16. The
+// `WindowsTty` struct below still references `std.fs.File` (moved
+// to `std.Io.File`) and the old `.initStreaming` writer pattern.
+// Porting it is the same mechanical work as PosixTty got in this
+// commit — left undone here because the fork's consumers are
+// darwin/linux only. Reintroduce before shipping to Windows.
+comptime {
+    if (builtin.os.tag == .windows and !builtin.is_test) {
+        @compileError(
+            "vaxis tty.zig: WindowsTty not ported to Zig 0.16 in this " ++
+                "fork. Update the std.fs.File references + pass Io into " ++
+                "init, then remove this gate.",
+        );
+    }
+}
+
+/// The target TTY implementation.
 pub const Tty = if (builtin.is_test)
     TestTty
 else switch (builtin.os.tag) {

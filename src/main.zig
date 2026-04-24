@@ -356,9 +356,51 @@ pub fn main(init: std.process.Init) !u8 {
                 .verbose = opts.verbose,
                 .color = want_color,
                 .host_str = opts.host,
+                .force = opts.force,
             }, &stdout_w.interface, &stderr_w.interface) catch |e| {
                 try stderr_w.interface.print("tigerclaw: gateway failed: {s}\n", .{@errorName(e)});
                 return 1;
+            };
+        },
+        .gateway_stop => |opts| {
+            var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const home = init.environ_map.get("HOME") orelse "";
+            const state_path = try std.fmt.bufPrint(
+                &state_buf,
+                "{s}/.tigerclaw/state",
+                .{home},
+            );
+            cli.commands.gateway.runStop(io, .{
+                .state_dir_path = state_path,
+                .force = opts.force,
+                .host = opts.host,
+                .port = opts.port,
+                .allocator = arena,
+            }, &stdout_w.interface) catch |e| switch (e) {
+                error.NotRunning => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway is not running\n");
+                    return 1;
+                },
+                error.OrphanListener => {
+                    // Distinct exit code (3) so scripts can branch —
+                    // this is recoverable with operator action but
+                    // the stop itself did not succeed.
+                    try stderr_w.interface.print(
+                        "tigerclaw: a process is holding {s}:{d} but we can't identify it. " ++
+                            "Check `lsof -iTCP:{d} -sTCP:LISTEN` and terminate it manually.\n",
+                        .{ opts.host, opts.port, opts.port },
+                    );
+                    return 3;
+                },
+                error.Timeout => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway did not stop within 5s (SIGKILL sent)\n");
+                    return 2;
+                },
+                error.PidfileCorrupt, error.SignalFailed, error.StateDirOpenFailed => {
+                    try stderr_w.interface.print("tigerclaw: gateway stop failed: {s}\n", .{@errorName(e)});
+                    return 1;
+                },
+                error.OutOfMemory, error.WriteFailed => return e,
             };
         },
         .gateway_logs => |opts| {
@@ -545,8 +587,8 @@ test "shouldEnableColor: windows/wasi stay monochrome without force" {
 const tui = @import("tui/root.zig");
 
 fn runTuiWithGateway(arena: std.mem.Allocator, io: std.Io, init: std.process.Init) !u8 {
-    _ = init;
-    tui.run(arena, io, .{}) catch |err| {
+    const home = init.environ_map.get("HOME") orelse "";
+    tui.run(arena, io, .{ .home = home }) catch |err| {
         // The tty is now in an undefined state if vaxis bailed
         // mid-render; print to stderr via libc write so we don't
         // re-enter the possibly-broken Io write path.

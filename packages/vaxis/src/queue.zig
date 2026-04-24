@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const atomic = std.atomic;
 
@@ -7,6 +8,20 @@ const atomic = std.atomic;
 // would force every Queue caller in the vaxis tree to plumb Io.
 // Use libc pthread primitives instead — same wake semantics, no
 // Io dependency in the type.
+//
+// POSIX-only for now. Windows support needs CRITICAL_SECTION +
+// CONDITION_VARIABLE; the hook is straightforward but not wired up
+// in this fork. Fail loudly at compile time instead of link time so
+// the constraint is obvious.
+comptime {
+    if (builtin.os.tag == .windows) {
+        @compileError(
+            "vaxis queue.zig: Windows support dropped during the Zig 0.16 " ++
+                "port. Restore SRWLOCK / CONDITION_VARIABLE shims before " ++
+                "building for Windows.",
+        );
+    }
+}
 
 /// Thread safe. Fixed size. Blocking push and pop.
 pub fn Queue(

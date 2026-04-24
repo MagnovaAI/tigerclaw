@@ -76,9 +76,25 @@ pub fn serve(
     var server = address.listen(io, .{ .reuse_address = true }) catch return error.BindFailed;
     defer server.deinit(io);
 
+    // SO_RCVTIMEO on the listener makes accept() wake every 500ms so
+    // the loop can observe `should_stop` without waiting for the next
+    // HTTP connection to arrive. The timeout surfaces as Cancelable /
+    // WouldBlock / Unexpected depending on platform; all three are
+    // treated as "no client, retry the flag check" below.
+    setListenerTimeout(&server, 500) catch |e| {
+        // Non-fatal: without the timeout, SIGTERM still works — the
+        // daemon just stays blocked until the next connection. Surface
+        // at debug level so it shows up when someone runs with -v.
+        std.log.scoped(.gateway).debug(
+            "listener timeout not set: {s}",
+            .{@errorName(e)},
+        );
+    };
+
     while (!should_stop.load(.acquire)) {
         var stream = server.accept(io) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionAborted => continue,
+            error.Canceled => continue,
             error.SocketNotListening => return,
             else => return error.AcceptFailed,
         };
@@ -240,6 +256,26 @@ pub fn installShutdownHandlers() void {
 
 fn handleSignal(_: std.c.SIG) callconv(.c) void {
     should_stop.store(true, .release);
+}
+
+/// Configure the listener socket so blocking `accept()` wakes every
+/// `millis` ms. This lets the serve loop observe `should_stop` without
+/// needing a client connection to arrive first. On Windows / WASI the
+/// function is a no-op; on POSIX it calls `setsockopt(SO_RCVTIMEO)`
+/// directly against the socket handle exposed by `std.Io.net.Server`.
+fn setListenerTimeout(server: *std.Io.net.Server, millis: u32) !void {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+    const fd = server.socket.handle;
+    var tv: std.posix.timeval = .{
+        .sec = @intCast(millis / 1000),
+        .usec = @intCast((millis % 1000) * 1000),
+    };
+    try std.posix.setsockopt(
+        fd,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&tv),
+    );
 }
 
 // --- tests -----------------------------------------------------------------

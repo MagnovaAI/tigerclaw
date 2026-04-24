@@ -306,20 +306,38 @@ fn renderJsonFromOutput(output: []const u8) http.Response {
 /// `tcp_server` before this thread services its next request.
 threadlocal var sse_body_buf: [16 * 1024]u8 = undefined;
 
+/// Emit the runner output as one `event: token` frame per source line
+/// followed by a single `event: done`. SSE forbids literal newlines in
+/// a `data:` line, so multi-line replies are split into multiple
+/// frames; clients concatenate them with `\n` between frames to
+/// reconstruct the original text.
+///
+/// The runner is still one-shot — true per-token streaming lands when
+/// the dispatcher grows a streaming response shape. Framing here so
+/// the wire protocol is honest and clients can render incrementally.
 fn renderSseFromOutput(output: []const u8) http.Response {
-    const truncated = if (output.len > sse_body_buf.len - 256)
-        output[0 .. sse_body_buf.len - 256]
-    else
-        output;
-    const body = std.fmt.bufPrint(
-        &sse_body_buf,
-        "event: token\ndata: {s}\n\nevent: done\ndata: {{\"completed\":true}}\n\n",
-        .{truncated},
-    ) catch return .{ .status = .internal_server_error, .body = "render failed\n" };
+    var w: std.Io.Writer = .fixed(&sse_body_buf);
+    const headroom: usize = 64; // space for the trailing done frame
+    const budget = if (sse_body_buf.len > headroom) sse_body_buf.len - headroom else 0;
+
+    var it = std.mem.splitScalar(u8, output, '\n');
+    while (it.next()) |line| {
+        // Cap any single frame so one pathologically long line can't
+        // exhaust the buffer on its own.
+        const cap = @min(line.len, budget / 2);
+        if (w.buffered().len + cap + 24 > budget) break;
+        w.writeAll("event: token\ndata: ") catch break;
+        if (cap > 0) w.writeAll(line[0..cap]) catch break;
+        w.writeAll("\n\n") catch break;
+    }
+
+    w.writeAll("event: done\ndata: {\"completed\":true}\n\n") catch
+        return .{ .status = .internal_server_error, .body = "render failed\n" };
+
     return .{
         .status = .ok,
         .headers = &sse_headers,
-        .body = body,
+        .body = w.buffered(),
     };
 }
 
@@ -345,14 +363,6 @@ fn wantsSse(req: http.Request) bool {
     const accept = req.getHeader("accept") orelse return false;
     return std.mem.indexOf(u8, accept, "text/event-stream") != null;
 }
-
-const mock_sse_body =
-    "event: token\n" ++
-    "data: ping\n" ++
-    "\n" ++
-    "event: done\n" ++
-    "data: {\"completed\":true}\n" ++
-    "\n";
 
 const sse_headers = [_]http.Header{
     .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },

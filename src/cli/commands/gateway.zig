@@ -21,6 +21,10 @@ pub const Verb = union(enum) {
     run: RunOptions,
     /// `tigerclaw gateway logs` — read the on-disk log file.
     logs: LogsOptions,
+    /// `tigerclaw gateway stop [--force]` — signal the running daemon
+    /// via its pidfile and wait for it to exit. `--force` skips the
+    /// grace period and SIGKILLs.
+    stop: StopOptions,
 };
 
 pub const RunOptions = struct {
@@ -35,6 +39,9 @@ pub const RunOptions = struct {
     /// Force-enable ANSI colour even when stdout is not a TTY.
     /// Equivalent to `FORCE_COLOR=1`.
     force_color: bool = false,
+    /// Kill any gateway already running from the pidfile before
+    /// starting. Lets `tigerclaw gateway --force` act as a restart.
+    force: bool = false,
 };
 
 pub const LogsOptions = struct {
@@ -43,6 +50,20 @@ pub const LogsOptions = struct {
     /// Number of trailing lines to print before (optionally) following.
     /// Zero means "all available".
     tail: u32 = 0,
+};
+
+pub const StopOptions = struct {
+    /// Skip the SIGTERM grace period and go straight to SIGKILL.
+    /// Also used when the grace wait expires without the pid clearing.
+    force: bool = false,
+    /// Port to probe when the pidfile is missing or stale. If a
+    /// listener answers on this port we surface an orphan-listener
+    /// error instead of the misleading "gateway is not running".
+    /// Matches the daemon's default (`RunOptions.port`).
+    port: u16 = 8765,
+    /// Host to probe alongside `port`. Loopback by default; override
+    /// only if the daemon was started against a non-default bind.
+    host: []const u8 = "127.0.0.1",
 };
 
 pub const ParseError = error{
@@ -64,6 +85,10 @@ pub fn parse(argv: []const []const u8) ParseError!Verb {
     // should error rather than silently start a daemon.
     if (std.mem.eql(u8, first, "logs")) {
         return .{ .logs = try parseLogsOptions(argv[1..]) };
+    }
+
+    if (std.mem.eql(u8, first, "stop")) {
+        return .{ .stop = try parseStopOptions(argv[1..]) };
     }
 
     // Everything else is parsed as run options. A non-flag positional
@@ -97,6 +122,36 @@ fn parseRunOptions(argv: []const []const u8) ParseError!RunOptions {
         }
         if (std.mem.eql(u8, a, "--color")) {
             opts.force_color = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--force") or std.mem.eql(u8, a, "-f")) {
+            opts.force = true;
+            continue;
+        }
+        return error.UnknownFlag;
+    }
+    return opts;
+}
+
+fn parseStopOptions(argv: []const []const u8) ParseError!StopOptions {
+    var opts: StopOptions = .{};
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (std.mem.eql(u8, a, "--force") or std.mem.eql(u8, a, "-9")) {
+            opts.force = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--port") or std.mem.eql(u8, a, "-p")) {
+            if (i + 1 >= argv.len) return error.MissingFlagValue;
+            opts.port = std.fmt.parseInt(u16, argv[i + 1], 10) catch return error.InvalidPort;
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--host")) {
+            if (i + 1 >= argv.len) return error.MissingFlagValue;
+            opts.host = argv[i + 1];
+            i += 1;
             continue;
         }
         return error.UnknownFlag;
@@ -282,6 +337,7 @@ fn printTail(
 const gateway_root = @import("../../gateway/root.zig");
 const harness = @import("../../harness/root.zig");
 const clock_mod = @import("../../clock.zig");
+const http_client = @import("http_client.zig");
 const tcp_server = @import("../../gateway/tcp_server.zig");
 const live_runner = @import("live_runner.zig");
 const agent_registry = @import("agent_registry.zig");
@@ -289,6 +345,11 @@ const agents_loader = @import("agents_loader.zig");
 const harness_agent_registry = @import("../../harness/agent_registry.zig");
 const startup_log = @import("../../gateway/startup_log.zig");
 const log_formatter = @import("../../gateway/log_formatter.zig");
+const pidfile = @import("../../daemon/pidfile.zig");
+
+/// Pidfile name inside the state directory. Kept as a stable
+/// relative path so both start and stop paths agree.
+pub const pidfile_name = "gateway.pid";
 
 const gw_log = std.log.scoped(.gateway);
 
@@ -321,6 +382,9 @@ pub const RunRunOptions = struct {
     /// Pre-formatted host string for the banner (the IpAddress
     /// union doesn't expose a cheap to_string in Zig 0.16).
     host_str: []const u8 = "127.0.0.1",
+    /// If true, stop any daemon referenced by the pidfile before
+    /// binding — enables `tigerclaw gateway --force` restart UX.
+    force: bool = false,
 };
 
 pub const RunRunError = error{
@@ -363,6 +427,44 @@ pub fn runGateway(
         else => return error.StateDirOpenFailed,
     };
     defer state_dir.close(io);
+
+    // `--force`: if a live pidfile points at another process, kill it
+    // and wait before we try to bind. A stale pidfile is overwritten
+    // silently by the write below.
+    if (opts.force) {
+        if (!pidfile.isStale(io, state_dir, pidfile_name)) {
+            if (pidfile.read(io, state_dir, pidfile_name)) |existing_pid| {
+                gw_log.info("--force: stopping existing gateway (pid {d})", .{existing_pid});
+                std.posix.kill(existing_pid, std.posix.SIG.TERM) catch {};
+                // Poll up to 5s then escalate to SIGKILL. Mirrors
+                // runStop's cadence so operator expectations align.
+                const poll_ns: u64 = 100 * std.time.ns_per_ms;
+                const max_ns: u64 = 5 * std.time.ns_per_s;
+                var waited: u64 = 0;
+                while (waited < max_ns) {
+                    std.Io.sleep(io, std.Io.Duration.fromNanoseconds(poll_ns), .awake) catch {};
+                    waited += poll_ns;
+                    std.posix.kill(existing_pid, @enumFromInt(0)) catch |e| switch (e) {
+                        error.ProcessNotFound => break,
+                        else => break,
+                    };
+                }
+                if (waited >= max_ns) {
+                    gw_log.warn("existing gateway did not exit in 5s — sending SIGKILL", .{});
+                    std.posix.kill(existing_pid, std.posix.SIG.KILL) catch {};
+                }
+            } else |_| {}
+        }
+    }
+
+    // Publish our pid so `gateway stop` can find us. Stale pidfiles
+    // from a previously-crashed daemon are overwritten unconditionally —
+    // `isStale` would just tell us the process is gone, same result.
+    const self_pid: pidfile.Pid = @intCast(std.c.getpid());
+    pidfile.write(io, state_dir, pidfile_name, self_pid) catch |e| {
+        gw_log.warn("pidfile write failed: {s}", .{@errorName(e)});
+    };
+    defer pidfile.remove(io, state_dir, pidfile_name) catch {};
 
     // Reset the stop flag so consecutive runs in the same process
     // (tests, REPL-style smoke runs) do not inherit a poisoned flag.
@@ -502,6 +604,172 @@ pub fn runGateway(
     try out.writeAll("tigerclaw gateway stopped cleanly\n");
 }
 
+// ---------------------------------------------------------------------------
+// `gateway stop` execution — signal the running daemon via its pidfile.
+
+pub const StopRunOptions = struct {
+    /// Caller-resolved absolute path to `<HOME>/.tigerclaw/state`.
+    state_dir_path: []const u8,
+    force: bool = false,
+    /// Host + port probed when the pidfile is missing or stale. A
+    /// live listener on this port while bookkeeping says "not
+    /// running" is an orphan — we surface that as its own error so
+    /// the CLI can tell the operator to investigate.
+    host: []const u8 = "127.0.0.1",
+    port: u16 = 8765,
+    /// Allocator used by the port probe's HTTP client. The probe
+    /// lives for the duration of a single `runStop` call, so any
+    /// general-purpose allocator is fine.
+    allocator: std.mem.Allocator,
+};
+
+pub const StopRunError = error{
+    NotRunning,
+    /// Pidfile says "not running" but `host:port` has a live
+    /// listener. Operator intervention required — most commonly a
+    /// crashed daemon that never cleaned its pidfile, or a stray
+    /// process occupying the port under a different identity.
+    OrphanListener,
+    PidfileCorrupt,
+    SignalFailed,
+    StateDirOpenFailed,
+    Timeout,
+} || std.Io.Writer.Error || std.mem.Allocator.Error;
+
+/// Signal the daemon referenced by `<state_dir>/gateway.pid` and wait
+/// for it to clear. SIGTERM is the default; `--force` sends SIGKILL
+/// immediately. A soft 5s grace period gives the drain path time to
+/// finish; on timeout we escalate to SIGKILL automatically.
+pub fn runStop(
+    io: std.Io,
+    opts: StopRunOptions,
+    out: *std.Io.Writer,
+) StopRunError!void {
+    var state_dir = std.Io.Dir.cwd().openDir(io, opts.state_dir_path, .{}) catch {
+        return error.StateDirOpenFailed;
+    };
+    defer state_dir.close(io);
+
+    const pid = pidfile.read(io, state_dir, pidfile_name) catch |e| switch (e) {
+        // Pidfile is gone — but something may still be bound to the
+        // gateway port. Probe before trusting the bookkeeping; an
+        // orphan listener needs operator attention, not a bland
+        // "not running" message.
+        error.FileMissing => {
+            if (probeGatewayPort(opts.allocator, io, opts.host, opts.port)) {
+                try out.print(
+                    "pidfile missing but {s}:{d} has a live listener — orphan process holding the port\n",
+                    .{ opts.host, opts.port },
+                );
+                return error.OrphanListener;
+            }
+            return error.NotRunning;
+        },
+        error.Corrupt => return error.PidfileCorrupt,
+        error.IoFailure => return error.StateDirOpenFailed,
+    };
+
+    // If the pid is already dead, skip the signal dance and just
+    // clean up the stale pidfile so the next start is quiet. But
+    // probe the port first — if the pidfile's pid is dead yet the
+    // port is still held, a different process has taken over and
+    // the operator needs to know.
+    if (pidfile.isStale(io, state_dir, pidfile_name)) {
+        pidfile.remove(io, state_dir, pidfile_name) catch {};
+        if (probeGatewayPort(opts.allocator, io, opts.host, opts.port)) {
+            try out.print(
+                "gateway pid {d} is dead but {s}:{d} has a live listener — orphan process holding the port\n",
+                .{ pid, opts.host, opts.port },
+            );
+            return error.OrphanListener;
+        }
+        try out.print("gateway pid {d} is not running (stale pidfile cleared)\n", .{pid});
+        return error.NotRunning;
+    }
+
+    const first_sig = if (opts.force)
+        std.posix.SIG.KILL
+    else
+        std.posix.SIG.TERM;
+
+    std.posix.kill(pid, first_sig) catch |e| switch (e) {
+        error.ProcessNotFound => {
+            pidfile.remove(io, state_dir, pidfile_name) catch {};
+            try out.print("gateway pid {d} already gone\n", .{pid});
+            return;
+        },
+        else => return error.SignalFailed,
+    };
+
+    try out.print("signalled gateway (pid {d}) with {s}\n", .{
+        pid,
+        if (opts.force) "SIGKILL" else "SIGTERM",
+    });
+
+    // Poll at 100ms up to 5s. `kill(pid, 0)` is the probe — a
+    // ProcessNotFound means the daemon unwound cleanly.
+    const poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
+    const max_wait_ns: u64 = 5 * std.time.ns_per_s;
+    var waited_ns: u64 = 0;
+    while (waited_ns < max_wait_ns) {
+        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(poll_interval_ns), .awake) catch {};
+        waited_ns += poll_interval_ns;
+        std.posix.kill(pid, @enumFromInt(0)) catch |e| switch (e) {
+            error.ProcessNotFound => {
+                pidfile.remove(io, state_dir, pidfile_name) catch {};
+                try out.print("gateway exited cleanly\n", .{});
+                return;
+            },
+            else => break,
+        };
+    }
+
+    // Grace period elapsed. Escalate to SIGKILL unless we already
+    // sent one; either way surface a Timeout so shell scripts can
+    // decide whether to retry.
+    if (!opts.force) {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        try out.print("gateway did not exit in 5s — sent SIGKILL\n", .{});
+    }
+    pidfile.remove(io, state_dir, pidfile_name) catch {};
+    return error.Timeout;
+}
+
+/// Return `true` when `host:port` has anything accepting TCP. We
+/// reuse the CLI's HTTP client against `/health` so the probe
+/// travels the same code path as a regular verb and any answering
+/// listener — gateway, stranger, or half-dead daemon — reads as
+/// "live". Only `GatewayDown` (ConnectionRefused twice) counts as
+/// absent; everything else (2xx, 4xx, 5xx, malformed response,
+/// timeout) proves someone is there.
+fn probeGatewayPort(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+) bool {
+    var url_buf: [128]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://{s}:{d}/health", .{ host, port }) catch
+        return false;
+
+    const r = http_client.send(
+        allocator,
+        io,
+        .{ .method = .GET, .url = url },
+        null,
+        // Short retry: the whole point of the probe is to be snappy,
+        // not to wait out a legitimately-starting daemon.
+        .{ .retry_delay_ns = 10 * std.time.ns_per_ms },
+    );
+    return if (r) |_| true else |err| switch (err) {
+        error.GatewayDown => false,
+        // Anything else (Unauthorized / BadRequest / InternalError /
+        // InvalidResponse / OutOfMemory) means the socket accepted
+        // — which is all we care about here.
+        else => true,
+    };
+}
+
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
@@ -544,6 +812,39 @@ test "parse: --port without a value returns MissingFlagValue" {
 test "parse: bogus positional returns UnknownSubVerb" {
     const argv = [_][]const u8{"launch"};
     try testing.expectError(error.UnknownSubVerb, parse(&argv));
+}
+
+test "parse: stop default options" {
+    const argv = [_][]const u8{"stop"};
+    const v = try parse(&argv);
+    try testing.expect(!v.stop.force);
+    try testing.expectEqualStrings("127.0.0.1", v.stop.host);
+    try testing.expectEqual(@as(u16, 8765), v.stop.port);
+}
+
+test "parse: stop --force and --port override defaults" {
+    const argv = [_][]const u8{ "stop", "--force", "--port", "9100", "--host", "0.0.0.0" };
+    const v = try parse(&argv);
+    try testing.expect(v.stop.force);
+    try testing.expectEqual(@as(u16, 9100), v.stop.port);
+    try testing.expectEqualStrings("0.0.0.0", v.stop.host);
+}
+
+test "parse: stop --port with a non-integer returns InvalidPort" {
+    const argv = [_][]const u8{ "stop", "--port", "abc" };
+    try testing.expectError(error.InvalidPort, parse(&argv));
+}
+
+test "probeGatewayPort: closed port returns false" {
+    // Same trick as the http_client test: bind, capture port, close,
+    // probe — the kernel holds the port in TIME_WAIT so connect()
+    // gets ConnectionRefused and the probe reports "nobody home".
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
+    var server = try addr.listen(testing.io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    server.deinit(testing.io);
+
+    try testing.expect(!probeGatewayPort(testing.allocator, testing.io, "127.0.0.1", port));
 }
 
 test "parse: logs default options" {

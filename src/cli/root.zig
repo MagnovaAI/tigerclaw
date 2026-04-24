@@ -64,6 +64,7 @@ pub const Command = union(enum) {
     diag: commands.diag.Subcommand,
     gateway: commands.gateway.RunOptions,
     gateway_logs: commands.gateway.LogsOptions,
+    gateway_stop: commands.gateway.StopOptions,
     uninstall: commands.uninstall.Args,
     unknown: []const u8,
 };
@@ -215,6 +216,7 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
         return switch (verb) {
             .run => |opts| .{ .gateway = opts },
             .logs => |opts| .{ .gateway_logs = opts },
+            .stop => |opts| .{ .gateway_stop = opts },
         };
     }
 
