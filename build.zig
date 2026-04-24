@@ -445,6 +445,19 @@ pub fn build(b: *std.Build) void {
     const ctx_default_engine_tests = b.addTest(.{ .root_module = ctx_default_engine_test_mod });
     test_step.dependOn(&b.addRunArtifact(ctx_default_engine_tests).step);
 
+    const ctx_engine_contract_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/context_engine_contract_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctx_engine_contract_test_mod.addImport("ctx_types", ctx_types_mod);
+    ctx_engine_contract_test_mod.addImport("ctx_engine", ctx_engine_mod);
+    ctx_engine_contract_test_mod.addImport("ctx_default_engine", ctx_default_engine_mod);
+    ctx_engine_contract_test_mod.addImport("context", context_mod);
+    ctx_engine_contract_test_mod.addImport("clock", clock_mod);
+    const ctx_engine_contract_tests = b.addTest(.{ .root_module = ctx_engine_contract_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ctx_engine_contract_tests).step);
+
     const capabilities_mod = b.addModule("capabilities", .{
         .root_source_file = b.path("src/capabilities.zig"),
         .target = target,
