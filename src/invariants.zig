@@ -65,11 +65,11 @@ pub fn runAll(alloc: std.mem.Allocator) !Report {
 }
 
 fn checkCapabilityCount(r: *Report) !void {
-    // Spec says 11 verbs + 5 infrastructure capabilities = 16.
-    const expected: usize = 16;
+    // Spec says 11 verbs + 5 infrastructure + 2 context capabilities = 18.
+    const expected: usize = 18;
     const actual = capabilities.capability_count;
     try r.add(.{
-        .name = "capability_count matches spec (16)",
+        .name = "capability_count matches spec (18)",
         .passed = actual == expected,
         .detail = if (actual == expected) "" else "capability enum drift vs spec",
     });

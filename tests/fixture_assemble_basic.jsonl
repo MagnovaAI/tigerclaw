@@ -1,0 +1,1 @@
+{"input_sections":[{"kind":"system_preamble","role":"system","content":"soul","priority":0,"token_estimate":10,"origin":"persona"},{"kind":"current_prompt","role":"user","content":"hello","priority":0,"token_estimate":5,"origin":"prompt"}],"budget":100,"expected_kept_count":2,"expected_estimated_tokens":15,"expected_dropped_count":0}

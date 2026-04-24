@@ -18,7 +18,7 @@
 //! Spec: docs/spec/agent-architecture-v3.yaml §architecture.hook-bus
 
 const std = @import("std");
-const context_mod = @import("context.zig");
+const context_mod = @import("context");
 const errors = @import("errors.zig");
 
 const Context = context_mod.Context;
@@ -157,7 +157,7 @@ pub const HookBus = struct {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
-const clock_mod = @import("clock.zig");
+const clock_mod = @import("clock");
 
 fn mkTestContext(clk: *const clock_mod.Clock) Context {
     return .{

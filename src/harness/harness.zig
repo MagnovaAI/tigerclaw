@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const clock_mod = @import("../clock.zig");
+const clock_mod = @import("clock");
 const session_mod = @import("session.zig");
 
 pub const Session = session_mod.Session;

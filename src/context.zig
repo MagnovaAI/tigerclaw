@@ -25,7 +25,7 @@
 //! Spec: docs/spec/agent-architecture-v3.yaml §architecture.context-object
 
 const std = @import("std");
-const clock_mod = @import("clock.zig");
+const clock_mod = @import("clock");
 
 /// Forward-declared meter handle. The real vtable lands in Phase 1 when
 /// the meter plugger is introduced. Plugs that want to consult the
@@ -119,6 +119,25 @@ pub const Context = struct {
             }
         }
         return out;
+    }
+
+    /// Construct a Context suitable for unit tests. Avoids the need for a
+    /// real Io pointer; callers that never call io-dependent code may pass
+    /// this safely. `alloc` and `clock` are injected; everything else is
+    /// set to inert sentinel values.
+    pub fn initForTest(alloc: std.mem.Allocator, clock: *const clock_mod.Clock) Context {
+        return .{
+            .io = undefined,
+            .alloc = alloc,
+            .clock = clock,
+            .trace_id = std.mem.zeroes(TraceId),
+            .parent_span_id = null,
+            .deadline_ms = null,
+            .budget = null,
+            .principal = "user:test",
+            .session_id = "session:test",
+            .origin_channel_id = null,
+        };
     }
 
     /// Returns true iff the deadline is set and has passed.

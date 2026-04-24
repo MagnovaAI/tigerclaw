@@ -33,8 +33,8 @@
 //! takes whatever plug reference its plugger expects.
 
 const std = @import("std");
-const clock_mod = @import("clock.zig");
-const context_mod = @import("context.zig");
+const clock_mod = @import("clock");
+const context_mod = @import("context");
 const errors = @import("errors.zig");
 
 const Context = context_mod.Context;

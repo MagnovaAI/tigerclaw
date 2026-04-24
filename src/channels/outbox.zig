@@ -41,7 +41,7 @@
 
 const std = @import("std");
 
-const clock_mod = @import("../clock.zig");
+const clock_mod = @import("clock");
 const spec = @import("channels_spec");
 
 pub const Clock = clock_mod.Clock;

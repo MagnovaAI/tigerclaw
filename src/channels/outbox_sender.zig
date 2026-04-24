@@ -198,7 +198,7 @@ fn drainOnce(self: *Sender, ch: spec.Channel) !void {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
-const clock_mod = @import("../clock.zig");
+const clock_mod = @import("clock");
 const dispatch_mod = @import("dispatch.zig");
 
 const FakeChannel = struct {

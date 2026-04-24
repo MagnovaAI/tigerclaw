@@ -129,7 +129,7 @@ fn processOne(self: *Worker, msg: spec.InboundMessage) TurnError!void {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
-const clock_mod = @import("../clock.zig");
+const clock_mod = @import("clock");
 
 /// Stub runner: records what it saw and echoes input back with a prefix.
 const StubRunner = struct {

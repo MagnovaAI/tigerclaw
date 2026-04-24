@@ -16,7 +16,7 @@
 
 const std = @import("std");
 const types = @import("types");
-const clock_mod = @import("../clock.zig");
+const clock_mod = @import("clock");
 const llm = @import("../llm/root.zig");
 const harness = @import("../harness/root.zig");
 

@@ -75,7 +75,7 @@ pub fn list(opts: Options) !Report {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
-const clock_mod = @import("../clock.zig");
+const clock_mod = @import("clock");
 
 test "list: empty directory prints nothing" {
     var tmp = std.testing.tmpDir(.{});

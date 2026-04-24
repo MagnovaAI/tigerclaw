@@ -49,6 +49,10 @@ pub const Capability = enum(u8) {
     waiter,
     hook_bus,
 
+    // Context
+    context_engine,
+    context_contributor,
+
     /// Stable integer tag across releases. Do not change values of
     /// existing variants — add new ones at the end.
     pub fn tag(self: Capability) u8 {
@@ -75,6 +79,8 @@ pub const Capability = enum(u8) {
             .telemetry => "telemetry",
             .waiter => "waiter",
             .hook_bus => "hook_bus",
+            .context_engine => "context_engine",
+            .context_contributor => "context_contributor",
         };
     }
 };
@@ -99,6 +105,8 @@ pub const vtable_version = struct {
     pub const telemetry: u16 = 1;
     pub const waiter: u16 = 1;
     pub const hook_bus: u16 = 1;
+    pub const context_engine: u16 = 1;
+    pub const context_contributor: u16 = 1;
 };
 
 /// Returns the current vtable version for the given capability. Used by
@@ -121,6 +129,8 @@ pub fn currentVtableVersion(cap: Capability) u16 {
         .telemetry => vtable_version.telemetry,
         .waiter => vtable_version.waiter,
         .hook_bus => vtable_version.hook_bus,
+        .context_engine => vtable_version.context_engine,
+        .context_contributor => vtable_version.context_contributor,
     };
 }
 
@@ -150,10 +160,12 @@ test "tag values are stable and append-only" {
     try std.testing.expectEqual(@as(u8, 13), Capability.telemetry.tag());
     try std.testing.expectEqual(@as(u8, 14), Capability.waiter.tag());
     try std.testing.expectEqual(@as(u8, 15), Capability.hook_bus.tag());
+    try std.testing.expectEqual(@as(u8, 16), Capability.context_engine.tag());
+    try std.testing.expectEqual(@as(u8, 17), Capability.context_contributor.tag());
 }
 
 test "capability_count matches enum field count" {
-    try std.testing.expectEqual(@as(usize, 16), capability_count);
+    try std.testing.expectEqual(@as(usize, 18), capability_count);
 }
 
 test "name returns canonical plugger name" {

@@ -1,0 +1,1 @@
+{"input_sections":[{"kind":"compaction_summary","role":"system","content":"prior","priority":40,"token_estimate":20,"origin":"summary"},{"kind":"current_prompt","role":"user","content":"now","priority":0,"token_estimate":5,"origin":"prompt"}],"budget":100,"expected_kept_count":2,"expected_estimated_tokens":25,"expected_dropped_count":0}
