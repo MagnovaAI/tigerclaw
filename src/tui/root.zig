@@ -42,6 +42,7 @@ const vxfw = vaxis.vxfw;
 const md = @import("md.zig");
 const live_runner = @import("../cli/commands/live_runner.zig");
 const harness = @import("../harness/root.zig");
+const HeaderWidget = @import("widgets/header.zig");
 
 test {
     // Ensure md tests are discovered when the unit-test binary
@@ -395,7 +396,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                         );
                         defer allocator.free(msg);
                         try appendLine(&history, allocator, .system, msg);
-                        try drawFrame(&vx, writer, &input, history.items, agents.items(), selected, pending, spinner_tick, picker_open, picker_cursor);
+                        try drawFrame(allocator, &vx, writer, &input, history.items, agents.items(), selected, pending, spinner_tick, picker_open, picker_cursor);
                         continue;
                     };
                     t.detach();
@@ -554,7 +555,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
             else => {},
         }
 
-        try drawFrame(&vx, writer, &input, history.items, agents.items(), selected, pending, spinner_tick, picker_open, picker_cursor);
+        try drawFrame(allocator, &vx, writer, &input, history.items, agents.items(), selected, pending, spinner_tick, picker_open, picker_cursor);
     }
 }
 
@@ -582,6 +583,7 @@ fn handlePickerKey(
 }
 
 fn drawFrame(
+    allocator: std.mem.Allocator,
     vx: *vaxis.Vaxis,
     writer: anytype,
     input: *vaxis.widgets.TextInput,
@@ -599,7 +601,7 @@ fn drawFrame(
     // in the row above the input box when a streamed reply ends and
     // the old bytes are what's left in the grid.
     vx.window().clear();
-    try draw(vx, input, history, agents, selected, pending, spinner_tick, picker_open, picker_cursor);
+    try draw(allocator, vx, input, history, agents, selected, pending, spinner_tick, picker_open, picker_cursor);
     try vx.render(writer);
     try writer.flush();
 }
@@ -710,6 +712,7 @@ fn handleSlashCommand(
 }
 
 fn draw(
+    allocator: std.mem.Allocator,
     vx: *vaxis.Vaxis,
     input: *vaxis.widgets.TextInput,
     history: []const Line,
@@ -725,7 +728,7 @@ fn draw(
 
     // Row 0: header. Row 1: separator. Rest: history, then status
     // hint above a 3-row input box.
-    drawHeader(win, agents, selected, pending, spinner_tick);
+    try drawHeaderVxfw(allocator, vx, win, agents, selected, pending, spinner_tick);
 
     const header_rows: i32 = 2;
     const footer_rows: i32 = 4; // status hint + 3-row input box
@@ -786,6 +789,68 @@ fn draw(
     if (picker_open and agents.len > 0) {
         drawPicker(win, agents, picker_cursor);
     }
+}
+
+/// Bridge between the vxfw widget and the hand-rolled draw loop.
+///
+/// Builds a per-frame arena (vxfw widgets allocate surface buffers
+/// through the DrawContext arena and expect everything to be freed
+/// together), instantiates the HeaderWidget with the current
+/// agent/pending/spinner state, calls `widget.draw(ctx)` to produce
+/// a Surface, then composites that Surface onto a child pane of the
+/// vaxis window. This is the "surface.render(win, focused)" path
+/// that `vxfw.App.run` normally drives — we're just doing it
+/// manually until the full migration lands.
+fn drawHeaderVxfw(
+    allocator: std.mem.Allocator,
+    vx: *vaxis.Vaxis,
+    win: vaxis.Window,
+    agents: []const []const u8,
+    selected: usize,
+    pending: bool,
+    spinner_tick: u64,
+) !void {
+    const agent_name = if (agents.len > 0) agents[selected] else "—";
+
+    const hdr: HeaderWidget = .{
+        .agent_name = agent_name,
+        .pending = pending,
+        .spinner_tick = spinner_tick,
+    };
+
+    // vxfw allocates Surface cell buffers out of the DrawContext's
+    // arena. Use a throwaway per-frame arena so there's no free
+    // bookkeeping; it releases everything after this function
+    // returns.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{ .width = 0, .height = 0 },
+        .max = .{
+            .width = @intCast(win.width),
+            .height = 2,
+        },
+        .cell_size = .{
+            .width = if (vx.screen.width > 0) vx.screen.width_pix / vx.screen.width else 8,
+            .height = if (vx.screen.height > 0) vx.screen.height_pix / vx.screen.height else 16,
+        },
+    };
+
+    const surface = try hdr.widget().draw(ctx);
+
+    // Composite the widget's Surface into the top two rows of the
+    // window. `Surface.render` walks the cell buffer and calls
+    // `win.writeCell` for each occupied cell — the same primitive
+    // the hand-rolled `drawHeader` used directly.
+    const pane = win.child(.{
+        .x_off = 0,
+        .y_off = 0,
+        .width = surface.size.width,
+        .height = surface.size.height,
+    });
+    surface.render(pane, hdr.widget());
 }
 
 fn drawHeader(
