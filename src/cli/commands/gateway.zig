@@ -281,7 +281,7 @@ fn printTail(
 
 const gateway_root = @import("../../gateway/root.zig");
 const harness = @import("../../harness/root.zig");
-const clock_mod = @import("../../clock.zig");
+const clock_mod = @import("clock");
 const tcp_server = @import("../../gateway/tcp_server.zig");
 const live_runner = @import("live_runner.zig");
 const agent_registry = @import("agent_registry.zig");

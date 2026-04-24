@@ -29,7 +29,7 @@ const capabilities = @import("capabilities.zig");
 const manifest_mod = @import("manifest.zig");
 const dep_graph = @import("dep_graph.zig");
 const registry_mod = @import("registry.zig");
-const context_mod = @import("context.zig");
+const context_mod = @import("context");
 const errors = @import("errors.zig");
 
 const Capability = capabilities.Capability;
@@ -186,7 +186,7 @@ pub const Lifecycle = struct {
 const testing = std.testing;
 const Dep = manifest_mod.Dep;
 const Slot = registry_mod.Slot;
-const clock_mod = @import("clock.zig");
+const clock_mod = @import("clock");
 
 // A trivial plug used in tests. Records how many times each hook fired
 // so we can assert ordering.

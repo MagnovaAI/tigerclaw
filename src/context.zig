@@ -25,7 +25,7 @@
 //! Spec: docs/spec/agent-architecture-v3.yaml §architecture.context-object
 
 const std = @import("std");
-const clock_mod = @import("clock.zig");
+const clock_mod = @import("clock");
 
 /// Forward-declared meter handle. The real vtable lands in Phase 1 when
 /// the meter plugger is introduced. Plugs that want to consult the

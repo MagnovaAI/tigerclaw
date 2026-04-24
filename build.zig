@@ -320,6 +320,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    tigerclaw_mod.addImport("clock", clock_mod);
+    exe_mod.addImport("clock", clock_mod);
+    unit_mod.addImport("clock", clock_mod);
+    const clock_tests = b.addTest(.{ .root_module = clock_mod });
+    test_step.dependOn(&b.addRunArtifact(clock_tests).step);
 
     const ctx_types_mod = b.addModule("ctx_types", .{
         .root_source_file = b.path("src/context/types.zig"),
@@ -340,7 +345,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    context_mod.addImport("clock.zig", clock_mod);
+    context_mod.addImport("clock", clock_mod);
+    tigerclaw_mod.addImport("context", context_mod);
+    exe_mod.addImport("context", context_mod);
+    unit_mod.addImport("context", context_mod);
+    const context_tests = b.addTest(.{ .root_module = context_mod });
+    test_step.dependOn(&b.addRunArtifact(context_tests).step);
 
     const ctx_engine_mod = b.addModule("ctx_engine", .{
         .root_source_file = b.path("src/context/engine.zig"),
@@ -441,6 +451,22 @@ pub fn build(b: *std.Build) void {
     ctx_default_engine_mod.addImport("ctx_assemble", ctx_assemble_mod);
     ctx_default_engine_mod.addImport("ctx_compact", ctx_compact_mod);
     ctx_default_engine_mod.addImport("context", context_mod);
+
+    const ctx_root_mod = b.addModule("ctx_root", .{
+        .root_source_file = b.path("src/context/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctx_root_mod.addImport("ctx_types", ctx_types_mod);
+    ctx_root_mod.addImport("ctx_engine", ctx_engine_mod);
+    ctx_root_mod.addImport("ctx_assemble", ctx_assemble_mod);
+    ctx_root_mod.addImport("ctx_registry", ctx_registry_mod);
+    ctx_root_mod.addImport("ctx_compact", ctx_compact_mod);
+    ctx_root_mod.addImport("ctx_recall", ctx_recall_mod);
+    ctx_root_mod.addImport("ctx_default_engine", ctx_default_engine_mod);
+    tigerclaw_mod.addImport("ctx_root", ctx_root_mod);
+    exe_mod.addImport("ctx_root", ctx_root_mod);
+    unit_mod.addImport("ctx_root", ctx_root_mod);
 
     const ctx_default_engine_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/context_default_engine_test.zig"),

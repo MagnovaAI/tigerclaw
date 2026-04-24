@@ -49,7 +49,7 @@ const outbox_sender_mod = @import("../channels/outbox_sender.zig");
 const agent_registry = @import("../harness/agent_registry.zig");
 const spec = @import("channels_spec");
 
-const clock_mod = @import("../clock.zig");
+const clock_mod = @import("clock");
 const drain_mod = @import("../daemon/drain.zig");
 const settings_mod = @import("../settings/root.zig");
 const env_overrides = @import("../settings/env_overrides.zig");

@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const errors = @import("errors.zig");
-const context_mod = @import("context.zig");
+const context_mod = @import("context");
 
 const PlugError = errors.PlugError;
 const Context = context_mod.Context;
@@ -200,7 +200,7 @@ pub fn runContract(t: Telemetry, ctx: *const Context) !void {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
-const clock_mod = @import("clock.zig");
+const clock_mod = @import("clock");
 
 fn mkTestContext(clk: *const clock_mod.Clock) Context {
     return .{
