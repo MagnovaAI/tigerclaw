@@ -163,11 +163,18 @@ fn bindTelegram(
     const identity = bot.getMe() catch return error.BotHandshakeFailed;
     defer identity.deinit(channels.allocator);
 
-    if (log_writer) |w| {
-        w.print(
-            "telegram: {s} bound to @{s} (bot_id={d}, account={s})\n",
+    // The bind message used to stream into the banner's `out` writer,
+    // which caused it to print above the banner during boot. Route it
+    // through std.log instead so it lands in the ordered log stream
+    // after the banner has flushed.
+    if (log_writer) |_| {
+        // Debug-level: the banner already lists bound agents. Surfacing
+        // per-channel bind details at info pushed this line above the
+        // banner because stderr bypasses stdout's buffered banner write.
+        std.log.scoped(.telegram).debug(
+            "{s} bound to @{s} (bot_id={d}, account={s})",
             .{ agent.name, identity.username, identity.id, agent.channel.account },
-        ) catch {};
+        );
     }
 
     const tg = try channels.allocator.create(telegram_ext.channel.TelegramChannel);

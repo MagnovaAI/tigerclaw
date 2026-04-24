@@ -34,8 +34,14 @@ pub const WriteError = error{
 pub const Pid = i32;
 
 /// Write `pid` to `path` inside `dir`. Truncates any existing file.
+/// The underlying `createFile` error name is scoped-logged before we
+/// collapse it to `IoFailure` so operators can tell EACCES from
+/// EROFS without rebuilding with different plumbing.
 pub fn write(io: std.Io, dir: std.Io.Dir, path: []const u8, pid: Pid) WriteError!void {
-    const file = dir.createFile(io, path, .{ .truncate = true }) catch return error.IoFailure;
+    const file = dir.createFile(io, path, .{ .truncate = true }) catch |e| {
+        std.log.scoped(.pidfile).warn("createFile({s}) failed: {s}", .{ path, @errorName(e) });
+        return error.IoFailure;
+    };
     defer file.close(io);
 
     var buf: [16]u8 = undefined;
@@ -43,8 +49,14 @@ pub fn write(io: std.Io, dir: std.Io.Dir, path: []const u8, pid: Pid) WriteError
 
     var w_buf: [32]u8 = undefined;
     var w = file.writer(io, &w_buf);
-    w.interface.writeAll(rendered) catch return error.IoFailure;
-    w.interface.flush() catch return error.IoFailure;
+    w.interface.writeAll(rendered) catch |e| {
+        std.log.scoped(.pidfile).warn("write({s}) failed: {s}", .{ path, @errorName(e) });
+        return error.IoFailure;
+    };
+    w.interface.flush() catch |e| {
+        std.log.scoped(.pidfile).warn("flush({s}) failed: {s}", .{ path, @errorName(e) });
+        return error.IoFailure;
+    };
 }
 
 /// Read a pid value from `path` inside `dir`. Returns a typed error
