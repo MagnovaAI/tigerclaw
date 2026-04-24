@@ -1,7 +1,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli/root.zig");
+const globals = @import("globals.zig");
 const log_formatter = @import("gateway/log_formatter.zig");
+
+/// Map the Zig build mode to our runtime `Profile`. `.bench` and
+/// `.replay` are intentionally not derivable from the build mode —
+/// they opt in via explicit flags (a future concern).
+fn profileFromBuildMode() globals.Profile {
+    return switch (builtin.mode) {
+        .Debug => .debug,
+        .ReleaseSafe, .ReleaseFast, .ReleaseSmall => .release,
+    };
+}
 
 /// Route all `std.log` calls through the gateway log formatter. The
 /// formatter gates `.debug` on a runtime flag so `--verbose` can
@@ -12,6 +23,11 @@ pub const std_options: std.Options = .{
 };
 
 pub fn main(init: std.process.Init) !u8 {
+    // Set the process-wide build profile once, before any subsystem
+    // boots. Downstream code reads it via globals.getProfile() when
+    // decisions need to branch on debug-vs-release behavior.
+    globals.setProfile(profileFromBuildMode());
+
     const io = init.io;
     const arena = init.arena.allocator();
 
@@ -139,12 +155,22 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: agent <name> [-m \"message\"]\n");
             return 64;
         },
+        error.DoctorUnknownSubcommand => {
+            try stderr_w.interface.writeAll("tigerclaw: doctor [invariants]\n");
+            return 64;
+        },
     };
 
     switch (cmd) {
         .version => try cli.printVersion(&stdout_w.interface),
         .help => try cli.printHelp(&stdout_w.interface),
-        .doctor => try runDoctor(arena, init.environ_map, &stdout_w.interface),
+        .doctor => |sub| switch (sub) {
+            .summary => try runDoctor(arena, init.environ_map, &stdout_w.interface),
+            .invariants => {
+                const failed = try cli.commands.doctor.writeInvariantsReport(arena, &stdout_w.interface);
+                if (failed > 0) return 1;
+            },
+        },
         .completion => |shell| try cli.commands.completion.write(
             &stdout_w.interface,
             shell,
@@ -502,6 +528,7 @@ fn runDoctor(
         .zig_version = builtin.zig_version_string,
         .os_tag = @tagName(builtin.target.os.tag),
         .arch_tag = @tagName(builtin.target.cpu.arch),
+        .profile = @tagName(globals.getProfile()),
         .env_config = environ_map.get("TIGERCLAW_CONFIG"),
         .env_xdg = environ_map.get("XDG_CONFIG_HOME"),
         .env_home = environ_map.get("HOME"),

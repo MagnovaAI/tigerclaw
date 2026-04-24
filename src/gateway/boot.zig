@@ -50,9 +50,13 @@ const agent_registry = @import("../harness/agent_registry.zig");
 const spec = @import("channels_spec");
 
 const clock_mod = @import("clock");
+const context_mod = @import("context");
 const drain_mod = @import("../daemon/drain.zig");
 const settings_mod = @import("../settings/root.zig");
 const env_overrides = @import("../settings/env_overrides.zig");
+const hook_bus_mod = @import("../hook_bus.zig");
+const meter_mod = @import("../meter.zig");
+const telemetry_mod = @import("../telemetry.zig");
 
 pub const Options = struct {
     address: std.Io.net.IpAddress,
@@ -141,6 +145,18 @@ pub const Boot = struct {
     /// trivial (one small struct per reload).
     snapshots: std.array_list.Aligned(*routes.SettingsSnapshot, null),
 
+    /// Cross-cutting infrastructure constructed at boot. These are
+    /// spec-mandated (docs/spec/agent-architecture-v3.yaml) but not yet
+    /// threaded through `Context`; consumers at capability boundaries
+    /// land with the turn-loop refactor. Until then they are
+    /// "ceremonially" live: constructed, deinit'd, and (for hook_bus)
+    /// fired on shutdown so the subscription surface is usable by any
+    /// subsystem that already holds a `*Boot`.
+    hook_bus: hook_bus_mod.HookBus,
+    meter_impl: meter_mod.InMemoryMeter,
+    telemetry_sink: telemetry_mod.NoopSink,
+    clock: clock_mod.Clock,
+
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -186,6 +202,13 @@ pub const Boot = struct {
             .config_path = opts.config_path,
             .current_settings = initial_settings,
             .snapshots = snapshots,
+            .hook_bus = hook_bus_mod.HookBus.init(allocator),
+            // Empty initial budgets. Real token/dollar caps get wired
+            // when a guardrail-budget-* plug consumes them; for now the
+            // meter is live infrastructure with remaining() == 0.
+            .meter_impl = meter_mod.InMemoryMeter.init(&.{}),
+            .telemetry_sink = .{},
+            .clock = opts.clock,
         };
         boot.manager = manager_mod.Manager.init(allocator, io, &boot.dispatch);
 
@@ -262,9 +285,23 @@ pub const Boot = struct {
         self.allowlist.deinit();
         self.dispatch.deinit();
         self.outbox.deinit();
+        self.hook_bus.deinit();
         for (self.snapshots.items) |s| self.allocator.destroy(s);
         self.snapshots.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Expose the meter vtable for subsystems that hold a `*Boot` and
+    /// want to reserve/consume against the gateway's token ledger.
+    pub fn meter(self: *Boot) meter_mod.Meter {
+        return self.meter_impl.meter();
+    }
+
+    /// Expose the telemetry vtable. Currently a NoopSink — swap the
+    /// backing field for `StdoutSink` (or a future otel sink) once the
+    /// wiring at capability boundaries lands.
+    pub fn telemetry(self: *Boot) telemetry_mod.Telemetry {
+        return self.telemetry_sink.telemetry();
     }
 
     /// Register a channel on behalf of the named agent. The
@@ -344,6 +381,26 @@ pub const Boot = struct {
     }
 
     fn drain(self: *Boot, ctx: *routes.Context) void {
+        // Fire the `on_shutdown` hook before any drain work runs so
+        // subscribers see the transition at a well-defined point.
+        // Errors from handlers are logged but do not abort shutdown —
+        // we still want the drain to complete.
+        var shutdown_ctx: context_mod.Context = .{
+            .io = &self.io,
+            .alloc = self.allocator,
+            .clock = &self.clock,
+            .trace_id = std.mem.zeroes(context_mod.TraceId),
+            .parent_span_id = null,
+            .deadline_ms = null,
+            .budget = null,
+            .principal = "system:gateway",
+            .session_id = "session:shutdown",
+            .origin_channel_id = null,
+        };
+        self.hook_bus.fire(&shutdown_ctx, .on_shutdown, null) catch |err| {
+            std.debug.print("gateway: on_shutdown hook failed: {s}\n", .{@errorName(err)});
+        };
+
         var wait_ctx: DrainCtx = .{ .counter = ctx.runner.counter() };
         drain_mod.waitFor(self.io, isInFlightZero, &wait_ctx, .{
             .poll_interval_ns = self.drain_poll_interval_ns,
@@ -684,4 +741,59 @@ test "Boot.rebuild leaves the previous snapshot alone on malformed config" {
     try testing.expectEqual(good_ptr, after);
     try testing.expectEqual(good_gen, after.generation);
     try testing.expectEqual(good_level, after.settings.log_level);
+}
+
+test "Boot exposes a live meter and telemetry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var boot = try Boot.init(testing.allocator, testing.io, bootTestOptions(tmp.dir));
+    defer boot.deinit();
+
+    // Meter starts at 0 (no budgets configured) but the vtable works:
+    // a reserve against an empty ledger clamps remaining at 0 rather
+    // than refusing — meter is passive, per spec.
+    const m = boot.meter();
+    try testing.expectEqual(@as(u64, 0), m.remaining(.tokens));
+    const id = try m.reserve(.tokens, 100);
+    m.consume(id);
+
+    // Telemetry sink accepts span_start/span_end/event/flush without
+    // doing anything observable.
+    var fixed = clock_mod.FixedClock{ .value_ns = 0 };
+    const clk = fixed.clock();
+    var ctx = context_mod.Context.initForTest(testing.allocator, &clk);
+    const t = boot.telemetry();
+    const span = try t.spanStart(&ctx, "boot-test", &.{});
+    t.event(&ctx, "boot-event", &.{});
+    t.spanEnd(&ctx, span, .ok);
+    t.flush(&ctx);
+}
+
+test "Boot.hook_bus accepts subscriptions and fires on shutdown" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var boot = try Boot.init(testing.allocator, testing.io, bootTestOptions(tmp.dir));
+    defer boot.deinit();
+
+    const Counter = struct {
+        var fired: u32 = 0;
+        fn handler(_: *const context_mod.Context, _: ?*anyopaque) !void {
+            fired += 1;
+        }
+    };
+    Counter.fired = 0;
+    _ = try boot.hook_bus.subscribe(.on_shutdown, Counter.handler, 0);
+    try testing.expectEqual(@as(usize, 1), boot.hook_bus.subscriberCount(.on_shutdown));
+
+    // Manually build a Context and fire to prove the subscription is
+    // reachable. The real drain() path does the same thing during
+    // gateway shutdown; we avoid calling drain() here because it
+    // expects a live `routes.Context` with a runner counter.
+    var fixed = clock_mod.FixedClock{ .value_ns = 0 };
+    const clk = fixed.clock();
+    const ctx = context_mod.Context.initForTest(testing.allocator, &clk);
+    try boot.hook_bus.fire(&ctx, .on_shutdown, null);
+    try testing.expectEqual(@as(u32, 1), Counter.fired);
 }

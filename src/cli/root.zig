@@ -53,7 +53,7 @@ pub const AgentArgs = struct {
 pub const Command = union(enum) {
     version,
     help,
-    doctor,
+    doctor: commands.doctor.Sub,
     completion: commands.completion.Shell,
     agent: AgentArgs,
     channels: commands.channels.Subcommand,
@@ -96,6 +96,7 @@ pub const ParseError = error{
     GatewayLogsInvalidTailCount,
     GatewayInvalidPort,
     AgentMissingName,
+    DoctorUnknownSubcommand,
 };
 
 /// Top-level command table. Summaries feed the help screen and shell
@@ -112,7 +113,7 @@ pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "uninstall", .summary = "Remove the binary and the local state directory" },
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
-    .{ .name = "doctor", .summary = "Print a short environment report" },
+    .{ .name = "doctor", .summary = "Print an environment report (or `doctor invariants`)" },
     .{ .name = "completion", .summary = "Print a shell completion script (bash|zsh|fish)" },
 };
 
@@ -136,7 +137,10 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
 
     if (std.mem.eql(u8, match.descriptor.name, "version")) return .version;
     if (std.mem.eql(u8, match.descriptor.name, "help")) return .help;
-    if (std.mem.eql(u8, match.descriptor.name, "doctor")) return .doctor;
+    if (std.mem.eql(u8, match.descriptor.name, "doctor")) {
+        const sub = commands.doctor.parseSub(match.argv[1..]) orelse return error.DoctorUnknownSubcommand;
+        return .{ .doctor = sub };
+    }
     if (std.mem.eql(u8, match.descriptor.name, "completion")) {
         if (match.argv.len < 2) return error.CompletionMissingShell;
         const shell = commands.completion.parseShell(match.argv[1]) catch return error.CompletionUnknownShell;
@@ -330,9 +334,21 @@ test "parse: help verb via descriptor table" {
     try testing.expectEqual(Command.help, try parse(&argv));
 }
 
-test "parse: doctor verb via descriptor table" {
+test "parse: doctor verb via descriptor table → summary sub" {
     const argv = [_][]const u8{"doctor"};
-    try testing.expectEqual(Command.doctor, try parse(&argv));
+    const cmd = try parse(&argv);
+    try testing.expectEqual(commands.doctor.Sub.summary, cmd.doctor);
+}
+
+test "parse: doctor invariants → invariants sub" {
+    const argv = [_][]const u8{ "doctor", "invariants" };
+    const cmd = try parse(&argv);
+    try testing.expectEqual(commands.doctor.Sub.invariants, cmd.doctor);
+}
+
+test "parse: doctor <unknown> → DoctorUnknownSubcommand" {
+    const argv = [_][]const u8{ "doctor", "bogus" };
+    try testing.expectError(error.DoctorUnknownSubcommand, parse(&argv));
 }
 
 test "parse: completion bash → Command.completion{.bash}" {
