@@ -8,14 +8,17 @@
 //! finishes consuming `result.output` before the next `run()` rotates
 //! the buffer.
 //!
-//! Token budget enforcement, multi-turn history, tool use, and real
-//! per-token streaming are explicit non-goals for v0.1.0; the gateway
-//! treats every turn as a fresh user→assistant round-trip.
+//! Multi-turn history is provided by an in-process `DefaultEngine` from
+//! the context subsystem, keyed by `req.session_id`. Tool use and real
+//! per-token streaming remain non-goals for v0.1.0.
 
 const std = @import("std");
 const harness = @import("../../harness/root.zig");
 const llm = @import("../../llm/root.zig");
 const types = @import("types");
+const clock_mod = @import("clock");
+const context_mod = @import("context");
+const context_root = @import("ctx_root");
 
 pub const LoadError = error{
     HomeMissing,
@@ -46,6 +49,17 @@ pub const LiveAgentRunner = struct {
     /// The most recent run's output. Borrowed by the route handler
     /// for the duration of the request; rotated on the next run().
     last_output: []u8 = &.{},
+
+    /// Multi-turn history store. Keyed by `TurnRequest.session_id`;
+    /// each run ingests the user message, assembles the context
+    /// window from prior turns, then ingests the assistant reply.
+    context_engine: *context_root.default_engine.DefaultEngine,
+    /// Wall clock for the `Context` bundle handed to engine methods.
+    system_clock: clock_mod.SystemClock = .{},
+    /// Monotonic counter feeding unique `message_id`s into ingest.
+    /// Ingest is idempotent on (session_id, message_id) so collisions
+    /// silently drop the duplicate — we avoid that with a counter.
+    next_message_id: u64 = 0,
 
     /// Load an agent config with workspace-then-global cascade.
     /// For each file (agent.json, config.json, SOUL.md) tries
@@ -105,6 +119,8 @@ pub const LiveAgentRunner = struct {
             error.AgentMissing,
         ) catch null;
 
+        const engine = try context_root.default_engine.DefaultEngine.init(allocator);
+
         return .{
             .allocator = allocator,
             .io = io,
@@ -113,6 +129,7 @@ pub const LiveAgentRunner = struct {
             .api_key = api_key,
             .model = manifest.model,
             .system_prompt = soul,
+            .context_engine = engine,
         };
     }
 
@@ -131,6 +148,7 @@ pub const LiveAgentRunner = struct {
         self.allocator.free(self.model);
         if (self.system_prompt) |s| self.allocator.free(s);
         if (self.last_output.len > 0) self.allocator.free(self.last_output);
+        self.context_engine.deinit();
         self.* = undefined;
     }
 
@@ -198,12 +216,69 @@ pub const LiveAgentRunner = struct {
         var owned = llm.fromSettings(self.allocator, config) catch return error.InternalError;
         defer owned.deinit(self.allocator);
 
-        const messages = [_]types.Message{
-            .{ .role = .user, .content = req.input },
+        // Build the context bundle engine methods expect. The default
+        // in-memory engine ignores most fields; only `alloc` and
+        // `session_id` carry meaning today.
+        const clock_value = self.system_clock.clock();
+        const context_bundle = context_mod.Context{
+            .io = undefined,
+            .alloc = self.allocator,
+            .clock = &clock_value,
+            .trace_id = std.mem.zeroes(context_mod.TraceId),
+            .parent_span_id = null,
+            .deadline_ms = null,
+            .budget = null,
+            .principal = "user:unknown",
+            .session_id = req.session_id,
+            .origin_channel_id = null,
         };
 
+        // Record the incoming user message before assembling so it
+        // shows up as the final user turn in the history section list.
+        const user_msg_id = try self.nextMessageId();
+        defer self.allocator.free(user_msg_id);
+        _ = self.context_engine.engine().vtable.ingest(
+            &context_bundle,
+            self.context_engine.engine().ptr,
+            .{
+                .session_id = req.session_id,
+                .message_id = user_msg_id,
+                .role = .user,
+                .content = req.input,
+            },
+        ) catch return error.InternalError;
+
+        // Assemble the context window. The default engine also emits
+        // a `current_prompt` section for `prompt`; we drop it during
+        // conversion because the user message is already in history.
+        const assembled = self.context_engine.engine().vtable.assemble(
+            &context_bundle,
+            self.context_engine.engine().ptr,
+            .{
+                .session_id = req.session_id,
+                .prompt = req.input,
+                .model = self.model,
+                .available_tools = &.{},
+                .token_budget = 64 * 1024,
+            },
+        ) catch return error.InternalError;
+        defer self.context_engine.freeAssembleResult(assembled);
+
+        var messages: std.ArrayList(types.Message) = .empty;
+        defer messages.deinit(self.allocator);
+        try messages.ensureTotalCapacity(self.allocator, assembled.sections.len);
+        for (assembled.sections) |section| {
+            // `current_prompt` duplicates the user message we just
+            // ingested; skip it rather than send the same text twice.
+            if (section.kind == .current_prompt) continue;
+            messages.appendAssumeCapacity(.{
+                .role = mapRole(section.role),
+                .content = section.content,
+            });
+        }
+
         const chat_req: llm.provider.ChatRequest = .{
-            .messages = &messages,
+            .messages = messages.items,
             .model = .{ .provider = @tagName(self.provider_kind), .model = self.model },
             .system = self.system_prompt,
             .max_output_tokens = 1024,
@@ -218,7 +293,44 @@ pub const LiveAgentRunner = struct {
         // it past the provider's lifetime.
         self.last_output = self.allocator.dupe(u8, text) catch return error.OutOfMemory;
 
+        // Record the assistant reply so it carries into the next turn.
+        if (text.len > 0) {
+            const asst_msg_id = self.nextMessageId() catch return error.OutOfMemory;
+            defer self.allocator.free(asst_msg_id);
+            _ = self.context_engine.engine().vtable.ingest(
+                &context_bundle,
+                self.context_engine.engine().ptr,
+                .{
+                    .session_id = req.session_id,
+                    .message_id = asst_msg_id,
+                    .role = .assistant,
+                    .content = text,
+                },
+            ) catch return error.InternalError;
+        }
+
         return .{ .output = self.last_output, .completed = resp.stop_reason != .refusal };
+    }
+
+    /// Allocate a unique message id of the form `"msg-<counter>"`.
+    /// The counter is per-runner rather than per-session because the
+    /// engine keys by (session_id, message_id); a global counter
+    /// avoids any cross-session collision even if session_ids collide.
+    fn nextMessageId(self: *LiveAgentRunner) ![]u8 {
+        const id = self.next_message_id;
+        self.next_message_id += 1;
+        return std.fmt.allocPrint(self.allocator, "msg-{d}", .{id});
+    }
+
+    /// Map context-engine Role to the LLM message Role. They are
+    /// nominally identical but compile-time separate types.
+    fn mapRole(r: context_root.types.Role) types.Role {
+        return switch (r) {
+            .system => .system,
+            .user => .user,
+            .assistant => .assistant,
+            .tool => .tool,
+        };
     }
 };
 
@@ -375,4 +487,112 @@ test "parseAgentManifest: unknown provider rejects" {
         \\{"provider":"made-up","model":"x"}
     ;
     try testing.expectError(error.UnknownProvider, parseAgentManifest(testing.allocator, json));
+}
+
+test "context engine: assemble returns prior turns in session order" {
+    // Exercises the same ingest/assemble sequence liveRun uses, so a
+    // regression that drops history in the runner will surface here
+    // without needing a live provider on the wire.
+    const allocator = testing.allocator;
+    const engine = try context_root.default_engine.DefaultEngine.init(allocator);
+    defer engine.deinit();
+
+    var sys_clock: clock_mod.SystemClock = .{};
+    const clock_value = sys_clock.clock();
+    const bundle = context_mod.Context{
+        .io = undefined,
+        .alloc = allocator,
+        .clock = &clock_value,
+        .trace_id = std.mem.zeroes(context_mod.TraceId),
+        .parent_span_id = null,
+        .deadline_ms = null,
+        .budget = null,
+        .principal = "user:test",
+        .session_id = "sess-1",
+        .origin_channel_id = null,
+    };
+
+    const e = engine.engine();
+    _ = try e.vtable.ingest(&bundle, e.ptr, .{
+        .session_id = "sess-1",
+        .message_id = "m1",
+        .role = .user,
+        .content = "hello",
+    });
+    _ = try e.vtable.ingest(&bundle, e.ptr, .{
+        .session_id = "sess-1",
+        .message_id = "m2",
+        .role = .assistant,
+        .content = "hi back",
+    });
+
+    const result = try e.vtable.assemble(&bundle, e.ptr, .{
+        .session_id = "sess-1",
+        .prompt = "how are you?",
+        .model = "test",
+        .available_tools = &.{},
+        .token_budget = 4096,
+    });
+    defer engine.freeAssembleResult(result);
+
+    // Three sections: two history turns + the current prompt.
+    try testing.expectEqual(@as(usize, 3), result.sections.len);
+
+    var saw_user_hello = false;
+    var saw_asst_hi = false;
+    var saw_prompt = false;
+    for (result.sections) |s| {
+        if (s.kind == .history_turn and s.role == .user and
+            std.mem.eql(u8, s.content, "hello")) saw_user_hello = true;
+        if (s.kind == .history_turn and s.role == .assistant and
+            std.mem.eql(u8, s.content, "hi back")) saw_asst_hi = true;
+        if (s.kind == .current_prompt and
+            std.mem.eql(u8, s.content, "how are you?")) saw_prompt = true;
+    }
+    try testing.expect(saw_user_hello);
+    try testing.expect(saw_asst_hi);
+    try testing.expect(saw_prompt);
+}
+
+test "context engine: sessions are isolated" {
+    const allocator = testing.allocator;
+    const engine = try context_root.default_engine.DefaultEngine.init(allocator);
+    defer engine.deinit();
+
+    var sys_clock: clock_mod.SystemClock = .{};
+    const clock_value = sys_clock.clock();
+    var bundle = context_mod.Context{
+        .io = undefined,
+        .alloc = allocator,
+        .clock = &clock_value,
+        .trace_id = std.mem.zeroes(context_mod.TraceId),
+        .parent_span_id = null,
+        .deadline_ms = null,
+        .budget = null,
+        .principal = "user:test",
+        .session_id = "sess-A",
+        .origin_channel_id = null,
+    };
+
+    const e = engine.engine();
+    _ = try e.vtable.ingest(&bundle, e.ptr, .{
+        .session_id = "sess-A",
+        .message_id = "m1",
+        .role = .user,
+        .content = "private A",
+    });
+
+    bundle.session_id = "sess-B";
+    const result = try e.vtable.assemble(&bundle, e.ptr, .{
+        .session_id = "sess-B",
+        .prompt = "prompt-B",
+        .model = "test",
+        .available_tools = &.{},
+        .token_budget = 4096,
+    });
+    defer engine.freeAssembleResult(result);
+
+    // sess-B should only see its own prompt, not sess-A's content.
+    try testing.expectEqual(@as(usize, 1), result.sections.len);
+    try testing.expectEqual(context_root.types.SectionKind.current_prompt, result.sections[0].kind);
 }
