@@ -42,6 +42,13 @@ pub const ChatResponse = struct {
     }
 };
 
+/// Incremental-delta callback used by `Provider.chatStream`. Fires
+/// once per fragment of assistant text as the provider decodes its
+/// upstream stream; the slice is borrowed for the duration of the
+/// call and must be copied if the sink needs to retain it. `ctx`
+/// carries opaque caller state (typically the gateway's SSE writer).
+pub const TokenSink = *const fn (ctx: ?*anyopaque, token: []const u8) void;
+
 pub const Provider = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -53,6 +60,18 @@ pub const Provider = struct {
             allocator: std.mem.Allocator,
             request: ChatRequest,
         ) anyerror!ChatResponse,
+        /// Optional streaming variant. Backends that decode provider
+        /// SSE natively (e.g. Anthropic) set this so every text delta
+        /// fires `sink(ctx, fragment)` as soon as it arrives. Backends
+        /// that don't leave it null; `Provider.chatStream` falls back
+        /// to `chat` + a single final-text invocation of the sink.
+        chatStream: ?*const fn (
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: ChatRequest,
+            sink: TokenSink,
+            sink_ctx: ?*anyopaque,
+        ) anyerror!ChatResponse = null,
         supportsNativeTools: *const fn (ptr: *anyopaque) bool,
         deinit: *const fn (ptr: *anyopaque) void,
     };
@@ -67,6 +86,26 @@ pub const Provider = struct {
         request: ChatRequest,
     ) anyerror!ChatResponse {
         return self.vtable.chat(self.ptr, allocator, request);
+    }
+
+    /// Stream-aware chat. When the backend supplies `chatStream`,
+    /// fragments are forwarded to `sink` as they decode. Otherwise we
+    /// fall back to a full `chat` and fire the sink once with the
+    /// finished text — simpler callers don't need to branch on
+    /// whether streaming is live.
+    pub fn chatStream(
+        self: Provider,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        sink: TokenSink,
+        sink_ctx: ?*anyopaque,
+    ) anyerror!ChatResponse {
+        if (self.vtable.chatStream) |stream_fn| {
+            return stream_fn(self.ptr, allocator, request, sink, sink_ctx);
+        }
+        const resp = try self.vtable.chat(self.ptr, allocator, request);
+        if (resp.text) |t| if (t.len > 0) sink(sink_ctx, t);
+        return resp;
     }
 
     pub fn supportsNativeTools(self: Provider) bool {
@@ -126,4 +165,137 @@ test "Provider: vtable dispatch reaches the implementing struct" {
     try testing.expectEqual(@as(usize, 0), resp.tool_calls.len);
 
     p.deinit();
+}
+
+/// Captures sink invocations for the streaming-fallback tests. The
+/// sink contract promises caller-allocated `ctx` that outlives the
+/// call; concatenating into a fixed buffer is the simplest way to
+/// assert order + content without chasing allocator lifetimes.
+const FixedSink = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+    calls: usize = 0,
+
+    fn append(ctx: ?*anyopaque, fragment: []const u8) void {
+        const self: *FixedSink = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        const room = self.buf.len - self.len;
+        const take = @min(fragment.len, room);
+        @memcpy(self.buf[self.len .. self.len + take], fragment[0..take]);
+        self.len += take;
+    }
+};
+
+/// Impl that returns a concrete text slice from `chat` with no
+/// `chatStream` override — exercises the fallback path in
+/// `Provider.chatStream`.
+const TextImpl = struct {
+    fn getName(_: *anyopaque) []const u8 {
+        return "text";
+    }
+    fn doChat(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ChatRequest,
+    ) anyerror!ChatResponse {
+        return .{ .text = try allocator.dupe(u8, "hello world") };
+    }
+    fn supportsTools(_: *anyopaque) bool {
+        return false;
+    }
+    fn doDeinit(_: *anyopaque) void {}
+
+    const vtable = Provider.VTable{
+        .name = getName,
+        .chat = doChat,
+        .supportsNativeTools = supportsTools,
+        .deinit = doDeinit,
+    };
+
+    fn provider(self: *TextImpl) Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "Provider.chatStream: falls back to single sink call when chatStream is null" {
+    var impl = TextImpl{};
+    const p = impl.provider();
+
+    var sink = FixedSink{};
+    const messages = [_]types.Message{};
+    const resp = try p.chatStream(
+        testing.allocator,
+        .{ .messages = &messages, .model = .{ .provider = "text", .model = "0" } },
+        FixedSink.append,
+        &sink,
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectEqualStrings("hello world", sink.buf[0..sink.len]);
+    try testing.expectEqualStrings("hello world", resp.text.?);
+}
+
+/// Impl that *does* provide `chatStream` and fires the sink three
+/// times. Verifies the vtable forwards to the stream function rather
+/// than falling back to `chat`.
+const StreamImpl = struct {
+    fn getName(_: *anyopaque) []const u8 {
+        return "stream";
+    }
+    fn doChat(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: ChatRequest,
+    ) anyerror!ChatResponse {
+        // Should not be called when `chatStream` is set.
+        return .{};
+    }
+    fn doChatStream(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ChatRequest,
+        sink: TokenSink,
+        sink_ctx: ?*anyopaque,
+    ) anyerror!ChatResponse {
+        sink(sink_ctx, "one");
+        sink(sink_ctx, "two");
+        sink(sink_ctx, "three");
+        return .{ .text = try allocator.dupe(u8, "onetwothree") };
+    }
+    fn supportsTools(_: *anyopaque) bool {
+        return false;
+    }
+    fn doDeinit(_: *anyopaque) void {}
+
+    const vtable = Provider.VTable{
+        .name = getName,
+        .chat = doChat,
+        .chatStream = doChatStream,
+        .supportsNativeTools = supportsTools,
+        .deinit = doDeinit,
+    };
+
+    fn provider(self: *StreamImpl) Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "Provider.chatStream: forwards to the stream fn when provided" {
+    var impl = StreamImpl{};
+    const p = impl.provider();
+
+    var sink = FixedSink{};
+    const messages = [_]types.Message{};
+    const resp = try p.chatStream(
+        testing.allocator,
+        .{ .messages = &messages, .model = .{ .provider = "stream", .model = "0" } },
+        FixedSink.append,
+        &sink,
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 3), sink.calls);
+    try testing.expectEqualStrings("onetwothree", sink.buf[0..sink.len]);
+    try testing.expectEqualStrings("onetwothree", resp.text.?);
 }

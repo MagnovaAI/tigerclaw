@@ -84,7 +84,26 @@ pub const AnthropicProvider = struct {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
         switch (self.source) {
             .literal => |bytes| return parseStream(allocator, .{ .literal = bytes }),
-            .http => |cfg| return runHttp(allocator, cfg, request),
+            .http => |cfg| return runHttp(allocator, cfg, request, null, null),
+        }
+    }
+
+    /// Streaming variant: same flow as `doChat` but each text delta
+    /// fires `sink(ctx, fragment)` as soon as it decodes. The final
+    /// `ChatResponse` still carries the accumulated text so callers
+    /// that treat the sink as a side channel (e.g. the runner when
+    /// a turn rolls into tool-use) don't lose anything.
+    fn doChatStream(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        sink: provider_mod.TokenSink,
+        sink_ctx: ?*anyopaque,
+    ) anyerror!ChatResponse {
+        const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
+        switch (self.source) {
+            .literal => |bytes| return streamTokens(allocator, .{ .literal = bytes }, sink, sink_ctx),
+            .http => |cfg| return runHttp(allocator, cfg, request, sink, sink_ctx),
         }
     }
 
@@ -97,6 +116,7 @@ pub const AnthropicProvider = struct {
     const vtable = Provider.VTable{
         .name = getName,
         .chat = doChat,
+        .chatStream = doChatStream,
         .supportsNativeTools = supportsTools,
         .deinit = doDeinit,
     };
@@ -324,6 +344,8 @@ fn runHttp(
     allocator: std.mem.Allocator,
     cfg: HttpSource,
     request: ChatRequest,
+    sink: ?provider_mod.TokenSink,
+    sink_ctx: ?*anyopaque,
 ) !ChatResponse {
     const body = try buildRequestBody(allocator, request, 1024);
     defer allocator.free(body);
@@ -435,7 +457,9 @@ fn runHttp(
     var decompress: std.http.Decompress = undefined;
     var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
     const body_reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
-    return parseStream(allocator, .{ .reader = body_reader });
+    const input: StreamInput = .{ .reader = body_reader };
+    if (sink) |s| return streamTokens(allocator, input, s, sink_ctx);
+    return parseStream(allocator, input);
 }
 
 /// Render the Anthropic-shaped JSON request body. Extracted so tests
