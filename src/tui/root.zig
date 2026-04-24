@@ -148,7 +148,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     const default_index = agents.findOrAppend(opts.agent) catch 0;
     var selected: usize = default_index;
 
-    try appendLine(&history, allocator, .system, "connected. ctrl-c to quit.");
+    try appendAgentLine(&history, allocator, agents.items(), selected);
 
     var spinner_tick: u64 = 0;
     var picker_open: bool = false;
@@ -174,18 +174,40 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                 }
 
                 if (picker_open) {
+                    const before = selected;
                     handlePickerKey(key, &picker_open, &picker_cursor, &selected, agents.items());
+                    if (selected != before) {
+                        try appendAgentLine(&history, allocator, agents.items(), selected);
+                    }
                 } else if (key.matches('e', .{ .ctrl = true }) and !pending) {
                     picker_cursor = selected;
                     picker_open = true;
                 } else if (key.matches('n', .{ .ctrl = true }) and !pending and agents.count() > 1) {
                     selected = (selected + 1) % agents.count();
+                    try appendAgentLine(&history, allocator, agents.items(), selected);
                 } else if (key.matches('p', .{ .ctrl = true }) and !pending and agents.count() > 1) {
                     selected = if (selected == 0) agents.count() - 1 else selected - 1;
+                    try appendAgentLine(&history, allocator, agents.items(), selected);
                 } else if (key.matches(vaxis.Key.enter, .{}) and !pending) {
                     const typed = try currentInput(allocator, &input);
                     defer allocator.free(typed);
                     if (typed.len == 0) continue;
+
+                    // Slash-command interception — keeps the wire
+                    // path (agent_line + worker spawn) reserved for
+                    // actual agent turns. Commands are handled
+                    // inline and the input box is cleared either way.
+                    if (std.mem.startsWith(u8, typed, "/")) {
+                        input.clearAndFree();
+                        try handleSlashCommand(
+                            &history,
+                            allocator,
+                            &agents,
+                            &selected,
+                            typed,
+                        );
+                        continue;
+                    }
 
                     const user_line = try makeLine(allocator, .user, typed);
                     try history.append(allocator, user_line);
@@ -371,6 +393,82 @@ fn appendLine(
 ) !void {
     const line = try makeLine(allocator, role, text);
     try history.append(allocator, line);
+}
+
+/// Push a one-line system banner naming the active agent. Used on
+/// boot and whenever the operator flips to a different agent via
+/// `Ctrl-N` / `Ctrl-P` / `/agent <name>`.
+fn appendAgentLine(
+    history: *std.ArrayList(Line),
+    allocator: std.mem.Allocator,
+    agents: []const []const u8,
+    selected: usize,
+) !void {
+    const name = if (agents.len == 0) "default" else agents[selected];
+    var buf: [128]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "agent: {s}", .{name}) catch "agent: ?";
+    try appendLine(history, allocator, .system, text);
+}
+
+/// Dispatch a slash-command line. Recognised commands:
+///   /agent              — list agents with a marker on the active one
+///   /agent <name>       — switch to the named agent (must already be loaded)
+///   /agents             — alias for `/agent`
+///   /help               — short reminder of available commands
+/// Unknown commands echo a one-line error. No command ever errors out
+/// of the event loop; they always write a system line and return.
+fn handleSlashCommand(
+    history: *std.ArrayList(Line),
+    allocator: std.mem.Allocator,
+    agents: *AgentList,
+    selected: *usize,
+    line: []const u8,
+) !void {
+    // Trim the leading slash. Split on the first run of whitespace.
+    const body = std.mem.trim(u8, line[1..], " \t");
+    var tok_it = std.mem.tokenizeAny(u8, body, " \t");
+    const cmd = tok_it.next() orelse {
+        try appendLine(history, allocator, .system, "commands: /agent [name], /agents, /help");
+        return;
+    };
+
+    if (std.mem.eql(u8, cmd, "help")) {
+        try appendLine(history, allocator, .system, "commands: /agent [name], /agents, /help");
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "agent") or std.mem.eql(u8, cmd, "agents")) {
+        const target = tok_it.next();
+        if (target == null) {
+            var buf: [512]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            w.writeAll("agents:") catch {};
+            for (agents.items(), 0..) |n, i| {
+                const marker: []const u8 = if (i == selected.*) " *" else "  ";
+                w.print(" {s}{s}", .{ marker, n }) catch {};
+            }
+            try appendLine(history, allocator, .system, w.buffered());
+            return;
+        }
+
+        const want = target.?;
+        for (agents.items(), 0..) |n, i| {
+            if (std.mem.eql(u8, n, want)) {
+                selected.* = i;
+                try appendAgentLine(history, allocator, agents.items(), selected.*);
+                return;
+            }
+        }
+
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "no such agent: {s}", .{want}) catch "no such agent";
+        try appendLine(history, allocator, .system, msg);
+        return;
+    }
+
+    var buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "unknown command: /{s}  (try /help)", .{cmd}) catch "unknown command";
+    try appendLine(history, allocator, .system, msg);
 }
 
 fn draw(
