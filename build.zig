@@ -315,6 +315,12 @@ pub fn build(b: *std.Build) void {
     const memory_spec_tests = b.addTest(.{ .root_module = memory_spec_mod });
     test_step.dependOn(&b.addRunArtifact(memory_spec_tests).step);
 
+    const clock_mod = b.addModule("clock", .{
+        .root_source_file = b.path("src/clock.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const ctx_types_mod = b.addModule("ctx_types", .{
         .root_source_file = b.path("src/context/types.zig"),
         .target = target,
@@ -334,6 +340,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    context_mod.addImport("clock.zig", clock_mod);
 
     const ctx_engine_mod = b.addModule("ctx_engine", .{
         .root_source_file = b.path("src/context/engine.zig"),
@@ -341,6 +348,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ctx_engine_mod.addImport("context", context_mod);
+    ctx_engine_mod.addImport("types.zig", ctx_types_mod);
 
     const ctx_engine_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/context_engine_vtable_test.zig"),
@@ -412,6 +420,30 @@ pub fn build(b: *std.Build) void {
     ctx_compact_test_mod.addImport("ctx_compact", ctx_compact_mod);
     const ctx_compact_tests = b.addTest(.{ .root_module = ctx_compact_test_mod });
     test_step.dependOn(&b.addRunArtifact(ctx_compact_tests).step);
+
+    const ctx_default_engine_mod = b.addModule("ctx_default_engine", .{
+        .root_source_file = b.path("src/context/default_engine.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctx_default_engine_mod.addImport("ctx_types", ctx_types_mod);
+    ctx_default_engine_mod.addImport("ctx_engine", ctx_engine_mod);
+    ctx_default_engine_mod.addImport("ctx_assemble", ctx_assemble_mod);
+    ctx_default_engine_mod.addImport("ctx_compact", ctx_compact_mod);
+    ctx_default_engine_mod.addImport("context", context_mod);
+
+    const ctx_default_engine_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/context_default_engine_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctx_default_engine_test_mod.addImport("ctx_types", ctx_types_mod);
+    ctx_default_engine_test_mod.addImport("ctx_engine", ctx_engine_mod);
+    ctx_default_engine_test_mod.addImport("ctx_default_engine", ctx_default_engine_mod);
+    ctx_default_engine_test_mod.addImport("context", context_mod);
+    ctx_default_engine_test_mod.addImport("clock", clock_mod);
+    const ctx_default_engine_tests = b.addTest(.{ .root_module = ctx_default_engine_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ctx_default_engine_tests).step);
 
     const capabilities_mod = b.addModule("capabilities", .{
         .root_source_file = b.path("src/capabilities.zig"),
