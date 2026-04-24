@@ -976,15 +976,20 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
         const prefix_cols: usize = measureCols(prefix);
         const avail = if (width > prefix_cols) width - prefix_cols else 1;
 
-        // Rows needed is driven by *display columns*, not byte count.
-        // Using bytes over-estimates when the line contains multi-byte
-        // characters (emoji, em-dashes, non-ASCII) and causes wrapped
-        // rows to land on top of each other during streaming.
-        const total_cols = measureCols(line.text.items);
-        var rows_needed: usize = 1;
-        if (total_cols > avail) {
-            rows_needed = (total_cols + avail - 1) / avail;
+        // Rows needed is driven by *display columns* and counts
+        // embedded newlines as explicit row breaks. Each line
+        // segment between newlines contributes ceil(cols / avail)
+        // rows. Without this, markdown lists / tool output
+        // containing \\n get painted with the newline interpreted
+        // mid-row, scrambling the display.
+        var rows_needed: usize = 0;
+        var seg_it = std.mem.splitScalar(u8, line.text.items, '\n');
+        while (seg_it.next()) |seg| {
+            const seg_cols = measureCols(seg);
+            const seg_rows: usize = if (seg_cols == 0) 1 else (seg_cols + avail - 1) / avail;
+            rows_needed += seg_rows;
         }
+        if (rows_needed == 0) rows_needed = 1;
         if (rows_needed > 32) rows_needed = 32;
 
         var remaining = line.text.items;
@@ -1032,11 +1037,19 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
 
         var col_offset: usize = prefix_cols;
         while (remaining.len > 0 and row < pane.height) {
-            // Wrap by display columns, not bytes, so a line containing
-            // emoji / em-dashes wraps at the right visual position
-            // instead of collapsing into the row above.
-            const taken = takeCols(remaining, avail);
-            const take = if (taken.bytes == 0) safeUtf8Take(remaining, 1) else taken.bytes;
+            // Hard-wrap on embedded newlines: if the next segment
+            // contains `\n`, stop at it, paint what's before, and
+            // move the row cursor forward. Without this, we'd paint
+            // `abc\ndef` as one segment and the terminal would
+            // interpret the `\n` mid-row, jumping the cursor and
+            // scrambling subsequent rows.
+            const nl_pos: ?usize = std.mem.indexOfScalar(u8, remaining, '\n');
+            const limit = if (nl_pos) |p| p else remaining.len;
+            const slice = remaining[0..limit];
+
+            // Then soft-wrap on display columns within the limit.
+            const taken = takeCols(slice, avail);
+            const take = if (taken.bytes == 0) safeUtf8Take(slice, 1) else taken.bytes;
             paintRow(
                 pane,
                 @intCast(row),
@@ -1047,6 +1060,11 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
                 line.spans,
             );
             remaining = remaining[take..];
+            // Consume the newline itself if we stopped at one and
+            // didn't also consume all the visible bytes on that row.
+            if (remaining.len > 0 and remaining[0] == '\n') {
+                remaining = remaining[1..];
+            }
             row += 1;
             col_offset = prefix_cols;
         }
