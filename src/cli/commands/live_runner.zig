@@ -344,30 +344,40 @@ pub const LiveAgentRunner = struct {
         ) catch return error.InternalError;
         defer self.context_engine.freeAssembleResult(assembled);
 
+        // The messages list owns every `content` slice. We dup
+        // assembled section content (which `assembled` would free
+        // via freeAssembleResult — but we'd then be reading freed
+        // memory if we held borrowed slices past assemble teardown)
+        // and we'll dup tool/assistant results we append in-loop so
+        // the same ownership rule holds on every entry.
         var messages: std.ArrayList(types.Message) = .empty;
-        defer messages.deinit(self.allocator);
+        defer {
+            for (messages.items) |m| self.allocator.free(m.content);
+            messages.deinit(self.allocator);
+        }
         for (assembled.sections) |section| {
             // `current_prompt` duplicates the user message we just
             // ingested; skip it rather than send the same text twice.
             if (section.kind == .current_prompt) continue;
             try messages.append(self.allocator, .{
                 .role = mapRole(section.role),
-                .content = section.content,
+                .content = try self.allocator.dupe(u8, section.content),
             });
         }
 
         // Dispatch loop: the model may answer with tool_use instead of
         // a final reply. Execute each tool locally, ingest the
         // assistant + tool messages into history, and call the
-        // provider again. Cap the round-trip count so a malformed or
-        // persistently tool-using model can't wedge the request.
-        const max_tool_rounds: u8 = 3;
-        var round: u8 = 0;
+        // provider again. The loop only exits when the model emits
+        // a response with no tool calls — there's no per-turn cap.
+        // The model self-terminates with a text reply; the user can
+        // always Ctrl-C to interrupt a runaway turn.
+        var round: u32 = 0;
         var final_text: []u8 = &.{};
         errdefer self.allocator.free(final_text);
         var last_stop: types.StopReason = .end_turn;
 
-        while (round < max_tool_rounds) : (round += 1) {
+        while (true) : (round += 1) {
             const chat_req: llm.provider.ChatRequest = .{
                 .messages = messages.items,
                 .model = .{ .provider = @tagName(self.provider_kind), .model = self.model },
@@ -416,6 +426,13 @@ pub const LiveAgentRunner = struct {
                 ) catch return error.InternalError;
             }
 
+            // No tool calls means the model gave its final answer.
+            // We always run any pending tool calls and loop back so
+            // the transcript stays consistent — even when the model
+            // emits a chatty intermediary text alongside the call.
+            // Cutting the loop short on text+tool combos breaks
+            // history persistence and the model loses track of
+            // what it has and hasn't run.
             if (resp.tool_calls.len == 0) {
                 self.allocator.free(final_text);
                 final_text = try self.allocator.dupe(u8, text);
@@ -427,9 +444,17 @@ pub const LiveAgentRunner = struct {
             // assembled messages slice. Safe `append` — the
             // pre-call `ensureTotalCapacity` was removed; the
             // ArrayList grows on demand for the tool-use turn.
+            // Dupe before appending — `text` is a borrowed slice into
+            // `resp`, which `defer resp.deinit` frees at the end of
+            // this iteration. Without the copy the slice points at
+            // poisoned memory (0xAA fill) on the next provider call,
+            // and the JSON serializer emits it as a byte array
+            // instead of a string. Anthropic 400s with
+            // `messages.N.content.0.text.text: Input should be a
+            // valid string`.
             try messages.append(self.allocator, .{
                 .role = .assistant,
-                .content = text,
+                .content = try self.allocator.dupe(u8, text),
             });
             for (resp.tool_calls) |tc| {
                 // Fire a `.started` event before dispatch so the TUI
@@ -480,6 +505,19 @@ pub const LiveAgentRunner = struct {
                     .content = try self.allocator.dupe(u8, result_text),
                 });
             }
+        }
+
+        // The loop exited via the no-tool-calls break, but the
+        // final response had no text. Surface a hint so the user
+        // isn't staring at nothing — likely the provider returned
+        // an empty turn (refusal, content filter, or transcript
+        // problem). The round count helps debugging.
+        if (final_text.len == 0) {
+            final_text = try std.fmt.allocPrint(
+                self.allocator,
+                "(no reply after {d} tool round(s) — try rephrasing)",
+                .{round},
+            );
         }
 
         self.last_output = final_text;
