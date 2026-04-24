@@ -206,6 +206,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
 
     var vx = try vaxis.init(allocator, .{});
     defer vx.deinit(allocator, writer);
+    // Vaxis's truecolor-capability detection is currently disabled
+    // upstream (see the commented-out COLORTERM / XTGETTCAP paths
+    // in `queryTerminalSend`). Force the flag on — every macOS and
+    // Linux terminal we ship for understands 24-bit SGR sequences,
+    // and without this flag the palette's `.rgb = {...}` colours
+    // don't paint at all (style silently no-ops).
+    vx.caps.rgb = true;
 
     var loop: EventLoop = .{ .vaxis = &vx, .tty = &tty };
     try loop.init();
@@ -939,12 +946,16 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
     while (i > 0 and row_cursor >= 0) {
         i -= 1;
         const line = history[i];
-        // Speaker glyphs — tuned for the tiger palette. The user's
-        // right-caret is heavier than the agent's left-caret so the
-        // user stands out as the "active" speaker.
+        // Speaker glyphs — single-cell Unicode only. The previous
+        // agent prefix `🐯 ` was a wide emoji (2 display cells) that
+        // triggered grapheme-width races on some macOS terminals
+        // during streaming redraws — lines got painted partially and
+        // looked like empty prefixes. Switched to the `✦` star glyph
+        // (1 cell, warm amber in context) so the agent still reads
+        // distinctly without the width hazard.
         const prefix = switch (line.role) {
             .user => "❯ ",
-            .agent => "🐯 ",
+            .agent => "✦ ",
             .system => "∙ ",
             .tool => "↻ ",
         };
