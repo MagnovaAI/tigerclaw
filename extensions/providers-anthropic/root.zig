@@ -365,6 +365,12 @@ fn runHttp(
     extra_len += 1;
     extra_buf[extra_len] = .{ .name = "content-type", .value = "application/json" };
     extra_len += 1;
+    // Disable compression negotiation. Zig's http.Client does not
+    // auto-decompress responses, so a gzipped 400 body surfaces as
+    // raw compressed bytes in the refusal message. `identity` tells
+    // the server to send the body uncompressed.
+    extra_buf[extra_len] = .{ .name = "accept-encoding", .value = "identity" };
+    extra_len += 1;
     if (is_oauth) {
         extra_buf[extra_len] = .{ .name = "anthropic-beta", .value = "oauth-2025-04-20" };
         extra_len += 1;
@@ -757,7 +763,12 @@ test "anthropic: buildRequestBody renders canonical wire shape" {
     try testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.6") != null);
 }
 
-test "anthropic: buildRequestBody serialises tools with a nested object schema" {
+test "scenario: buildRequestBody with tools parses as valid JSON and matches the Anthropic wire shape" {
+    // This test exercises the full body — parses the whole thing as
+    // JSON and asserts on the structure the way the Anthropic API
+    // will. Any divergence here (malformed commas, double-encoded
+    // schema, stray fields) reads as a 400 against production;
+    // catching it in-process saves a real round-trip.
     const messages = [_]types.Message{
         .{ .role = .user, .content = "what time is it" },
     };
@@ -765,23 +776,109 @@ test "anthropic: buildRequestBody serialises tools with a nested object schema" 
         .{
             .name = "get_current_time",
             .description = "Return the current UTC time.",
-            .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+            .input_schema_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
         },
     };
     const req: ChatRequest = .{
         .messages = &messages,
-        .model = .{ .provider = "anthropic", .model = "claude-opus-4-7" },
+        .model = .{ .provider = "anthropic", .model = "claude-haiku-4-5-20251001" },
+        .system = "be brief",
         .tools = &tools,
     };
 
     const body = try buildRequestBody(testing.allocator, req, 1024);
     defer testing.allocator.free(body);
 
-    try testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"name\":\"get_current_time\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"description\":\"Return the current UTC time.\"") != null);
-    // The schema is spliced as a nested object, not a string.
-    try testing.expect(std.mem.indexOf(u8, body, "\"input_schema\":{\"type\":\"object\"") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value;
+    try testing.expect(root == .object);
+
+    // Required Anthropic fields.
+    try testing.expect(root.object.get("model").? == .string);
+    try testing.expect(root.object.get("max_tokens").? == .integer);
+    try testing.expect(root.object.get("stream").? == .bool);
+    try testing.expectEqual(true, root.object.get("stream").?.bool);
+
+    // `system` is an array of typed blocks, not a bare string.
+    const sys = root.object.get("system").?;
+    try testing.expect(sys == .array);
+    try testing.expectEqual(@as(usize, 1), sys.array.items.len);
+    try testing.expectEqualStrings("text", sys.array.items[0].object.get("type").?.string);
+
+    // Messages are typed-content blocks.
+    const msgs = root.object.get("messages").?;
+    try testing.expect(msgs == .array);
+    try testing.expectEqual(@as(usize, 1), msgs.array.items.len);
+    const m0 = msgs.array.items[0].object;
+    try testing.expectEqualStrings("user", m0.get("role").?.string);
+    const c0 = m0.get("content").?.array.items[0].object;
+    try testing.expectEqualStrings("text", c0.get("type").?.string);
+    try testing.expectEqualStrings("what time is it", c0.get("text").?.string);
+
+    // Tools: an array of objects, each with a NESTED input_schema
+    // object (not a stringified JSON blob). This is the thing a
+    // bare `indexOf` check misses — a string value would still
+    // contain `"type":"object"` as a substring.
+    const tools_v = root.object.get("tools").?;
+    try testing.expect(tools_v == .array);
+    try testing.expectEqual(@as(usize, 1), tools_v.array.items.len);
+    const t0 = tools_v.array.items[0].object;
+    try testing.expectEqualStrings("get_current_time", t0.get("name").?.string);
+    try testing.expectEqualStrings("Return the current UTC time.", t0.get("description").?.string);
+    const schema = t0.get("input_schema").?;
+    try testing.expect(schema == .object); // nested, not a string.
+    try testing.expectEqualStrings("object", schema.object.get("type").?.string);
+    try testing.expectEqual(false, schema.object.get("additionalProperties").?.bool);
+}
+
+test "scenario: buildRequestBody with no tools omits the field entirely" {
+    // A request without tools must not emit an empty `tools: []`
+    // either — some Anthropic models 400 on the empty-array form.
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = "hi" },
+    };
+    const req: ChatRequest = .{
+        .messages = &messages,
+        .model = .{ .provider = "anthropic", .model = "claude-haiku-4-5-20251001" },
+    };
+
+    const body = try buildRequestBody(testing.allocator, req, 1024);
+    defer testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("tools") == null);
+}
+
+test "scenario: multi-turn body with assistant + tool role messages parses cleanly" {
+    // Mirrors the state after the runner has ingested a user prompt,
+    // an assistant tool_use marker, and a tool result. The body
+    // must remain valid JSON; every message must be a typed-content
+    // block object regardless of role.
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = "what time is it" },
+        .{ .role = .assistant, .content = "[tool_call toolu_1 get_current_time({})]" },
+        .{ .role = .tool, .content = "2026-04-23T23:45:12Z" },
+    };
+    const req: ChatRequest = .{
+        .messages = &messages,
+        .model = .{ .provider = "anthropic", .model = "claude-haiku-4-5-20251001" },
+    };
+
+    const body = try buildRequestBody(testing.allocator, req, 1024);
+    defer testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?;
+    try testing.expectEqual(@as(usize, 3), msgs.array.items.len);
+
+    // All roles legal at the Anthropic layer are either "user" or
+    // "assistant"; the provider collapses `.tool` to `"user"` today.
+    try testing.expectEqualStrings("user", msgs.array.items[0].object.get("role").?.string);
+    try testing.expectEqualStrings("assistant", msgs.array.items[1].object.get("role").?.string);
+    try testing.expectEqualStrings("user", msgs.array.items[2].object.get("role").?.string);
 }
 
 test "anthropic: parseStream captures a tool_use block as a ToolCall" {
