@@ -68,3 +68,74 @@ test "fit: budget=0 drops everything" {
     try std.testing.expectEqual(@as(usize, 0), res.sections.len);
     try std.testing.expectEqual(@as(usize, 1), res.dropped.len);
 }
+
+// ---------------------------------------------------------------------------
+// Golden-file fixtures
+// ---------------------------------------------------------------------------
+
+const FxSection = struct {
+    kind: []const u8,
+    role: []const u8,
+    content: []const u8,
+    priority: u8,
+    token_estimate: u32,
+    origin: []const u8,
+};
+
+const Fixture = struct {
+    input_sections: []FxSection,
+    budget: u32,
+    expected_kept_count: usize,
+    expected_estimated_tokens: u32,
+    expected_dropped_count: usize,
+};
+
+fn parseKind(s: []const u8) t.SectionKind {
+    return std.meta.stringToEnum(t.SectionKind, s) orelse @panic("bad kind in fixture");
+}
+
+fn parseRole(s: []const u8) t.Role {
+    return std.meta.stringToEnum(t.Role, s) orelse @panic("bad role in fixture");
+}
+
+fn runFixtureBytes(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    const trimmed = std.mem.trim(u8, bytes, "\n\r \t");
+    const parsed = try std.json.parseFromSlice(Fixture, allocator, trimmed, .{});
+    defer parsed.deinit();
+    const fx = parsed.value;
+
+    const sections = try allocator.alloc(t.Section, fx.input_sections.len);
+    defer allocator.free(sections);
+    for (fx.input_sections, 0..) |fs_in, i| {
+        sections[i] = .{
+            .kind = parseKind(fs_in.kind),
+            .role = parseRole(fs_in.role),
+            .content = fs_in.content,
+            .priority = fs_in.priority,
+            .token_estimate = fs_in.token_estimate,
+            .tags = &.{},
+            .pinned = false,
+            .origin = fs_in.origin,
+        };
+    }
+
+    const res = try assemble.fit(allocator, sections, fx.budget);
+    defer allocator.free(res.sections);
+    defer allocator.free(res.dropped);
+
+    try std.testing.expectEqual(fx.expected_kept_count, res.sections.len);
+    try std.testing.expectEqual(fx.expected_estimated_tokens, res.estimated_tokens);
+    try std.testing.expectEqual(fx.expected_dropped_count, res.dropped.len);
+}
+
+test "golden: fixture_assemble_basic" {
+    try runFixtureBytes(std.testing.allocator, @embedFile("fixture_assemble_basic.jsonl"));
+}
+
+test "golden: fixture_assemble_over_budget" {
+    try runFixtureBytes(std.testing.allocator, @embedFile("fixture_assemble_over_budget.jsonl"));
+}
+
+test "golden: fixture_assemble_with_marker" {
+    try runFixtureBytes(std.testing.allocator, @embedFile("fixture_assemble_with_marker.jsonl"));
+}
