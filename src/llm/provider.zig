@@ -15,6 +15,10 @@ pub const ChatRequest = struct {
     model: types.ModelRef,
     max_output_tokens: ?u32 = null,
     temperature: f32 = 0.7,
+    /// Tools the model is allowed to call. Providers that return
+    /// `supportsNativeTools() == false` ignore this — the runner is
+    /// expected to gate dispatch on capability.
+    tools: []const types.Tool = &.{},
 };
 
 pub const ChatResponse = struct {
@@ -22,6 +26,20 @@ pub const ChatResponse = struct {
     tool_calls: []const types.ToolCall = &.{},
     usage: types.TokenUsage = .{},
     stop_reason: types.StopReason = .end_turn,
+
+    /// Release every heap-allocated string this response owns. A
+    /// centralised helper so callers aren't forced to remember the
+    /// growing list of optional slices (`text`, each tool-call's
+    /// `id`/`name`/`arguments_json`).
+    pub fn deinit(self: ChatResponse, allocator: std.mem.Allocator) void {
+        if (self.text) |t| allocator.free(t);
+        for (self.tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments_json);
+        }
+        if (self.tool_calls.len > 0) allocator.free(self.tool_calls);
+    }
 };
 
 pub const Provider = struct {

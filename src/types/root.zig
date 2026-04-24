@@ -13,6 +13,7 @@ pub const ModelRef = @import("model_ref.zig").ModelRef;
 pub const Role = @import("message.zig").Role;
 pub const StopReason = @import("llm_response.zig").StopReason;
 pub const TokenUsage = @import("token_usage.zig").TokenUsage;
+pub const Tool = @import("tool.zig").Tool;
 pub const ToolCall = @import("tool_call.zig").ToolCall;
 pub const ToolResult = @import("tool_result.zig").ToolResult;
 
@@ -23,6 +24,7 @@ test {
     std.testing.refAllDecls(@import("metadata.zig"));
     std.testing.refAllDecls(@import("model_ref.zig"));
     std.testing.refAllDecls(@import("token_usage.zig"));
+    std.testing.refAllDecls(@import("tool.zig"));
     std.testing.refAllDecls(@import("tool_call.zig"));
     std.testing.refAllDecls(@import("tool_result.zig"));
 }
