@@ -771,10 +771,12 @@ fn drawHeader(
     pending: bool,
     spinner_tick: u64,
 ) void {
-    // Left: title. Padded with unicode blocks to give the orange
-    // background a clear left edge that reads like a badge.
+    // Left: title. Kept ASCII-only — the previous emoji-prefixed
+    // version triggered grapheme-width races on some terminals
+    // that corrupted the right-side chip area during rapid
+    // pending→ready transitions.
     _ = win.printSegment(
-        .{ .text = "  🐯 tigerclaw  ", .style = palette.title },
+        .{ .text = "  tigerclaw  ", .style = palette.title },
         .{ .row_offset = 0, .col_offset = 0 },
     );
 
@@ -1258,7 +1260,7 @@ fn workerMain(ctx: *WorkerCtx) void {
     runTurn(ctx) catch |err| {
         const msg = std.fmt.allocPrint(
             ctx.allocator,
-            "! gateway error: {s}",
+            "! turn failed: {s}",
             .{@errorName(err)},
         ) catch {
             ctx.loop.postEvent(.turn_done);
