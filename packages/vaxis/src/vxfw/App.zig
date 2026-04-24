@@ -244,8 +244,14 @@ fn doLayout(
             .height = @intCast(vx.screen.height),
         },
         .cell_size = .{
-            .width = vx.screen.width_pix / vx.screen.width,
-            .height = vx.screen.height_pix / vx.screen.height,
+            // Guard the divides: `vx.screen.width`/`height` can be
+            // zero immediately after init or during a SIGWINCH where
+            // the new winsize hasn't arrived yet. The original code
+            // divided unconditionally and aborted on terminals that
+            // briefly reported a zero dimension (real-world repro:
+            // tool-call rerender right after resize).
+            .width = if (vx.screen.width == 0) 0 else vx.screen.width_pix / vx.screen.width,
+            .height = if (vx.screen.height == 0) 0 else vx.screen.height_pix / vx.screen.height,
         },
     };
     return widget.draw(draw_context);
