@@ -70,6 +70,18 @@ const Event = union(enum) {
 const Line = struct {
     role: Role,
     text: std.ArrayList(u8),
+    /// Style spans over `text`. Non-null only for agent replies
+    /// that have finished streaming and been re-parsed as
+    /// markdown; streaming in progress keeps this null so the
+    /// renderer falls back to a flat style.
+    spans: ?[]md.Span = null,
+
+    fn deinitSpans(self: *Line, allocator: std.mem.Allocator) void {
+        if (self.spans) |s| {
+            allocator.free(s);
+            self.spans = null;
+        }
+    }
 
     const Role = enum { user, agent, system };
 };
@@ -103,6 +115,29 @@ const palette = struct {
     const picker_border: vaxis.Style = .{ .fg = .{ .index = 45 } };
     const picker_item: vaxis.Style = .{ .fg = .{ .index = 252 } };
     const picker_item_selected: vaxis.Style = .{ .fg = .{ .index = 16 }, .bg = .{ .index = 45 }, .bold = true };
+    // Markdown span overlays. Each function composes the span style
+    // on top of the caller's base style (typically `palette.agent`)
+    // so text still reads as the speaker's line colour with the
+    // markdown flavour applied.
+    fn mdStyle(base: vaxis.Style, kind: md.StyleKind) vaxis.Style {
+        var s = base;
+        switch (kind) {
+            .plain => {},
+            .bold => s.bold = true,
+            .italic => s.italic = true,
+            .code => {
+                s.fg = .{ .index = 214 };
+                s.bg = .{ .index = 236 };
+            },
+            .link => {
+                s.fg = .{ .index = 45 };
+                s.ul_style = .single;
+            },
+            .heading => s.bold = true,
+            .block_quote => s.fg = .{ .index = 244 },
+        }
+        return s;
+    }
 };
 
 const spinner_frames = [_][]const u8{
@@ -142,7 +177,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
 
     var history: std.ArrayList(Line) = .empty;
     defer {
-        for (history.items) |*l| l.text.deinit(allocator);
+        for (history.items) |*l| {
+            l.text.deinit(allocator);
+            l.deinitSpans(allocator);
+        }
         history.deinit(allocator);
     }
 
@@ -250,6 +288,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                         if (pending_agent_line) |idx| {
                             var dropped = history.orderedRemove(idx);
                             dropped.text.deinit(allocator);
+                            dropped.deinitSpans(allocator);
                         }
                         pending_agent_line = null;
                         pending = false;
@@ -295,7 +334,25 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                     if (pending_agent_line) |idx| {
                         var dropped = history.orderedRemove(idx);
                         dropped.text.deinit(allocator);
+                        dropped.deinitSpans(allocator);
                     }
+                } else if (pending_agent_line) |idx| {
+                    // Streaming done — re-parse the accumulated raw
+                    // markdown with koino and attach the span list so
+                    // the renderer paints bold/italic/code/etc. For
+                    // robustness we silently fall back to a flat
+                    // un-styled render on parse failure rather than
+                    // dropping the reply.
+                    var line = &history.items[idx];
+                    if (md.render(allocator, line.text.items)) |rendered| {
+                        line.text.clearRetainingCapacity();
+                        line.text.appendSlice(allocator, rendered.text) catch {};
+                        line.deinitSpans(allocator);
+                        line.spans = rendered.spans;
+                        // Free only the text buffer — spans ownership
+                        // moved into `line`.
+                        allocator.free(rendered.text);
+                    } else |_| {}
                 }
                 pending_agent_line = null;
                 pending_saw_text = false;
@@ -312,6 +369,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                     if (!pending_saw_text) {
                         var dropped = history.orderedRemove(idx);
                         dropped.text.deinit(allocator);
+                        dropped.deinitSpans(allocator);
                     }
                 }
                 try appendLine(&history, allocator, .system, msg);
@@ -701,7 +759,7 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
             start_row = 0;
         }
 
-        const style: vaxis.Style = switch (line.role) {
+        const base_style: vaxis.Style = switch (line.role) {
             .user => palette.user,
             .agent => palette.agent,
             .system => palette.system,
@@ -709,16 +767,28 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
 
         var row = start_row;
         _ = pane.printSegment(
-            .{ .text = prefix, .style = style },
+            .{ .text = prefix, .style = base_style },
             .{ .row_offset = @intCast(row), .col_offset = 0 },
         );
+
+        // Track the byte offset of `remaining[0]` back into the full
+        // line.text buffer so we can look up which markdown span
+        // covers each byte as we paint. `drop` accounted for rows
+        // that fell off the top of the pane when row_cursor < 0.
+        const total_len = line.text.items.len;
+        const span_offset_start: usize = total_len - remaining.len;
 
         var col_offset: usize = prefix.len;
         while (remaining.len > 0 and row < pane.height) {
             const take = safeUtf8Take(remaining, avail);
-            _ = pane.printSegment(
-                .{ .text = remaining[0..take], .style = style },
-                .{ .row_offset = @intCast(row), .col_offset = @intCast(col_offset) },
+            paintRow(
+                pane,
+                @intCast(row),
+                @intCast(col_offset),
+                remaining[0..take],
+                span_offset_start + (remaining.ptr - line.text.items.ptr),
+                base_style,
+                line.spans,
             );
             remaining = remaining[take..];
             row += 1;
@@ -727,6 +797,63 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
 
         row_cursor -= @intCast(rows_needed);
     }
+}
+
+/// Paint one row of wrapped text, applying per-byte markdown span
+/// styles. Walks the slice in runs of constant style and emits one
+/// `printSegment` per run.
+fn paintRow(
+    pane: vaxis.Window,
+    row: u16,
+    col_offset: u16,
+    bytes: []const u8,
+    bytes_start_in_line: usize,
+    base_style: vaxis.Style,
+    spans: ?[]md.Span,
+) void {
+    if (spans == null or spans.?.len == 0) {
+        _ = pane.printSegment(
+            .{ .text = bytes, .style = base_style },
+            .{ .row_offset = row, .col_offset = col_offset },
+        );
+        return;
+    }
+    const all_spans = spans.?;
+
+    var i: usize = 0;
+    var col = col_offset;
+    while (i < bytes.len) {
+        const abs = bytes_start_in_line + i;
+        const style = pickStyle(abs, base_style, all_spans);
+
+        // Extend `j` while the style at byte `j` matches `style`.
+        var j = i + 1;
+        while (j < bytes.len and styleEql(pickStyle(bytes_start_in_line + j, base_style, all_spans), style)) : (j += 1) {}
+
+        const slice = bytes[i..j];
+        _ = pane.printSegment(
+            .{ .text = slice, .style = style },
+            .{ .row_offset = row, .col_offset = col },
+        );
+        col += @intCast(slice.len);
+        i = j;
+    }
+}
+
+/// Pick the style for byte `abs` in the full line: the innermost
+/// covering span's style overlaid on `base`, or `base` alone.
+fn pickStyle(abs: usize, base: vaxis.Style, spans: []md.Span) vaxis.Style {
+    var s = base;
+    for (spans) |sp| {
+        if (abs >= sp.start and abs < sp.start + sp.len) {
+            s = palette.mdStyle(s, sp.style);
+        }
+    }
+    return s;
+}
+
+fn styleEql(a: vaxis.Style, b: vaxis.Style) bool {
+    return std.meta.eql(a, b);
 }
 
 fn drawPicker(

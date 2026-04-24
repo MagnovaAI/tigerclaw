@@ -32,4 +32,3 @@ runtime_sessions/
 # Workspace agent state (contains API keys, state, outbox).
 .tigerclaw/
 zig-pkg/
-graphify-out/
