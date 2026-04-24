@@ -329,6 +329,20 @@ pub fn build(b: *std.Build) void {
     const ctx_types_tests = b.addTest(.{ .root_module = ctx_types_test_mod });
     test_step.dependOn(&b.addRunArtifact(ctx_types_tests).step);
 
+    const capabilities_mod = b.addModule("capabilities", .{
+        .root_source_file = b.path("src/capabilities.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ctx_caps_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/context_capabilities_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctx_caps_test_mod.addImport("capabilities", capabilities_mod);
+    const ctx_caps_tests = b.addTest(.{ .root_module = ctx_caps_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ctx_caps_tests).step);
+
     if (provider_anthropic_mod) |m| {
         const t = b.addTest(.{ .root_module = m });
         test_step.dependOn(&b.addRunArtifact(t).step);
