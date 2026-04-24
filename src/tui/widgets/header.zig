@@ -86,20 +86,21 @@ pub fn draw(self: *const Header, ctx: vxfw.DrawContext) std.mem.Allocator.Error!
     // Title badge at col 0.
     writeGraphemes(ctx, surface, 0, 0, title_text, title_style);
 
-    // Right-side chips. Build the strings, measure in display columns,
-    // then place right-aligned. The chip widths include the flanking
-    // spaces that make the coloured background read as a pill.
-    var agent_buf: [128]u8 = undefined;
-    const agent_chip = std.fmt.bufPrint(&agent_buf, " {s} ", .{self.agent_name}) catch " agent ";
+    // Right-side chips. Build the strings ON THE ARENA (not the
+    // stack), because Surface cells retain slices into the
+    // grapheme bytes and App.render walks those slices AFTER
+    // draw() has returned — any stack-local buffer would be
+    // freed by then, and the rendered chip would degenerate to
+    // whatever bytes happened to survive in the popped frame.
+    const agent_chip = try std.fmt.allocPrint(ctx.arena, " {s} ", .{self.agent_name});
 
     const spinner = spinner_frames[@intCast(self.spinner_tick % spinner_frames.len)];
-    var status_buf: [64]u8 = undefined;
     // Same-width padding on the idle chip keeps the status chip's
     // column-span stable across pending→ready transitions, which
     // used to leave trailing "dy" / "king" glyphs with the
     // hand-rolled renderer.
     const status_text = if (self.pending)
-        (std.fmt.bufPrint(&status_buf, " {s} thinking ", .{spinner}) catch " … ")
+        try std.fmt.allocPrint(ctx.arena, " {s} thinking ", .{spinner})
     else
         " ● ready    ";
     const status_style = if (self.pending) status_busy_style else status_idle_style;
