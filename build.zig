@@ -383,6 +383,22 @@ pub fn build(b: *std.Build) void {
     const ctx_registry_tests = b.addTest(.{ .root_module = ctx_registry_test_mod });
     test_step.dependOn(&b.addRunArtifact(ctx_registry_tests).step);
 
+    const ctx_recall_mod = b.addModule("ctx_recall", .{
+        .root_source_file = b.path("src/context/recall.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctx_recall_mod.addImport("ctx_types", ctx_types_mod);
+    const ctx_recall_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/context_recall_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctx_recall_test_mod.addImport("ctx_types", ctx_types_mod);
+    ctx_recall_test_mod.addImport("ctx_recall", ctx_recall_mod);
+    const ctx_recall_tests = b.addTest(.{ .root_module = ctx_recall_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ctx_recall_tests).step);
+
     const ctx_compact_mod = b.addModule("ctx_compact", .{
         .root_source_file = b.path("src/context/compact.zig"),
         .target = target,
