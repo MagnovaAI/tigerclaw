@@ -263,16 +263,16 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
-    // Route to the vxfw implementation when the env flag is set —
-    // lets us test the migration without changing the default.
-    // `std.posix.getenv` was removed in Zig 0.16; use libc's
-    // `getenv` directly.
-    if (std.c.getenv("TIGERCLAW_VXFW")) |vptr| {
-        const v = std.mem.span(vptr);
-        if (v.len > 0 and v[0] != '0') {
-            return runVxfw(allocator, io, opts);
-        }
-    }
+    // vxfw path is the default. Set \`TIGERCLAW_VXFW=0\` to fall
+    // back to the hand-rolled implementation — kept around as a
+    // rollback escape hatch while the vxfw port soaks. The old
+    // path will be deleted once we've lived on vxfw for a while.
+    const use_legacy = blk: {
+        const v = std.c.getenv("TIGERCLAW_VXFW") orelse break :blk false;
+        const s = std.mem.span(v);
+        break :blk s.len > 0 and s[0] == '0';
+    };
+    if (!use_legacy) return runVxfw(allocator, io, opts);
 
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);

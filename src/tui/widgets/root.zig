@@ -151,11 +151,13 @@ fn beginTurn(self: *Root, typed: []const u8) !void {
     const app = self.app orelse return error.NoApp;
 
     try self.appendLine(.user, typed);
-    // Reserve a placeholder agent line so streamed chunks have a
-    // stable slot to accumulate into.
-    const agent_line_idx = self.history.items.len;
-    try self.appendLine(.agent, "");
-    self.pending_agent_line = agent_line_idx;
+    // No pre-reserved agent line. Chunks that arrive before a
+    // tool_start get a fresh agent line via the lazy path in
+    // the chunk handler; chunks that arrive *after* tool lines
+    // get their own agent line below the tools. This keeps the
+    // reading order natural — tool calls nest between the
+    // user prompt and the agent's final reply.
+    self.pending_agent_line = null;
     self.pending_saw_text = false;
 
     self.header.pending = true;
@@ -373,17 +375,31 @@ fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent) !vo
         defer self.allocator.free(p.text);
         defer self.allocator.destroy(@as(*ChunkPayload, @constCast(p)));
 
-        if (self.pending_agent_line) |idx| {
-            var line = &self.history.items[idx];
-            try line.text.appendSlice(self.allocator, p.text);
-            self.pending_saw_text = true;
-        }
+        // Lazily create (or reuse) an agent line at the current
+        // end of history. `pending_agent_line` is set on the
+        // first chunk and cleared whenever a tool event lands,
+        // so chunks before + after tools each live on their own
+        // line in the natural reading order.
+        const idx = self.pending_agent_line orelse blk: {
+            try self.appendLine(.agent, "");
+            const new_idx = self.history.items.len - 1;
+            self.pending_agent_line = new_idx;
+            break :blk new_idx;
+        };
+        var line = &self.history.items[idx];
+        try line.text.appendSlice(self.allocator, p.text);
+        self.pending_saw_text = true;
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_tool_start)) {
         const p: *const ToolStartPayload = @ptrCast(@alignCast(ue.data.?));
         defer self.allocator.free(p.id);
         defer self.allocator.free(p.name);
         defer self.allocator.destroy(@as(*ToolStartPayload, @constCast(p)));
+
+        // Tool call breaks the current agent-line accumulator.
+        // Subsequent chunks (post-tool) create a fresh agent
+        // line below the tool entry.
+        self.pending_agent_line = null;
 
         // Append a pending tool line. We own the id so tool_done
         // can find its matching entry.
@@ -439,22 +455,9 @@ fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent) !vo
         try self.appendLine(.system, line);
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_done)) {
-        // Drop the empty placeholder if the turn produced no
-        // text (e.g. a tool-only reply or an error mid-stream).
-        if (!self.pending_saw_text) {
-            if (self.pending_agent_line) |idx| {
-                // Only drop if it's actually still the last-ish
-                // line we reserved — inserting tool lines above
-                // shifts the index forward but the placeholder
-                // stays at the original idx.
-                if (idx < self.history.items.len) {
-                    var dropped = self.history.orderedRemove(idx);
-                    dropped.text.deinit(self.allocator);
-                    dropped.deinitSpans(self.allocator);
-                    dropped.deinitToolId(self.allocator);
-                }
-            }
-        }
+        // No placeholder to drop — the chunk handler creates the
+        // agent line lazily, so an empty turn leaves no empty
+        // line behind.
         self.pending_agent_line = null;
         self.pending_saw_text = false;
         self.header.pending = false;
