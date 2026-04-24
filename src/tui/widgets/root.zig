@@ -491,14 +491,38 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     const width = ctx.max.width orelse 0;
     const height = ctx.max.height orelse 0;
 
+    // Bail on degenerate sizes. The input box alone needs 3
+    // rows; below that the underflow math (`height - input_rows`)
+    // panics and the input-border loop blows past the visible
+    // area. Returning a blank surface lets the next resize event
+    // paint properly without an abort in between.
+    if (width == 0 or height < 3) {
+        return try vxfw.Surface.init(
+            ctx.arena,
+            self.widget(),
+            .{ .width = width, .height = height },
+        );
+    }
+
     // Layout (top → bottom):
-    //   rows 0..1                    header (2 rows)
-    //   rows 2..history_end-1        history
-    //   thinking_row                 thinking row (1 row when pending, 0 else)
-    //   bottom 3 rows                input box
-    const header_rows: u16 = Header.banner_rows;
+    //   header                       Header.bannerRows(width)
+    //   history                      whatever is left
+    //   thinking_row                 1 row when pending, 0 else
+    //   input box                    3 rows
     const input_rows: u16 = 3;
     const thinking_rows: u16 = if (self.thinking.pending) 1 else 0;
+
+    // Header collapses to zero rows when the terminal is too
+    // short to fit it alongside the input + thinking row.
+    const requested_header: u16 = Header.bannerRows(width);
+    const non_header_min: u16 = input_rows + thinking_rows;
+    const header_rows: u16 = if (height > non_header_min + requested_header)
+        requested_header
+    else if (height > non_header_min)
+        height - non_header_min
+    else
+        0;
+
     const reserved: u16 = header_rows + thinking_rows + input_rows;
     const history_rows: u16 = if (height > reserved) height - reserved else 0;
 
@@ -541,18 +565,19 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     ));
     const thinking_row: u16 = @intCast(header_rows + history_rows);
     surface.children[2] = .{
-        .origin = .{ .row = @intCast(thinking_row), .col = 0 },
+        .origin = .{ .row = thinking_row, .col = 0 },
         .surface = thinking_surface,
         .z_index = 0,
     };
 
-    // Input at the bottom.
+    // Input at the bottom. Guarded against `height < input_rows`
+    // by the early-return at the top of this function.
     const input_surface = try self.input.widget().draw(ctx.withConstraints(
         .{ .width = 0, .height = 0 },
         .{ .width = width, .height = input_rows },
     ));
     surface.children[3] = .{
-        .origin = .{ .row = @intCast(height - input_rows), .col = 0 },
+        .origin = .{ .row = height - input_rows, .col = 0 },
         .surface = input_surface,
         .z_index = 0,
     };

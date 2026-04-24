@@ -160,17 +160,20 @@ pub fn draw(self: *Input, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Su
     const text_style: vaxis.Style = tui.palette.agent;
     const hint_style: vaxis.Style = tui.palette.hint;
 
-    // Top border: ╭───...───╮
-    surface.writeCell(0, 0, .{ .char = .{ .grapheme = "╭", .width = 1 }, .style = border_style });
+    // Top border: ┏━━━...━━━┓ (heavy weight matches the
+    // header divider rule and tiles flush across cells —
+    // thin/rounded glyphs leave visible gaps in fonts with
+    // any cell padding).
+    surface.writeCell(0, 0, .{ .char = .{ .grapheme = "┏", .width = 1 }, .style = border_style });
     var c: u16 = 1;
     while (c < width - 1) : (c += 1) {
-        surface.writeCell(c, 0, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = border_style });
+        surface.writeCell(c, 0, .{ .char = .{ .grapheme = "━", .width = 1 }, .style = border_style });
     }
-    surface.writeCell(width - 1, 0, .{ .char = .{ .grapheme = "╮", .width = 1 }, .style = border_style });
+    surface.writeCell(width - 1, 0, .{ .char = .{ .grapheme = "┓", .width = 1 }, .style = border_style });
 
     // Sides + prompt + content on row 1.
-    surface.writeCell(0, 1, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = border_style });
-    surface.writeCell(width - 1, 1, .{ .char = .{ .grapheme = "│", .width = 1 }, .style = border_style });
+    surface.writeCell(0, 1, .{ .char = .{ .grapheme = "┃", .width = 1 }, .style = border_style });
+    surface.writeCell(width - 1, 1, .{ .char = .{ .grapheme = "┃", .width = 1 }, .style = border_style });
     // Prompt glyph at col 1.
     surface.writeCell(1, 1, .{ .char = .{ .grapheme = "❯", .width = 1 }, .style = prompt_style });
     surface.writeCell(2, 1, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = prompt_style });
@@ -225,13 +228,13 @@ pub fn draw(self: *Input, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Su
         // follow-up.
     }
 
-    // Bottom border: ╰───...───╯
-    surface.writeCell(0, 2, .{ .char = .{ .grapheme = "╰", .width = 1 }, .style = border_style });
+    // Bottom border: ┗━━━...━━━┛
+    surface.writeCell(0, 2, .{ .char = .{ .grapheme = "┗", .width = 1 }, .style = border_style });
     c = 1;
     while (c < width - 1) : (c += 1) {
-        surface.writeCell(c, 2, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = border_style });
+        surface.writeCell(c, 2, .{ .char = .{ .grapheme = "━", .width = 1 }, .style = border_style });
     }
-    surface.writeCell(width - 1, 2, .{ .char = .{ .grapheme = "╯", .width = 1 }, .style = border_style });
+    surface.writeCell(width - 1, 2, .{ .char = .{ .grapheme = "┛", .width = 1 }, .style = border_style });
 
     return surface;
 }
