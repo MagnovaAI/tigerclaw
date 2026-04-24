@@ -516,7 +516,7 @@ const builtin_tools = [_]types.Tool{
     },
     .{
         .name = "fetch_url",
-        .description = "HTTP GET the URL and return the response body as text (max 64 KB). Only http:// and https:// schemes are allowed; private and loopback addresses are refused.",
+        .description = "Fetch a web page and return it rendered as readable markdown (headings, links, lists), not raw HTML. JavaScript runs before the page is dumped, so SPA content is included. Only http:// and https:// URLs are allowed; private and loopback addresses are refused. Response is capped at 64 KB.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute URL to fetch.\"}},\"required\":[\"url\"]}",
     },
     .{
@@ -705,11 +705,18 @@ fn runRandomNumber(allocator: std.mem.Allocator, now_ns: i128, arguments_json: [
 // ---------------------------------------------------------------------------
 // fetch_url
 
-/// Minimal HTTP GET tool. Refuses non-http(s) URLs and any hostname
-/// that resolves to a loopback, private (RFC 1918), or link-local
-/// address — the classic SSRF escape hatches where the tool could
-/// be coerced into talking to internal services.
+/// Fetch a URL via the locally-installed Lightpanda headless browser
+/// and return the rendered page as markdown. Uses the compiled
+/// `lightpanda` binary on $PATH (written in Zig but distributed as a
+/// pre-built executable) — linking Lightpanda as a Zig module is not
+/// yet viable on Zig 0.16 because its build graph still targets 0.15.
+///
+/// SSRF guard: the URL's hostname is rejected if it parses to any
+/// loopback / RFC 1918 / link-local literal before we spawn the
+/// subprocess. Hostname-based DNS rebinding is out of scope here
+/// (future-work concern shared with the older direct-HTTP version).
 fn runFetchUrl(allocator: std.mem.Allocator, io: std.Io, arguments_json: []const u8) ![]u8 {
+    _ = io;
     const Args = struct { url: []const u8 };
     var parsed = try std.json.parseFromSlice(Args, allocator, arguments_json, .{
         .ignore_unknown_fields = true,
@@ -721,8 +728,6 @@ fn runFetchUrl(allocator: std.mem.Allocator, io: std.Io, arguments_json: []const
         return error.DisallowedScheme;
     }
 
-    // Parse to extract the hostname for the SSRF check. We let zig
-    // reject malformed URLs before hitting the real HTTP client.
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
     const host: []const u8 = switch (uri.host orelse return error.MissingHost) {
         .raw => |h| h,
@@ -730,42 +735,66 @@ fn runFetchUrl(allocator: std.mem.Allocator, io: std.Io, arguments_json: []const
     };
     try ensurePublicHost(host);
 
-    var client: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer client.deinit();
+    return runLightpanda(allocator, url);
+}
 
-    // std.http.Client.fetch writes the response body into a caller-
-    // supplied `Writer`. We use an Allocating writer backed by a
-    // plain ArrayList so we can read the body back as a slice, and
-    // enforce the 64 KiB cap by checking length after the call.
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(allocator);
-    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &body);
+/// Spawn `lightpanda fetch --dump markdown <url>` via libc popen (the
+/// same pattern `findOrphanPid` uses in `gateway.zig`, for the same
+/// reason: Zig 0.16's `std.process.Child` spawn-and-read pipeline is
+/// still in transition). Reads up to 64 KiB of stdout; anything past
+/// the cap is truncated so a runaway page can't exhaust the heap.
+fn runLightpanda(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    // Build the shell command. URL must be sanitised — refuse any
+    // single-quote in the URL so the shell can't be talked out of its
+    // quoting (the SSRF check above already rejected most attack
+    // surface; this is a belt on top of it).
+    if (std.mem.indexOfScalar(u8, url, '\'') != null) return error.InvalidUrl;
 
-    const result = client.fetch(.{
-        .method = .GET,
-        .location = .{ .url = url },
-        .response_writer = &aw.writer,
-    }) catch return error.FetchFailed;
+    // 8 KiB is enough for the full command line; a URL longer than
+    // that is almost certainly malformed.
+    var cmd_buf: [8 * 1024]u8 = undefined;
+    const cmd = std.fmt.bufPrintZ(
+        &cmd_buf,
+        "lightpanda fetch --dump markdown --wait_ms 3000 '{s}' 2>/dev/null",
+        .{url},
+    ) catch return error.InvalidUrl;
 
-    // Pull the ArrayList back out of the writer before reading it —
-    // the writer may still hold buffered bytes we haven't drained.
-    aw.writer.flush() catch {};
-    body = aw.toArrayList();
+    const f = popen(cmd.ptr, "r") orelse return error.FetchFailed;
+    defer _ = pclose(f);
 
-    const status_code = @intFromEnum(result.status);
-    if (status_code < 200 or status_code >= 300) {
+    const max_bytes: usize = 64 * 1024;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, 4096);
+
+    var chunk: [4096]u8 = undefined;
+    while (out.items.len < max_bytes) {
+        const n = fread(&chunk, 1, chunk.len, f);
+        if (n == 0) break;
+        const room = max_bytes - out.items.len;
+        const take = @min(n, room);
+        try out.appendSlice(allocator, chunk[0..take]);
+        if (take < n) break;
+    }
+
+    if (out.items.len == 0) {
         return std.fmt.allocPrint(
             allocator,
-            "HTTP {d} {s}",
-            .{ status_code, result.status.phrase() orelse "error" },
+            "lightpanda returned no output for {s}",
+            .{url},
         );
     }
 
-    // Hard cap response size.
-    const max_bytes: usize = 64 * 1024;
-    const slice = if (body.items.len > max_bytes) body.items[0..max_bytes] else body.items;
-    return allocator.dupe(u8, slice);
+    return out.toOwnedSlice(allocator);
 }
+
+// libc shims for popen-based subprocess I/O. Mirrors the bindings in
+// `gateway.zig` but kept local so `live_runner` has no dependency on
+// the gateway module.
+const LP_FILE = opaque {};
+extern "c" fn popen(cmd: [*:0]const u8, mode: [*:0]const u8) ?*LP_FILE;
+extern "c" fn pclose(stream: *LP_FILE) c_int;
+extern "c" fn fread(ptr: [*]u8, size: usize, n: usize, stream: *LP_FILE) usize;
 
 /// Refuse hostnames that parse as loopback/private/link-local IPs.
 /// DNS-based bypasses (e.g. `evil.example.com` pointing at
