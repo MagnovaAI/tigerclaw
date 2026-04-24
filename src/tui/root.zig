@@ -195,16 +195,20 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
 
                     // Slash-command interception — keeps the wire
                     // path (agent_line + worker spawn) reserved for
-                    // actual agent turns. Commands are handled
-                    // inline and the input box is cleared either way.
-                    if (std.mem.startsWith(u8, typed, "/")) {
+                    // actual agent turns. Leading whitespace is
+                    // trimmed first so stray spaces from paste or
+                    // accidental keystrokes still activate the
+                    // command parser instead of being sent on to
+                    // the agent as user text.
+                    const trimmed = std.mem.trim(u8, typed, " \t");
+                    if (std.mem.startsWith(u8, trimmed, "/")) {
                         input.clearAndFree();
                         try handleSlashCommand(
                             &history,
                             allocator,
                             &agents,
                             &selected,
-                            typed,
+                            trimmed,
                         );
                         continue;
                     }
