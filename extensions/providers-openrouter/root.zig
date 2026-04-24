@@ -135,7 +135,23 @@ pub fn buildRequestBody(
 
     try s.objectField("messages");
     try s.beginArray();
+    // OpenAI / OpenRouter expect the system prompt as the first entry
+    // of the `messages` array (no separate top-level field). Emit it
+    // when the caller supplied one; without this, the agent's SOUL.md
+    // persona is silently dropped and the model falls back to its
+    // stock identity.
+    if (request.system) |sys_text| {
+        if (sys_text.len > 0) {
+            try s.beginObject();
+            try s.objectField("role");
+            try s.write("system");
+            try s.objectField("content");
+            try s.write(sys_text);
+            try s.endObject();
+        }
+    }
     for (request.messages) |msg| {
+        if (msg.content.len == 0) continue;
         try s.beginObject();
         try s.objectField("role");
         try s.write(@tagName(msg.role));
@@ -408,6 +424,53 @@ test "openrouter: buildRequestBody preserves model string and shape" {
     try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"content\":\"hi\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":1024") != null);
+}
+
+test "scenario: buildRequestBody promotes ChatRequest.system to the first messages entry" {
+    // Regression for the session where sage and bolt agents answered
+    // with their provider's default identity instead of their
+    // SOUL.md persona. The runner sets `ChatRequest.system`; an
+    // OpenAI-compatible body must surface that as a `{role: system}`
+    // message at the head of `messages[]` or the persona is lost.
+    const msgs = [_]types.Message{
+        .{ .role = .user, .content = "who are you" },
+    };
+    const req: ChatRequest = .{
+        .messages = &msgs,
+        .model = .{ .provider = "openrouter", .model = "openai/gpt-4o" },
+        .system = "You are sage — a wise, patient agent.",
+    };
+
+    const body = try buildRequestBody(testing.allocator, req);
+    defer testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?;
+    try testing.expectEqual(@as(usize, 2), messages.array.items.len);
+    try testing.expectEqualStrings("system", messages.array.items[0].object.get("role").?.string);
+    try testing.expectEqualStrings(
+        "You are sage — a wise, patient agent.",
+        messages.array.items[0].object.get("content").?.string,
+    );
+    try testing.expectEqualStrings("user", messages.array.items[1].object.get("role").?.string);
+}
+
+test "scenario: buildRequestBody omits the system entry when request.system is null" {
+    const msgs = [_]types.Message{.{ .role = .user, .content = "hi" }};
+    const req: ChatRequest = .{
+        .messages = &msgs,
+        .model = .{ .provider = "openrouter", .model = "openai/gpt-4o" },
+    };
+
+    const body = try buildRequestBody(testing.allocator, req);
+    defer testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?;
+    try testing.expectEqual(@as(usize, 1), messages.array.items.len);
+    try testing.expectEqualStrings("user", messages.array.items[0].object.get("role").?.string);
 }
 
 test "openrouter: buildRequestBody honours caller-provided max_tokens" {
