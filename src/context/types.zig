@@ -1,5 +1,3 @@
-const std = @import("std");
-
 pub const Role = enum { system, user, assistant, tool };
 
 pub const SectionKind = enum {
