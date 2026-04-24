@@ -206,12 +206,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
 
     var vx = try vaxis.init(allocator, .{});
     defer vx.deinit(allocator, writer);
-    // Vaxis's truecolor-capability detection is currently disabled
-    // upstream (see the commented-out COLORTERM / XTGETTCAP paths
-    // in `queryTerminalSend`). Force the flag on — every macOS and
-    // Linux terminal we ship for understands 24-bit SGR sequences,
-    // and without this flag the palette's `.rgb = {...}` colours
-    // don't paint at all (style silently no-ops).
+    // Switch to the legacy SGR encoding (semicolon-separated sub-
+    // parameters) so truecolor paints on macOS Terminal.app. The
+    // default is `.standard` — colon-separated, per ITU-T T.416 —
+    // which Terminal.app silently drops on the floor. iTerm2 /
+    // Ghostty / WezTerm accept both; the legacy form is the
+    // universally-compatible one. (See packages/vaxis/src/ctlseqs.zig
+    // — `fg_rgb` vs `fg_rgb_legacy`.)
+    vx.sgr = .legacy;
     vx.caps.rgb = true;
 
     var loop: EventLoop = .{ .vaxis = &vx, .tty = &tty };
@@ -794,10 +796,16 @@ fn drawHeader(
 
     const spinner = spinner_frames[@intCast(spinner_tick % spinner_frames.len)];
     var status_buf: [64]u8 = undefined;
+    // Pad both labels to the same display width so the transition
+    // from "thinking" → "ready" doesn't leave stale cells past the
+    // right edge of the shorter string. vaxis's differential render
+    // sometimes decides a cell's unchanged when the style flips back
+    // and forth, which leaves the trailing "ng" of "thinking" bleeding
+    // into "ready ". Same width in both states = no residue.
     const status_text = if (pending)
         (std.fmt.bufPrint(&status_buf, " {s} thinking ", .{spinner}) catch " … ")
     else
-        " ● ready ";
+        " ● ready    ";
 
     const chip_len: usize = measureCols(chip);
     const status_len: usize = measureCols(status_text);
