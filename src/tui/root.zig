@@ -92,7 +92,7 @@ const Event = union(enum) {
 const ToolStartPayload = struct { id: []u8, name: []u8 };
 const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8 };
 
-const Line = struct {
+pub const Line = struct {
     role: Role,
     text: std.ArrayList(u8),
     /// Style spans over `text`. Non-null only for agent replies
@@ -106,21 +106,21 @@ const Line = struct {
     /// without having to pattern-match on rendered text.
     tool_id: ?[]u8 = null,
 
-    fn deinitSpans(self: *Line, allocator: std.mem.Allocator) void {
+    pub fn deinitSpans(self: *Line, allocator: std.mem.Allocator) void {
         if (self.spans) |s| {
             allocator.free(s);
             self.spans = null;
         }
     }
 
-    fn deinitToolId(self: *Line, allocator: std.mem.Allocator) void {
+    pub fn deinitToolId(self: *Line, allocator: std.mem.Allocator) void {
         if (self.tool_id) |id| {
             allocator.free(id);
             self.tool_id = null;
         }
     }
 
-    const Role = enum { user, agent, system, tool };
+    pub const Role = enum { user, agent, system, tool };
 };
 
 pub const Options = struct {
@@ -140,7 +140,7 @@ const EventLoop = vaxis.Loop(Event);
 /// terminal needs `COLORTERM=truecolor` (default on iTerm2, Ghostty,
 /// WezTerm, Kitty, modern Terminal.app). On a non-truecolor term the
 /// sequences gracefully degrade to the nearest 256-color index.
-const palette = struct {
+pub const palette = struct {
     // Core tiger colours — reused as field values in Style below. Kept
     // in one block so tweaking the theme means editing nine numbers,
     // not nine separate Style entries.
@@ -160,12 +160,12 @@ const palette = struct {
     const status_idle: vaxis.Style = .{ .fg = green, .bold = true };
     const status_busy: vaxis.Style = .{ .fg = amber, .bold = true };
     const separator: vaxis.Style = .{ .fg = smoke };
-    const user: vaxis.Style = .{ .fg = gold, .bold = true };
-    const agent: vaxis.Style = .{ .fg = cream };
-    const system: vaxis.Style = .{ .fg = smoke, .italic = true };
+    pub const user: vaxis.Style = .{ .fg = gold, .bold = true };
+    pub const agent: vaxis.Style = .{ .fg = cream };
+    pub const system: vaxis.Style = .{ .fg = smoke, .italic = true };
     /// Tool-call trace lines. Dim moss — enough to read but clearly
     /// subordinate to the user/agent conversation.
-    const tool: vaxis.Style = .{ .fg = moss, .italic = true };
+    pub const tool: vaxis.Style = .{ .fg = moss, .italic = true };
     const prompt: vaxis.Style = .{ .fg = orange, .bold = true };
     const hint: vaxis.Style = .{ .fg = smoke, .italic = true };
     const picker_border: vaxis.Style = .{ .fg = orange };
@@ -176,7 +176,7 @@ const palette = struct {
     // on top of the caller's base style (typically `palette.agent`)
     // so text still reads as the speaker's line colour with the
     // markdown flavour applied on top.
-    fn mdStyle(base: vaxis.Style, kind: md.StyleKind) vaxis.Style {
+    pub fn mdStyle(base: vaxis.Style, kind: md.StyleKind) vaxis.Style {
         var s = base;
         switch (kind) {
             .plain => {},
@@ -238,6 +238,17 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     app.vx.caps.rgb = true;
 
     var root = RootWidget.init(allocator, default_agent);
+    defer root.deinit();
+
+    // Seed a demo history so the History widget has something to
+    // show during the migration. Real runner-driven history lands
+    // in a follow-up once the streaming sinks get routed through
+    // vxfw UserEvents.
+    try root.appendLine(.system, "agent: tiger");
+    try root.appendLine(.user, "hey");
+    try root.appendLine(.agent, "Hey there! vxfw history widget is live. Press q to quit.");
+    try root.appendLine(.tool, "get_current_time → 2026-04-24T12:05:00Z");
+    try root.appendLine(.user, "try a longer line to test wrapping, with a nice sentence that will definitely need two rows on a narrow terminal and probably three rows on something even narrower than that");
 
     try app.run(root.widget(), .{});
 }
