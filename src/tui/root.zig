@@ -404,10 +404,13 @@ fn draw(
         drawHistory(pane, history);
     }
 
-    if (win.height >= 4) {
-        const status_row: u16 = @intCast(@as(i32, @intCast(win.height)) - footer_rows);
-        drawStatusHint(win, status_row, agents, selected);
-    }
+    // Status-hint row intentionally omitted: it produced glyph
+    // artefacts on macOS Terminal at narrow widths that I could not
+    // fully attribute to a single source (printSegment wrap, width
+    // detection races, or a terminal-response byte bleeding through
+    // the input path). The header already shows the agent chip and
+    // ready/thinking state, which covers the common case. Keybindings
+    // are documented in tigerclaw --help.
 
     if (win.height >= 3) {
         const input_child = win.child(.{
@@ -486,38 +489,6 @@ fn drawHeader(
             );
         }
     }
-}
-
-fn drawStatusHint(
-    win: vaxis.Window,
-    row: u16,
-    agents: []const []const u8,
-    selected: usize,
-) void {
-    var buf: [256]u8 = undefined;
-    const full = if (agents.len > 1)
-        (std.fmt.bufPrint(
-            &buf,
-            "ctrl-n/p cycle agent ({d}/{d})  ·  ctrl-e pick  ·  enter send  ·  ctrl-c quit",
-            .{ selected + 1, agents.len },
-        ) catch "ctrl-c quit")
-    else
-        "enter send  ·  ctrl-c quit";
-
-    // Truncate the hint to one row: `printSegment` soft-wraps into
-    // the next row by default, and the next row here is the input
-    // box's top border. A wrap would leak tail bytes into cells
-    // that the input widget doesn't paint over, leaving the `:��`
-    // artefact visible to the user.
-    const avail: usize = if (win.width > 2) @as(usize, win.width) - 2 else 0;
-    if (avail == 0) return;
-    const n = safeUtf8Take(full, avail);
-    const hint = full[0..n];
-
-    _ = win.printSegment(
-        .{ .text = hint, .style = palette.hint },
-        .{ .row_offset = row, .col_offset = 1 },
-    );
 }
 
 /// Return the largest byte count ≤ `max` that ends on a UTF-8
