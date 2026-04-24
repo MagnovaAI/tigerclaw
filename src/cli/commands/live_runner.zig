@@ -182,6 +182,12 @@ pub const LiveAgentRunner = struct {
             \\or telling the user to do the work themselves. Each tool's JSON schema
             \\is provided separately; the list below is for quick reference.
             \\
+            \\When the user names a tool by the name of the underlying CLI it wraps
+            \\(for example "use lightpanda", "run the calculator", "grab the time"),
+            \\treat that as a request to invoke the matching tool directly — do not
+            \\ask them to clarify or apologise. If the user's intent is unambiguous,
+            \\make the tool call on the first try.
+            \\
             \\
         );
         for (builtin_tools) |t| {
@@ -516,7 +522,7 @@ const builtin_tools = [_]types.Tool{
     },
     .{
         .name = "fetch_url",
-        .description = "Fetch a web page and return it rendered as readable markdown (headings, links, lists), not raw HTML. JavaScript runs before the page is dumped, so SPA content is included. Only http:// and https:// URLs are allowed; private and loopback addresses are refused. Response is capped at 64 KB.",
+        .description = "Fetch a web page via the Lightpanda headless browser and return it as readable markdown (headings, links, lists) rather than raw HTML. JavaScript runs before the page is dumped, so SPA content is included. Call this tool whenever the user says 'fetch', 'browse', 'scrape', 'look up <a topic> online', 'visit', 'check this page', 'open this URL', or names Lightpanda directly. Only http:// and https:// URLs are allowed; private and loopback addresses are refused. Response is capped at 64 KB.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute URL to fetch.\"}},\"required\":[\"url\"]}",
     },
     .{
