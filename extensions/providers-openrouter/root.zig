@@ -152,12 +152,7 @@ pub fn buildRequestBody(
     }
     for (request.messages) |msg| {
         if (msg.content.len == 0) continue;
-        try s.beginObject();
-        try s.objectField("role");
-        try s.write(@tagName(msg.role));
-        try s.objectField("content");
-        try s.write(msg.content);
-        try s.endObject();
+        try writeOpenAIMessage(allocator, &s, msg);
     }
     try s.endArray();
 
@@ -177,6 +172,114 @@ pub fn buildRequestBody(
     try s.endObject();
 
     return aw.toOwnedSlice();
+}
+
+/// Serialize one Message in OpenAI/OpenRouter chat-completions wire
+/// format. Differs from Anthropic in three structural ways:
+///   * `tool_use` blocks become an `assistant` message's `tool_calls`
+///     array (alongside any `content` text);
+///   * `tool_result` blocks are emitted as separate `role:tool`
+///     messages (one per result), each carrying `tool_call_id` and
+///     a stringified `content` field;
+///   * if the assistant emitted only a `tool_use` (no text),
+///     `content` is null rather than an empty string.
+fn writeOpenAIMessage(
+    allocator: std.mem.Allocator,
+    s: *std.json.Stringify,
+    msg: types.Message,
+) !void {
+    // Walk blocks once to classify what's present.
+    var text_combined: ?[]const u8 = null;
+    var first_tool_use_idx: ?usize = null;
+    var first_tool_result_idx: ?usize = null;
+    var any_tool_use = false;
+    var any_tool_result = false;
+    for (msg.content, 0..) |b, i| {
+        switch (b) {
+            .text => |t| {
+                if (text_combined == null) text_combined = t;
+                // For multi-text-block messages we'd need to
+                // concatenate; leave that to a future refactor —
+                // today the runner only ever emits one text block
+                // per message.
+            },
+            .tool_use => {
+                if (first_tool_use_idx == null) first_tool_use_idx = i;
+                any_tool_use = true;
+            },
+            .tool_result => {
+                if (first_tool_result_idx == null) first_tool_result_idx = i;
+                any_tool_result = true;
+            },
+        }
+    }
+
+    if (any_tool_result) {
+        // Emit one `role:tool` message per tool_result block.
+        // Multiple tool results from a single batch fan out into
+        // multiple wire messages — the role itself can't ride
+        // tool_calls and content together in OpenAI's format.
+        for (msg.content) |b| {
+            switch (b) {
+                .tool_result => |tr| {
+                    try s.beginObject();
+                    try s.objectField("role");
+                    try s.write("tool");
+                    try s.objectField("tool_call_id");
+                    try s.write(tr.tool_use_id);
+                    try s.objectField("content");
+                    try s.write(tr.content);
+                    try s.endObject();
+                },
+                else => {},
+            }
+        }
+        return;
+    }
+
+    // Non-tool_result message: emit as a single object.
+    try s.beginObject();
+    try s.objectField("role");
+    try s.write(@tagName(msg.role));
+
+    // Content: text if present, else null when tool_calls only.
+    try s.objectField("content");
+    if (text_combined) |t| {
+        try s.write(t);
+    } else {
+        try s.write(null);
+    }
+
+    if (any_tool_use) {
+        try s.objectField("tool_calls");
+        try s.beginArray();
+        for (msg.content) |b| {
+            switch (b) {
+                .tool_use => |tu| {
+                    try s.beginObject();
+                    try s.objectField("id");
+                    try s.write(tu.id);
+                    try s.objectField("type");
+                    try s.write("function");
+                    try s.objectField("function");
+                    try s.beginObject();
+                    try s.objectField("name");
+                    try s.write(tu.name);
+                    try s.objectField("arguments");
+                    // OpenAI expects `arguments` as a JSON string,
+                    // not an object — pass the already-encoded JSON
+                    // through verbatim. Empty args become "{}".
+                    try s.write(if (tu.input_json.len == 0) "{}" else tu.input_json);
+                    try s.endObject();
+                    try s.endObject();
+                },
+                else => {},
+            }
+        }
+        try s.endArray();
+    }
+    try s.endObject();
+    _ = allocator;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,8 +509,8 @@ test "openrouter: assembles content across chunks" {
 
 test "openrouter: buildRequestBody preserves model string and shape" {
     const msgs = [_]types.Message{
-        .{ .role = .system, .content = "be terse" },
-        .{ .role = .user, .content = "hi" },
+        types.Message.literal(.system, "be terse"),
+        types.Message.literal(.user, "hi"),
     };
     const req: ChatRequest = .{
         .messages = &msgs,
@@ -433,7 +536,7 @@ test "scenario: buildRequestBody promotes ChatRequest.system to the first messag
     // OpenAI-compatible body must surface that as a `{role: system}`
     // message at the head of `messages[]` or the persona is lost.
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "who are you" },
+        types.Message.literal(.user, "who are you"),
     };
     const req: ChatRequest = .{
         .messages = &msgs,
@@ -457,7 +560,7 @@ test "scenario: buildRequestBody promotes ChatRequest.system to the first messag
 }
 
 test "scenario: buildRequestBody omits the system entry when request.system is null" {
-    const msgs = [_]types.Message{.{ .role = .user, .content = "hi" }};
+    const msgs = [_]types.Message{types.Message.literal(.user, "hi")};
     const req: ChatRequest = .{
         .messages = &msgs,
         .model = .{ .provider = "openrouter", .model = "openai/gpt-4o" },
@@ -475,7 +578,7 @@ test "scenario: buildRequestBody omits the system entry when request.system is n
 
 test "openrouter: buildRequestBody honours caller-provided max_tokens" {
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "x" },
+        types.Message.literal(.user, "x"),
     };
     const req: ChatRequest = .{
         .messages = &msgs,
@@ -553,7 +656,7 @@ test "openrouter: HTTP error path returns a refusal containing the status" {
     const provider = p.provider();
 
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "hello" },
+        types.Message.literal(.user, "hello"),
     };
     const resp = try provider.chat(testing.allocator, .{
         .messages = &msgs,

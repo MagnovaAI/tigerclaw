@@ -38,7 +38,7 @@ pub const Result = struct {
 };
 
 pub fn deinitResult(allocator: std.mem.Allocator, r: Result) void {
-    for (r.messages) |m| allocator.free(m.content);
+    for (r.messages) |m| m.freeOwned(allocator);
     allocator.free(r.messages);
     allocator.free(r.hint);
 }
@@ -64,18 +64,16 @@ pub fn compact(
     errdefer allocator.free(messages);
 
     var written: usize = 0;
-    errdefer for (messages[0..written]) |m| allocator.free(m.content);
+    errdefer for (messages[0..written]) |m| m.freeOwned(allocator);
 
     // Head
     for (history[0..head_n]) |m| {
-        const copy = try allocator.dupe(u8, m.content);
-        messages[written] = .{ .role = m.role, .content = copy };
+        messages[written] = try types.Message.allocText(allocator, m.role, m.flatText());
         written += 1;
     }
     // Tail
     for (history[effective_tail_start..]) |m| {
-        const copy = try allocator.dupe(u8, m.content);
-        messages[written] = .{ .role = m.role, .content = copy };
+        messages[written] = try types.Message.allocText(allocator, m.role, m.flatText());
         written += 1;
     }
 
@@ -109,8 +107,8 @@ const testing = std.testing;
 
 test "compact: short history is passed through unchanged" {
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "1" },
-        .{ .role = .assistant, .content = "2" },
+        types.Message.literal(.user, "1"),
+        types.Message.literal(.assistant, "2"),
     };
     const r = try compact(testing.allocator, &msgs, .{ .keep_head = 1, .keep_tail = 4 });
     defer deinitResult(testing.allocator, r);
@@ -122,26 +120,26 @@ test "compact: short history is passed through unchanged" {
 
 test "compact: trims middle when history exceeds head+tail" {
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "head" },
-        .{ .role = .assistant, .content = "mid1" },
-        .{ .role = .user, .content = "mid2" },
-        .{ .role = .assistant, .content = "mid3" },
-        .{ .role = .user, .content = "tail1" },
-        .{ .role = .assistant, .content = "tail2" },
+        types.Message.literal(.user, "head"),
+        types.Message.literal(.assistant, "mid1"),
+        types.Message.literal(.user, "mid2"),
+        types.Message.literal(.assistant, "mid3"),
+        types.Message.literal(.user, "tail1"),
+        types.Message.literal(.assistant, "tail2"),
     };
     const r = try compact(testing.allocator, &msgs, .{ .keep_head = 1, .keep_tail = 2 });
     defer deinitResult(testing.allocator, r);
 
     try testing.expectEqual(@as(usize, 3), r.messages.len);
-    try testing.expectEqualStrings("head", r.messages[0].content);
-    try testing.expectEqualStrings("tail1", r.messages[1].content);
-    try testing.expectEqualStrings("tail2", r.messages[2].content);
+    try testing.expectEqualStrings("head", r.messages[0].flatText());
+    try testing.expectEqualStrings("tail1", r.messages[1].flatText());
+    try testing.expectEqualStrings("tail2", r.messages[2].flatText());
     try testing.expectEqual(@as(usize, 3), r.dropped);
     try testing.expect(std.mem.indexOf(u8, r.hint, "dropped 3") != null);
 }
 
 test "compact: keep_head larger than history is clamped" {
-    const msgs = [_]types.Message{.{ .role = .user, .content = "only" }};
+    const msgs = [_]types.Message{types.Message.literal(.user, "only")};
     const r = try compact(testing.allocator, &msgs, .{ .keep_head = 10, .keep_tail = 10 });
     defer deinitResult(testing.allocator, r);
 

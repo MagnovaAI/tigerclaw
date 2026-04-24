@@ -127,11 +127,11 @@ test "plan: min_system_bytes overridable" {
 
 test "plan: history tail caching falls right after the last cached message" {
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "1" },
-        .{ .role = .assistant, .content = "2" },
-        .{ .role = .user, .content = "3" },
-        .{ .role = .assistant, .content = "4" },
-        .{ .role = .user, .content = "5" },
+        types.Message.literal(.user, "1"),
+        types.Message.literal(.assistant, "2"),
+        types.Message.literal(.user, "3"),
+        types.Message.literal(.assistant, "4"),
+        types.Message.literal(.user, "5"),
     };
     const r = plan(null, &msgs, .{ .history_tail_uncached = 2 });
     try testing.expectEqual(@as(usize, 1), r.len);
@@ -140,7 +140,7 @@ test "plan: history tail caching falls right after the last cached message" {
 }
 
 test "plan: history shorter than tail is left entirely uncached" {
-    const msgs = [_]types.Message{.{ .role = .user, .content = "only" }};
+    const msgs = [_]types.Message{types.Message.literal(.user, "only")};
     const r = plan(null, &msgs, .{ .history_tail_uncached = 5 });
     try testing.expectEqual(@as(usize, 0), r.len);
 }
@@ -148,9 +148,9 @@ test "plan: history shorter than tail is left entirely uncached" {
 test "plan: respects max_breakpoints cap" {
     const long = "x" ** 4096;
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "a" },
-        .{ .role = .user, .content = "b" },
-        .{ .role = .user, .content = "c" },
+        types.Message.literal(.user, "a"),
+        types.Message.literal(.user, "b"),
+        types.Message.literal(.user, "c"),
     };
     const r = plan(long, &msgs, .{ .history_tail_uncached = 1, .max_breakpoints = 1 });
     // Only system_end fits; message_end is dropped.

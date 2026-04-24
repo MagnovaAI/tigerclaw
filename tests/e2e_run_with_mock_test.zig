@@ -50,8 +50,8 @@ test "e2e: run produces a session file and prints the assistant text" {
     defer parsed.deinit();
     try testing.expectEqualStrings("e2e", parsed.value.id);
     try testing.expectEqual(@as(u32, 1), parsed.value.turn_count);
-    try testing.expectEqualStrings("ping", parsed.value.turns[0].user.content);
-    try testing.expectEqualStrings("pong", parsed.value.turns[0].assistant.content);
+    try testing.expectEqualStrings("ping", parsed.value.turns[0].user.flatText());
+    try testing.expectEqualStrings("pong", parsed.value.turns[0].assistant.flatText());
 }
 
 test "e2e: back-to-back runs with resume_if_exists accumulate turns" {
@@ -92,8 +92,8 @@ test "e2e: back-to-back runs with resume_if_exists accumulate turns" {
     const parsed = try tigerclaw.harness.state.parse(testing.allocator, bytes);
     defer parsed.deinit();
     try testing.expectEqual(@as(u32, 3), parsed.value.turn_count);
-    try testing.expectEqualStrings("first", parsed.value.turns[0].assistant.content);
-    try testing.expectEqualStrings("third", parsed.value.turns[2].assistant.content);
+    try testing.expectEqualStrings("first", parsed.value.turns[0].assistant.flatText());
+    try testing.expectEqualStrings("third", parsed.value.turns[2].assistant.flatText());
 }
 
 test "e2e: doctor produces an ok report on a clean install" {

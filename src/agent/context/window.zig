@@ -35,7 +35,7 @@ pub const Window = struct {
     pub fn estimateMessages(self: Window, messages: []const types.Message) u32 {
         _ = self;
         var total: u64 = 0;
-        for (messages) |m| total +|= token_estimator.estimate(m.content);
+        for (messages) |m| total +|= token_estimator.estimate(m.flatText());
         // Saturate to u32 — this is a budget check, not a billing
         // record, so clamping is safer than returning an error.
         return if (total > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(total);
@@ -90,8 +90,8 @@ test "Window.classify: ok/warm/pressure/overflow thresholds" {
 test "Window.estimateMessages: aggregates across messages" {
     const w = Window{ .capacity_tokens = 1_000 };
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "a" ** 100 },
-        .{ .role = .assistant, .content = "b" ** 100 },
+        types.Message.literal(.user, "a" ** 100),
+        types.Message.literal(.assistant, "b" ** 100),
     };
     const est = w.estimateMessages(&msgs);
     // Estimator is ceil(bytes/4) per message → 25 + 25 = 50.

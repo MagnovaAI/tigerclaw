@@ -45,6 +45,19 @@ pub const ResumeError = error{
     UnsupportedSchemaVersion,
 };
 
+/// Return the first text content in a Message's content blocks, or
+/// null if there is none. Sessions persist plain text only, so we
+/// flatten on the read path.
+fn firstText(blocks: []const types.ContentBlock) ?[]const u8 {
+    for (blocks) |b| {
+        switch (b) {
+            .text => |t| return t,
+            else => {},
+        }
+    }
+    return null;
+}
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     clock: clock_mod.Clock,
@@ -102,16 +115,22 @@ pub const Session = struct {
 
         try session.turns.ensureTotalCapacity(allocator, parsed.value.turns.len);
         for (parsed.value.turns) |t| {
-            const user_copy = try allocator.dupe(u8, t.user.content);
-            errdefer allocator.free(user_copy);
-            const assistant_copy = try allocator.dupe(u8, t.assistant.content);
-            errdefer allocator.free(assistant_copy);
+            // Sessions only carry plain-text turns today; any tool
+            // structure travels live through the runner and isn't
+            // persisted via this path. Flatten to single-text
+            // Message values backed by our allocator.
+            const user_text = firstText(t.user.content) orelse "";
+            const assistant_text = firstText(t.assistant.content) orelse "";
+            const user_msg = try types.Message.allocText(allocator, t.user.role, user_text);
+            errdefer user_msg.freeOwned(allocator);
+            const assistant_msg = try types.Message.allocText(allocator, t.assistant.role, assistant_text);
+            errdefer assistant_msg.freeOwned(allocator);
             try session.turns.append(allocator, .{
                 .index = t.index,
                 .started_at_ns = t.started_at_ns,
                 .finished_at_ns = t.finished_at_ns,
-                .user = .{ .role = t.user.role, .content = user_copy },
-                .assistant = .{ .role = t.assistant.role, .content = assistant_copy },
+                .user = user_msg,
+                .assistant = assistant_msg,
             });
         }
         return session;
@@ -119,8 +138,8 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         for (self.turns.items) |t| {
-            self.allocator.free(t.user.content);
-            self.allocator.free(t.assistant.content);
+            t.user.freeOwned(self.allocator);
+            t.assistant.freeOwned(self.allocator);
         }
         self.turns.deinit(self.allocator);
         self.allocator.free(self.id_owned);
@@ -149,17 +168,17 @@ pub const Session = struct {
         const started = now;
         const finished = now;
 
-        const user_copy = try self.allocator.dupe(u8, user_content);
-        errdefer self.allocator.free(user_copy);
-        const assistant_copy = try self.allocator.dupe(u8, assistant_content);
-        errdefer self.allocator.free(assistant_copy);
+        const user_msg = try types.Message.allocText(self.allocator, .user, user_content);
+        errdefer user_msg.freeOwned(self.allocator);
+        const assistant_msg = try types.Message.allocText(self.allocator, .assistant, assistant_content);
+        errdefer assistant_msg.freeOwned(self.allocator);
 
         try self.turns.append(self.allocator, .{
             .index = self.turnCount(),
             .started_at_ns = started,
             .finished_at_ns = finished,
-            .user = .{ .role = .user, .content = user_copy },
-            .assistant = .{ .role = .assistant, .content = assistant_copy },
+            .user = user_msg,
+            .assistant = assistant_msg,
         });
         self.updated_at_ns = now;
     }
@@ -225,8 +244,8 @@ test "Session: appendTurn copies content and advances indexes" {
     try testing.expectEqual(@as(u32, 2), s.turnCount());
     try testing.expectEqual(@as(u32, 0), s.turns.items[0].index);
     try testing.expectEqual(@as(u32, 1), s.turns.items[1].index);
-    try testing.expectEqualStrings("hi", s.turns.items[0].user.content);
-    try testing.expectEqualStrings("still here", s.turns.items[1].assistant.content);
+    try testing.expectEqualStrings("hi", s.turns.items[0].user.flatText());
+    try testing.expectEqualStrings("still here", s.turns.items[1].assistant.flatText());
     try testing.expectEqual(@as(i128, 15), s.updated_at_ns);
 }
 
@@ -247,8 +266,8 @@ test "Session: resumeFromBytes rehydrates prior turns" {
 
     try testing.expectEqualStrings("sess-42", resumed.id());
     try testing.expectEqual(@as(u32, 2), resumed.turnCount());
-    try testing.expectEqualStrings("q1", resumed.turns.items[0].user.content);
-    try testing.expectEqualStrings("a2", resumed.turns.items[1].assistant.content);
+    try testing.expectEqualStrings("q1", resumed.turns.items[0].user.flatText());
+    try testing.expectEqualStrings("a2", resumed.turns.items[1].assistant.flatText());
     try testing.expectEqual(original.created_at_ns, resumed.created_at_ns);
 }
 

@@ -6,6 +6,7 @@
 const std = @import("std");
 
 pub const Content = @import("content.zig").Content;
+pub const ContentBlock = @import("message.zig").ContentBlock;
 pub const LlmResponse = @import("llm_response.zig").LlmResponse;
 pub const Message = @import("message.zig").Message;
 pub const Metadata = @import("metadata.zig").Metadata;

@@ -18,8 +18,8 @@ test "context window: classify thresholds match documented cut-offs" {
 
 test "context window: estimate scales with message content length" {
     const w = context.Window{ .capacity_tokens = 10_000 };
-    const short = [_]types.Message{.{ .role = .user, .content = "hi" }};
-    const long = [_]types.Message{.{ .role = .user, .content = "x" ** 1024 }};
+    const short = [_]types.Message{types.Message.literal(.user, "hi")};
+    const long = [_]types.Message{types.Message.literal(.user, "x" ** 1024)};
     try testing.expect(w.estimateMessages(&long) > w.estimateMessages(&short));
 }
 
@@ -30,8 +30,8 @@ test "context engine: warm history is forwarded without compaction" {
     });
 
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "a" ** 200 },
-        .{ .role = .assistant, .content = "b" ** 200 },
+        types.Message.literal(.user, "a" ** 200),
+        types.Message.literal(.assistant, "b" ** 200),
     };
     var prep = try e.prepareForSend(&msgs);
     defer prep.deinit(testing.allocator);
@@ -48,10 +48,10 @@ test "context engine: overflow compacts and leaves a hint" {
     });
 
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "a" ** 64 },
-        .{ .role = .assistant, .content = "b" ** 64 },
-        .{ .role = .user, .content = "c" ** 64 },
-        .{ .role = .assistant, .content = "d" ** 64 },
+        types.Message.literal(.user, "a" ** 64),
+        types.Message.literal(.assistant, "b" ** 64),
+        types.Message.literal(.user, "c" ** 64),
+        types.Message.literal(.assistant, "d" ** 64),
     };
     var prep = try e.prepareForSend(&msgs);
     defer prep.deinit(testing.allocator);

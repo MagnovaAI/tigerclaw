@@ -509,28 +509,23 @@ pub fn buildRequestBody(
     try stringify.beginArray();
     for (request.messages) |msg| {
         std.debug.assert(msg.role != .system);
-        // Anthropic rejects empty text content blocks with
-        // `messages: text content blocks must be non-empty` (HTTP
-        // 400). Skip any message whose content is the empty
-        // string — those arise when a model reply contains only a
-        // tool_use block and the runner later appends the empty
-        // `resp.text` as an assistant message.
+        // Skip messages whose content array is empty — Anthropic
+        // rejects messages with no content blocks (`messages.N.content:
+        // List should have at least 1 item`). Also skip messages whose
+        // only block(s) are empty text — Anthropic rejects empty text
+        // blocks with `messages: text content blocks must be non-empty`.
         if (msg.content.len == 0) continue;
+        if (allBlocksEmpty(msg.content)) continue;
+
         try stringify.beginObject();
         try stringify.objectField("role");
-        switch (msg.role) {
-            .user, .tool => try stringify.write("user"),
-            .assistant => try stringify.write("assistant"),
-            .system => unreachable,
-        }
+        try stringify.write(@tagName(msg.role));
+
         try stringify.objectField("content");
         try stringify.beginArray();
-        try stringify.beginObject();
-        try stringify.objectField("type");
-        try stringify.write("text");
-        try stringify.objectField("text");
-        try stringify.write(msg.content);
-        try stringify.endObject();
+        for (msg.content) |block| {
+            try writeContentBlock(allocator, &stringify, block);
+        }
         try stringify.endArray();
         try stringify.endObject();
     }
@@ -572,6 +567,89 @@ pub fn buildRequestBody(
     try stringify.endObject();
 
     return aw.toOwnedSlice();
+}
+
+/// True when every text block in `blocks` is empty AND there are no
+/// non-text blocks. Used to skip wholly-empty messages — Anthropic
+/// rejects them with `text content blocks must be non-empty`.
+fn allBlocksEmpty(blocks: []const types.ContentBlock) bool {
+    for (blocks) |b| {
+        switch (b) {
+            .text => |t| if (t.len > 0) return false,
+            .tool_use, .tool_result => return false,
+        }
+    }
+    return true;
+}
+
+/// Serialize one ContentBlock as the matching Anthropic API JSON
+/// object: `{type:"text",text:...}`, `{type:"tool_use",id,name,input}`,
+/// or `{type:"tool_result",tool_use_id,content,is_error}`.
+fn writeContentBlock(
+    allocator: std.mem.Allocator,
+    s: *std.json.Stringify,
+    block: types.ContentBlock,
+) !void {
+    switch (block) {
+        .text => |t| {
+            // Skip empty text blocks — Anthropic 400s on them. The
+            // caller pre-filters wholly-empty messages, but a mixed
+            // message can still carry an empty text block alongside
+            // a tool_use; drop just that block.
+            if (t.len == 0) return;
+            try s.beginObject();
+            try s.objectField("type");
+            try s.write("text");
+            try s.objectField("text");
+            try s.write(t);
+            try s.endObject();
+        },
+        .tool_use => |tu| {
+            try s.beginObject();
+            try s.objectField("type");
+            try s.write("tool_use");
+            try s.objectField("id");
+            try s.write(tu.id);
+            try s.objectField("name");
+            try s.write(tu.name);
+            try s.objectField("input");
+            // `input_json` is already-encoded JSON. Round-trip it
+            // through `std.json.Value` so the Stringify state machine
+            // sees a single value and emits it correctly nested.
+            // Anthropic requires `input` to be an object — empty args
+            // serialize as `"{}"` which becomes `{}`.
+            var parsed = std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                if (tu.input_json.len == 0) "{}" else tu.input_json,
+                .{},
+            ) catch {
+                // Malformed JSON — fall back to empty object so the
+                // request still validates. Beats throwing a parse error
+                // mid-serialization.
+                try s.write(std.json.Value{ .object = .{} });
+                try s.endObject();
+                return;
+            };
+            defer parsed.deinit();
+            try s.write(parsed.value);
+            try s.endObject();
+        },
+        .tool_result => |tr| {
+            try s.beginObject();
+            try s.objectField("type");
+            try s.write("tool_result");
+            try s.objectField("tool_use_id");
+            try s.write(tr.tool_use_id);
+            try s.objectField("content");
+            try s.write(tr.content);
+            if (tr.is_error) {
+                try s.objectField("is_error");
+                try s.write(true);
+            }
+            try s.endObject();
+        },
+    }
 }
 
 fn refusal(
@@ -771,7 +849,7 @@ test "anthropic: supportsNativeTools is true" {
 
 test "anthropic: buildRequestBody renders canonical wire shape" {
     const messages = [_]types.Message{
-        .{ .role = .user, .content = "hi there" },
+        types.Message.literal(.user, "hi there"),
     };
     const req: ChatRequest = .{
         .messages = &messages,
@@ -801,7 +879,7 @@ test "scenario: buildRequestBody with tools parses as valid JSON and matches the
     // schema, stray fields) reads as a 400 against production;
     // catching it in-process saves a real round-trip.
     const messages = [_]types.Message{
-        .{ .role = .user, .content = "what time is it" },
+        types.Message.literal(.user, "what time is it"),
     };
     const tools = [_]types.Tool{
         .{
@@ -867,7 +945,7 @@ test "scenario: buildRequestBody with no tools omits the field entirely" {
     // A request without tools must not emit an empty `tools: []`
     // either — some Anthropic models 400 on the empty-array form.
     const messages = [_]types.Message{
-        .{ .role = .user, .content = "hi" },
+        types.Message.literal(.user, "hi"),
     };
     const req: ChatRequest = .{
         .messages = &messages,
@@ -888,10 +966,14 @@ test "scenario: buildRequestBody drops empty messages (anthropic 400s on empty t
     // The runner can end up with an empty assistant message when a
     // model returns only a tool_use block. The wire layer must
     // filter those out rather than forward them.
+    const tool_result_blocks = [_]types.ContentBlock{.{ .tool_result = .{
+        .tool_use_id = "toolu_1",
+        .content = "2026-04-23T23:45:12Z",
+    } }};
     const messages = [_]types.Message{
-        .{ .role = .user, .content = "hi" },
-        .{ .role = .assistant, .content = "" }, // tool-only reply
-        .{ .role = .tool, .content = "2026-04-23T23:45:12Z" },
+        types.Message.literal(.user, "hi"),
+        types.Message.literal(.assistant, ""), // tool-only reply, gets filtered
+        .{ .role = .user, .content = &tool_result_blocks },
     };
     const req: ChatRequest = .{
         .messages = &messages,
@@ -907,18 +989,28 @@ test "scenario: buildRequestBody drops empty messages (anthropic 400s on empty t
     // Only the two non-empty messages survive.
     try testing.expectEqual(@as(usize, 2), msgs.array.items.len);
     try testing.expectEqualStrings("hi", msgs.array.items[0].object.get("content").?.array.items[0].object.get("text").?.string);
-    try testing.expectEqualStrings("2026-04-23T23:45:12Z", msgs.array.items[1].object.get("content").?.array.items[0].object.get("text").?.string);
+    try testing.expectEqualStrings("tool_result", msgs.array.items[1].object.get("content").?.array.items[0].object.get("type").?.string);
+    try testing.expectEqualStrings("2026-04-23T23:45:12Z", msgs.array.items[1].object.get("content").?.array.items[0].object.get("content").?.string);
 }
 
-test "scenario: multi-turn body with assistant + tool role messages parses cleanly" {
-    // Mirrors the state after the runner has ingested a user prompt,
-    // an assistant tool_use marker, and a tool result. The body
-    // must remain valid JSON; every message must be a typed-content
-    // block object regardless of role.
+test "scenario: multi-turn body with structured tool_use and tool_result blocks" {
+    // Mirrors the post-tool-call transcript shape: user prompt,
+    // assistant message containing a tool_use block, then a user
+    // message containing a tool_result block referencing the same
+    // id. Every message serializes as Anthropic's typed-block JSON.
+    const assistant_blocks = [_]types.ContentBlock{.{ .tool_use = .{
+        .id = "toolu_1",
+        .name = "get_current_time",
+        .input_json = "{}",
+    } }};
+    const tool_result_blocks = [_]types.ContentBlock{.{ .tool_result = .{
+        .tool_use_id = "toolu_1",
+        .content = "2026-04-23T23:45:12Z",
+    } }};
     const messages = [_]types.Message{
-        .{ .role = .user, .content = "what time is it" },
-        .{ .role = .assistant, .content = "[tool_call toolu_1 get_current_time({})]" },
-        .{ .role = .tool, .content = "2026-04-23T23:45:12Z" },
+        types.Message.literal(.user, "what time is it"),
+        .{ .role = .assistant, .content = &assistant_blocks },
+        .{ .role = .user, .content = &tool_result_blocks },
     };
     const req: ChatRequest = .{
         .messages = &messages,
@@ -933,11 +1025,23 @@ test "scenario: multi-turn body with assistant + tool role messages parses clean
     const msgs = parsed.value.object.get("messages").?;
     try testing.expectEqual(@as(usize, 3), msgs.array.items.len);
 
-    // All roles legal at the Anthropic layer are either "user" or
-    // "assistant"; the provider collapses `.tool` to `"user"` today.
+    // Roles preserved as-is — `.tool` is no longer a wire role.
     try testing.expectEqualStrings("user", msgs.array.items[0].object.get("role").?.string);
     try testing.expectEqualStrings("assistant", msgs.array.items[1].object.get("role").?.string);
     try testing.expectEqualStrings("user", msgs.array.items[2].object.get("role").?.string);
+
+    // Verify the assistant message contains a tool_use block with
+    // the right id/name and the user message contains a matching
+    // tool_result block.
+    const asst_block = msgs.array.items[1].object.get("content").?.array.items[0].object;
+    try testing.expectEqualStrings("tool_use", asst_block.get("type").?.string);
+    try testing.expectEqualStrings("toolu_1", asst_block.get("id").?.string);
+    try testing.expectEqualStrings("get_current_time", asst_block.get("name").?.string);
+
+    const tr_block = msgs.array.items[2].object.get("content").?.array.items[0].object;
+    try testing.expectEqualStrings("tool_result", tr_block.get("type").?.string);
+    try testing.expectEqualStrings("toolu_1", tr_block.get("tool_use_id").?.string);
+    try testing.expectEqualStrings("2026-04-23T23:45:12Z", tr_block.get("content").?.string);
 }
 
 test "anthropic: parseStream captures a tool_use block as a ToolCall" {
@@ -1000,7 +1104,7 @@ test "anthropic: http error path surfaces refusal" {
     const provider = p.provider();
 
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "hello" },
+        types.Message.literal(.user, "hello"),
     };
     const resp = try provider.chat(testing.allocator, .{
         .messages = &msgs,

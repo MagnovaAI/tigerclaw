@@ -45,8 +45,8 @@ const testing = std.testing;
 
 test "build: passes through system, history, and knobs unchanged" {
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "hi" },
-        .{ .role = .assistant, .content = "hello" },
+        types.Message.literal(.user, "hi"),
+        types.Message.literal(.assistant, "hello"),
     };
     const req = build(.{
         .system = "you are helpful",

@@ -96,11 +96,11 @@ test "react loop: tool use then final answer closes in two iterations" {
     const h = a.history();
     try testing.expectEqual(@as(usize, 3), h.len);
     try testing.expectEqual(types.Role.user, h[0].role);
-    try testing.expectEqualStrings("q", h[0].content);
-    try testing.expectEqual(types.Role.tool, h[1].role);
-    try testing.expectEqualStrings("ok:tool-result", h[1].content);
+    try testing.expectEqualStrings("q", h[0].flatText());
+    try testing.expectEqual(types.Role.user, h[1].role);
+    try testing.expectEqualStrings("ok:tool-result", h[1].flatText());
     try testing.expectEqual(types.Role.assistant, h[2].role);
-    try testing.expectEqualStrings("final", h[2].content);
+    try testing.expectEqualStrings("final", h[2].flatText());
 }
 
 test "react loop: iteration cap halts a runaway model" {
@@ -175,6 +175,6 @@ test "react loop: multiple tool calls in one turn all land in the transcript" {
     const h = a.history();
     // user, tool(first), tool(second), assistant(ok)
     try testing.expectEqual(@as(usize, 4), h.len);
-    try testing.expectEqualStrings("ok:first", h[1].content);
-    try testing.expectEqualStrings("ok:second", h[2].content);
+    try testing.expectEqualStrings("ok:first", h[1].flatText());
+    try testing.expectEqualStrings("ok:second", h[2].flatText());
 }

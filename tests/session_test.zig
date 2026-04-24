@@ -82,5 +82,5 @@ test "session: snapshot reflects live turns without copying" {
     try testing.expectEqual(@as(u32, 1), snap.turn_count);
     try testing.expectEqual(state_mod.schema_version, snap.schema_version);
     try testing.expectEqual(@as(usize, 1), snap.turns.len);
-    try testing.expectEqualStrings("a", snap.turns[0].user.content);
+    try testing.expectEqualStrings("a", snap.turns[0].user.flatText());
 }

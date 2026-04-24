@@ -27,21 +27,24 @@ pub const AgentState = struct {
     }
 
     pub fn deinit(self: *AgentState) void {
-        for (self.messages.items) |m| self.allocator.free(m.content);
+        for (self.messages.items) |m| m.freeOwned(self.allocator);
         self.messages.deinit(self.allocator);
         self.* = undefined;
     }
 
     /// Append a message, copying its content into the state's
-    /// allocator. Returns the index of the new message.
+    /// allocator. Returns the index of the new message. The content
+    /// is wrapped in a single text block — agent.Agent only stores
+    /// plain text turns; structured tool flows live on the
+    /// LiveAgentRunner side.
     pub fn pushMessage(
         self: *AgentState,
         role: types.Role,
         content: []const u8,
     ) !usize {
-        const copy = try self.allocator.dupe(u8, content);
-        errdefer self.allocator.free(copy);
-        try self.messages.append(self.allocator, .{ .role = role, .content = copy });
+        const msg = try types.Message.allocText(self.allocator, role, content);
+        errdefer msg.freeOwned(self.allocator);
+        try self.messages.append(self.allocator, msg);
         return self.messages.items.len - 1;
     }
 
@@ -53,10 +56,13 @@ pub const AgentState = struct {
         return self.pushMessage(.assistant, content);
     }
 
-    /// Append a tool-result message. The payload is the rendered
-    /// outcome string the provider will see on the next turn.
+    /// Append a tool-result message. With the wire-Role refactor,
+    /// `tool` is no longer a wire role — tool results ride on user
+    /// messages via tool_result content blocks. agent.Agent doesn't
+    /// build structured tool flows yet, so we collapse to user-text
+    /// for now (same flat-string treatment as before).
     pub fn pushTool(self: *AgentState, content: []const u8) !usize {
-        return self.pushMessage(.tool, content);
+        return self.pushMessage(.user, content);
     }
 
     pub fn history(self: *const AgentState) []const types.Message {
@@ -94,8 +100,9 @@ test "AgentState: push round-trips role and content" {
     const h = s.history();
     try testing.expectEqual(@as(usize, 3), h.len);
     try testing.expectEqual(types.Role.user, h[0].role);
-    try testing.expectEqualStrings("hi", h[0].content);
-    try testing.expectEqual(types.Role.tool, h[2].role);
+    try testing.expectEqualStrings("hi", h[0].flatText());
+    // pushTool now collapses to user role since tool isn't a wire role anymore.
+    try testing.expectEqual(types.Role.user, h[2].role);
 }
 
 test "AgentState: pushed strings are independent copies" {
@@ -106,7 +113,7 @@ test "AgentState: pushed strings are independent copies" {
     _ = try s.pushUser(&buf);
     buf[0] = 'X'; // mutate the caller's buffer
 
-    try testing.expectEqualStrings("abc", s.history()[0].content);
+    try testing.expectEqualStrings("abc", s.history()[0].flatText());
 }
 
 test "AgentState: iteration counter bumps and resets" {

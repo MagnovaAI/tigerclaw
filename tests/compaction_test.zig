@@ -9,8 +9,8 @@ const types = tigerclaw.types;
 
 test "compaction: histories within head+tail are forwarded untouched" {
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "a" },
-        .{ .role = .assistant, .content = "b" },
+        types.Message.literal(.user, "a"),
+        types.Message.literal(.assistant, "b"),
     };
     const r = try compaction.compact(testing.allocator, &msgs, .{ .keep_head = 1, .keep_tail = 4 });
     defer compaction.deinitResult(testing.allocator, r);
@@ -22,26 +22,26 @@ test "compaction: histories within head+tail are forwarded untouched" {
 
 test "compaction: middle is dropped when history is longer than head+tail" {
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "start" },
-        .{ .role = .user, .content = "x1" },
-        .{ .role = .user, .content = "x2" },
-        .{ .role = .user, .content = "x3" },
-        .{ .role = .user, .content = "tail1" },
-        .{ .role = .user, .content = "tail2" },
+        types.Message.literal(.user, "start"),
+        types.Message.literal(.user, "x1"),
+        types.Message.literal(.user, "x2"),
+        types.Message.literal(.user, "x3"),
+        types.Message.literal(.user, "tail1"),
+        types.Message.literal(.user, "tail2"),
     };
     const r = try compaction.compact(testing.allocator, &msgs, .{ .keep_head = 1, .keep_tail = 2 });
     defer compaction.deinitResult(testing.allocator, r);
 
     try testing.expectEqual(@as(usize, 3), r.messages.len);
-    try testing.expectEqualStrings("start", r.messages[0].content);
-    try testing.expectEqualStrings("tail1", r.messages[1].content);
-    try testing.expectEqualStrings("tail2", r.messages[2].content);
+    try testing.expectEqualStrings("start", r.messages[0].flatText());
+    try testing.expectEqualStrings("tail1", r.messages[1].flatText());
+    try testing.expectEqualStrings("tail2", r.messages[2].flatText());
     try testing.expectEqual(@as(usize, 3), r.dropped);
     try testing.expect(std.mem.indexOf(u8, r.hint, "dropped 3") != null);
 }
 
 test "compaction: head oversize is clamped to history length" {
-    const msgs = [_]types.Message{.{ .role = .user, .content = "solo" }};
+    const msgs = [_]types.Message{types.Message.literal(.user, "solo")};
     const r = try compaction.compact(testing.allocator, &msgs, .{ .keep_head = 10, .keep_tail = 10 });
     defer compaction.deinitResult(testing.allocator, r);
     try testing.expectEqual(@as(usize, 1), r.messages.len);
@@ -49,14 +49,24 @@ test "compaction: head oversize is clamped to history length" {
 }
 
 test "compaction: output messages are independent copies of the inputs" {
-    var user_buf = [_]u8{ 'h', 'e', 'y' };
+    // Build the head message with an owned, mutable backing buffer
+    // so we can prove `compact` duplicates rather than aliases.
+    const head = try types.Message.allocText(testing.allocator, .user, "hey");
+    defer head.freeOwned(testing.allocator);
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = &user_buf },
-        .{ .role = .assistant, .content = "fine" },
-        .{ .role = .user, .content = "tail" },
+        head,
+        types.Message.literal(.assistant, "fine"),
+        types.Message.literal(.user, "tail"),
     };
     const r = try compaction.compact(testing.allocator, &msgs, .{ .keep_head = 1, .keep_tail = 1 });
     defer compaction.deinitResult(testing.allocator, r);
-    user_buf[0] = 'X';
-    try testing.expectEqualStrings("hey", r.messages[0].content);
+
+    // Mutate the original head's first text byte. If `compact`
+    // aliased the slice the assertion below would fail.
+    const head_text_block = &@constCast(head.content)[0];
+    switch (head_text_block.*) {
+        .text => |t| @constCast(t)[0] = 'X',
+        else => unreachable,
+    }
+    try testing.expectEqualStrings("hey", r.messages[0].flatText());
 }

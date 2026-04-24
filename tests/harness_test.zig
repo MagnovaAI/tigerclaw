@@ -47,8 +47,8 @@ test "harness: two independent harnesses share state via the state dir" {
         var resumed = try h.resumeSession("shared-1");
         defer resumed.deinit();
         try testing.expectEqual(@as(u32, 2), resumed.turnCount());
-        try testing.expectEqualStrings("pong", resumed.turns.items[0].assistant.content);
-        try testing.expectEqualStrings("yes", resumed.turns.items[1].assistant.content);
+        try testing.expectEqualStrings("pong", resumed.turns.items[0].assistant.flatText());
+        try testing.expectEqualStrings("yes", resumed.turns.items[1].assistant.flatText());
     }
 }
 
@@ -111,7 +111,7 @@ test "harness: append after resume extends the stored history" {
         var s = try h.resumeSession("grow");
         defer s.deinit();
         try testing.expectEqual(@as(u32, 2), s.turnCount());
-        try testing.expectEqualStrings("1", s.turns.items[0].assistant.content);
-        try testing.expectEqualStrings("2", s.turns.items[1].assistant.content);
+        try testing.expectEqualStrings("1", s.turns.items[0].assistant.flatText());
+        try testing.expectEqualStrings("2", s.turns.items[1].assistant.flatText());
     }
 }

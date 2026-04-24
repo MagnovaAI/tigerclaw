@@ -344,25 +344,33 @@ pub const LiveAgentRunner = struct {
         ) catch return error.InternalError;
         defer self.context_engine.freeAssembleResult(assembled);
 
-        // The messages list owns every `content` slice. We dup
-        // assembled section content (which `assembled` would free
-        // via freeAssembleResult — but we'd then be reading freed
-        // memory if we held borrowed slices past assemble teardown)
-        // and we'll dup tool/assistant results we append in-loop so
-        // the same ownership rule holds on every entry.
+        // The messages list owns every Message — including its
+        // content blocks and the inner slices each block points at.
+        // `Message.freeOwned` walks the union and frees each variant
+        // appropriately. The context-engine sections are flat-string
+        // borrows that we copy into owned text blocks below; in-loop
+        // appends (assistant text, tool_use, tool_result) likewise
+        // own everything they hold.
         var messages: std.ArrayList(types.Message) = .empty;
         defer {
-            for (messages.items) |m| self.allocator.free(m.content);
+            for (messages.items) |m| m.freeOwned(self.allocator);
             messages.deinit(self.allocator);
         }
         for (assembled.sections) |section| {
             // `current_prompt` duplicates the user message we just
             // ingested; skip it rather than send the same text twice.
             if (section.kind == .current_prompt) continue;
-            try messages.append(self.allocator, .{
-                .role = mapRole(section.role),
-                .content = try self.allocator.dupe(u8, section.content),
-            });
+            // The context engine stores history as flat strings (text
+            // only). Wrap each section in a single text block until
+            // the engine learns to persist structured content.
+            // History replay therefore loses tool_use/tool_result
+            // structure — the model only sees a serialized text
+            // marker. Fixing this is the next refactor phase.
+            try messages.append(self.allocator, try types.Message.allocText(
+                self.allocator,
+                mapRole(section.role),
+                section.content,
+            ));
         }
 
         // Dispatch loop: the model may answer with tool_use instead of
@@ -439,24 +447,53 @@ pub const LiveAgentRunner = struct {
                 break;
             }
 
-            // Execute each tool, ingest the result as a tool-role
-            // message, and feed it back on the next round via the
-            // assembled messages slice. Safe `append` — the
-            // pre-call `ensureTotalCapacity` was removed; the
-            // ArrayList grows on demand for the tool-use turn.
-            // Dupe before appending — `text` is a borrowed slice into
-            // `resp`, which `defer resp.deinit` frees at the end of
-            // this iteration. Without the copy the slice points at
-            // poisoned memory (0xAA fill) on the next provider call,
-            // and the JSON serializer emits it as a byte array
-            // instead of a string. Anthropic 400s with
-            // `messages.N.content.0.text.text: Input should be a
-            // valid string`.
-            try messages.append(self.allocator, .{
-                .role = .assistant,
-                .content = try self.allocator.dupe(u8, text),
-            });
-            for (resp.tool_calls) |tc| {
+            // Build the assistant message with structured content:
+            // an optional leading text block (when the model spoke
+            // before the tool call), followed by one tool_use block
+            // per call. Then dispatch each tool, build a single
+            // user message holding all tool_result blocks, and
+            // append both messages so the next provider iteration
+            // sees the proper transcript shape.
+            //
+            // Tool ids correlate `tool_use` and `tool_result` blocks
+            // — Anthropic 400s if a tool_result references an id
+            // that didn't appear in the preceding assistant
+            // message's tool_use blocks.
+            {
+                const has_text = text.len > 0;
+                const block_count = (if (has_text) @as(usize, 1) else 0) + resp.tool_calls.len;
+                const blocks = try self.allocator.alloc(types.ContentBlock, block_count);
+                errdefer self.allocator.free(blocks);
+
+                var bi: usize = 0;
+                if (has_text) {
+                    blocks[bi] = .{ .text = try self.allocator.dupe(u8, text) };
+                    bi += 1;
+                }
+                for (resp.tool_calls) |tc| {
+                    blocks[bi] = .{ .tool_use = .{
+                        .id = try self.allocator.dupe(u8, tc.id),
+                        .name = try self.allocator.dupe(u8, tc.name),
+                        .input_json = try self.allocator.dupe(u8, tc.arguments_json),
+                    } };
+                    bi += 1;
+                }
+                try messages.append(self.allocator, .{
+                    .role = .assistant,
+                    .content = blocks,
+                });
+            }
+
+            // Execute each tool and build the matching user message
+            // carrying tool_result blocks. We dispatch all tools
+            // first, collect the result text for each, then assemble
+            // one user message with N tool_result blocks. Anthropic
+            // expects the tool_result(s) to ride on a single user
+            // turn following the assistant's tool_use turn.
+            const result_blocks = try self.allocator.alloc(types.ContentBlock, resp.tool_calls.len);
+            errdefer self.allocator.free(result_blocks);
+
+            for (resp.tool_calls, 0..) |tc, idx| {
                 // Fire a `.started` event before dispatch so the TUI
                 // can render a pending tool line. The runner never
                 // sees the sink output; it's a side channel for the
@@ -464,6 +501,7 @@ pub const LiveAgentRunner = struct {
                 if (req.tool_event_sink) |s| {
                     s(req.tool_event_sink_ctx, .started, tc.id, tc.name, "");
                 }
+                var tool_failed = false;
                 const result_text = dispatchBuiltinTool(
                     self.allocator,
                     self.io,
@@ -472,17 +510,21 @@ pub const LiveAgentRunner = struct {
                     tc.name,
                     tc.arguments_json,
                 ) catch |e| blk: {
+                    tool_failed = true;
                     break :blk std.fmt.allocPrint(
                         self.allocator,
                         "tool {s} failed: {s}",
                         .{ tc.name, @errorName(e) },
                     ) catch return error.OutOfMemory;
                 };
-                defer self.allocator.free(result_text);
                 if (req.tool_event_sink) |s| {
                     s(req.tool_event_sink_ctx, .finished, tc.id, tc.name, result_text);
                 }
 
+                // Persist the result in the context engine for
+                // future-turn replay. The engine still stores flat
+                // strings; we lose the structured tool_use_id link
+                // until the engine learns structured persistence.
                 const tool_msg_id = try self.nextMessageId();
                 defer self.allocator.free(tool_msg_id);
                 _ = self.context_engine.engine().vtable.ingest(
@@ -491,20 +533,27 @@ pub const LiveAgentRunner = struct {
                     .{
                         .session_id = req.session_id,
                         .message_id = tool_msg_id,
-                        .role = .tool,
+                        .role = .user,
                         .content = result_text,
                     },
                 ) catch return error.InternalError;
 
-                // Append to the in-flight message list too — the next
-                // `chat()` call sends whatever this slice contains,
-                // without re-running assemble. That keeps tool round
-                // trips inside one turn.
-                try messages.append(self.allocator, .{
-                    .role = .tool,
-                    .content = try self.allocator.dupe(u8, result_text),
-                });
+                // The block takes ownership of result_text and the
+                // duped tool_use_id. Don't free result_text here —
+                // it's now owned by the block, which will be freed
+                // by `Message.freeOwned` when the messages list
+                // tears down.
+                result_blocks[idx] = .{ .tool_result = .{
+                    .tool_use_id = try self.allocator.dupe(u8, tc.id),
+                    .content = result_text,
+                    .is_error = tool_failed,
+                } };
             }
+
+            try messages.append(self.allocator, .{
+                .role = .user,
+                .content = result_blocks,
+            });
         }
 
         // The loop exited via the no-tool-calls break, but the
@@ -534,14 +583,18 @@ pub const LiveAgentRunner = struct {
         return std.fmt.allocPrint(self.allocator, "msg-{d}", .{id});
     }
 
-    /// Map context-engine Role to the LLM message Role. They are
-    /// nominally identical but compile-time separate types.
+    /// Map context-engine Role to the LLM wire Role. The engine
+    /// has a `.tool` category for past tool results (still stored
+    /// as flat strings); on replay we collapse it to `.user`
+    /// because the wire shape no longer has a tool role — tool
+    /// results live as `tool_result` content blocks on user
+    /// messages. Until the engine learns structured persistence
+    /// the model sees tool results as plain user-role text.
     fn mapRole(r: context_root.types.Role) types.Role {
         return switch (r) {
             .system => .system,
-            .user => .user,
+            .user, .tool => .user,
             .assistant => .assistant,
-            .tool => .tool,
         };
     }
 };

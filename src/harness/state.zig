@@ -96,8 +96,8 @@ test "State: JSON roundtrip preserves identity and turns" {
             .index = 0,
             .started_at_ns = 100,
             .finished_at_ns = 200,
-            .user = .{ .role = .user, .content = "ping" },
-            .assistant = .{ .role = .assistant, .content = "pong" },
+            .user = types.Message.literal(.user, "ping"),
+            .assistant = types.Message.literal(.assistant, "pong"),
         },
     };
     const original = State{
@@ -118,8 +118,8 @@ test "State: JSON roundtrip preserves identity and turns" {
     try testing.expectEqualStrings("session-abc", parsed.value.id);
     try testing.expectEqual(@as(u32, 1), parsed.value.turn_count);
     try testing.expectEqual(@as(usize, 1), parsed.value.turns.len);
-    try testing.expectEqualStrings("ping", parsed.value.turns[0].user.content);
-    try testing.expectEqualStrings("pong", parsed.value.turns[0].assistant.content);
+    try testing.expectEqualStrings("ping", parsed.value.turns[0].user.flatText());
+    try testing.expectEqualStrings("pong", parsed.value.turns[0].assistant.flatText());
 }
 
 test "State: unknown fields are ignored on load" {

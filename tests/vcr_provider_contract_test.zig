@@ -66,7 +66,7 @@ fn runReplay(kind: ProviderKind, cassette_bytes: []const u8) !void {
     // first interaction is what the provider would consume.
     const recorded = cs.interactions[0].response.body;
 
-    const msgs = [_]tigerclaw.types.Message{.{ .role = .user, .content = "hi" }};
+    const msgs = [_]tigerclaw.types.Message{tigerclaw.types.Message.literal(.user, "hi")};
     const req: llm.provider.ChatRequest = .{
         .messages = &msgs,
         .model = .{ .provider = backendName(kind), .model = "0" },

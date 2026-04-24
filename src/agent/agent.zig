@@ -89,6 +89,6 @@ test "Agent: runTurn drives the loop and appends to the transcript" {
     const h = agent.history();
     try testing.expectEqual(@as(usize, 2), h.len);
     try testing.expectEqual(types.Role.user, h[0].role);
-    try testing.expectEqualStrings("hello", h[0].content);
+    try testing.expectEqualStrings("hello", h[0].flatText());
     try testing.expectEqual(types.Role.assistant, h[1].role);
 }

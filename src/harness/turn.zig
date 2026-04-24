@@ -33,8 +33,8 @@ test "Turn: JSON roundtrip preserves ordering and roles" {
         .index = 3,
         .started_at_ns = 10,
         .finished_at_ns = 20,
-        .user = .{ .role = .user, .content = "hi" },
-        .assistant = .{ .role = .assistant, .content = "hello" },
+        .user = types.Message.literal(.user, "hi"),
+        .assistant = types.Message.literal(.assistant, "hello"),
     };
 
     const bytes = try std.json.Stringify.valueAlloc(testing.allocator, t, .{});
@@ -48,6 +48,6 @@ test "Turn: JSON roundtrip preserves ordering and roles" {
     try testing.expectEqual(@as(i128, 20), parsed.value.finished_at_ns);
     try testing.expectEqual(types.Role.user, parsed.value.user.role);
     try testing.expectEqual(types.Role.assistant, parsed.value.assistant.role);
-    try testing.expectEqualStrings("hi", parsed.value.user.content);
-    try testing.expectEqualStrings("hello", parsed.value.assistant.content);
+    try testing.expectEqualStrings("hi", parsed.value.user.flatText());
+    try testing.expectEqualStrings("hello", parsed.value.assistant.flatText());
 }

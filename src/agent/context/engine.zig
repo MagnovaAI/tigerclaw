@@ -29,7 +29,7 @@ pub const Prepared = struct {
     feedback: feedback_mod.Record,
 
     pub fn deinit(self: *Prepared, allocator: std.mem.Allocator) void {
-        for (self.messages) |m| allocator.free(m.content);
+        for (self.messages) |m| m.freeOwned(allocator);
         allocator.free(self.messages);
         allocator.free(self.hint);
     }
@@ -96,10 +96,9 @@ fn copyMessages(allocator: std.mem.Allocator, src: []const types.Message) ![]typ
     const out = try allocator.alloc(types.Message, src.len);
     errdefer allocator.free(out);
     var written: usize = 0;
-    errdefer for (out[0..written]) |m| allocator.free(m.content);
+    errdefer for (out[0..written]) |m| m.freeOwned(allocator);
     for (src) |m| {
-        const copy = try allocator.dupe(u8, m.content);
-        out[written] = .{ .role = m.role, .content = copy };
+        out[written] = try types.Message.allocText(allocator, m.role, m.flatText());
         written += 1;
     }
     return out;
@@ -116,8 +115,8 @@ test "Engine: ok status keeps history intact" {
     });
 
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "hi" },
-        .{ .role = .assistant, .content = "hello" },
+        types.Message.literal(.user, "hi"),
+        types.Message.literal(.assistant, "hello"),
     };
     var prep = try e.prepareForSend(&msgs);
     defer prep.deinit(testing.allocator);
@@ -136,10 +135,10 @@ test "Engine: pressure triggers compaction" {
     });
 
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "abcdefghijklmnop" },
-        .{ .role = .assistant, .content = "qrstuvwxyzabcdef" },
-        .{ .role = .user, .content = "ghijklmnopqrstuv" },
-        .{ .role = .assistant, .content = "wxyzabcdefghijkl" },
+        types.Message.literal(.user, "abcdefghijklmnop"),
+        types.Message.literal(.assistant, "qrstuvwxyzabcdef"),
+        types.Message.literal(.user, "ghijklmnopqrstuv"),
+        types.Message.literal(.assistant, "wxyzabcdefghijkl"),
     };
     var prep = try e.prepareForSend(&msgs);
     defer prep.deinit(testing.allocator);

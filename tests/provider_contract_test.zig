@@ -39,7 +39,7 @@ fn assertName(provider: llm.Provider, hooks: Hooks) !void {
 
 fn assertFirstCallRoundtrips(provider: llm.Provider, hooks: Hooks) !void {
     hooks.reset();
-    const msgs = [_]tigerclaw.types.Message{.{ .role = .user, .content = "hi" }};
+    const msgs = [_]tigerclaw.types.Message{tigerclaw.types.Message.literal(.user, "hi")};
     const resp = try provider.chat(testing.allocator, .{
         .messages = &msgs,
         .model = .{ .provider = hooks.backend_name, .model = "0" },
@@ -54,7 +54,7 @@ fn assertTextIsCallerOwned(provider: llm.Provider, hooks: Hooks) !void {
     // The contract says callers own the returned text. We verify by
     // freeing from the caller allocator without a double-free.
     hooks.reset();
-    const msgs = [_]tigerclaw.types.Message{.{ .role = .user, .content = "hi" }};
+    const msgs = [_]tigerclaw.types.Message{tigerclaw.types.Message.literal(.user, "hi")};
     const resp = try provider.chat(testing.allocator, .{
         .messages = &msgs,
         .model = .{ .provider = hooks.backend_name, .model = "0" },

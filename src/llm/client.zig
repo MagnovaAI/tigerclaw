@@ -24,7 +24,7 @@ pub const Client = struct {
         _ = self;
         var est: u64 = 0;
         if (request.system) |sys| est += token_estimator.estimate(sys);
-        for (request.messages) |m| est += token_estimator.estimate(m.content);
+        for (request.messages) |m| est += token_estimator.estimate(m.flatText());
         return @intCast(@min(est, std.math.maxInt(u32)));
     }
 
@@ -97,7 +97,7 @@ test "Client.estimateRequest: counts system + messages" {
     const client = Client.init(impl.provider());
 
     // 4 bytes per token; system=8 ⇒ 2 tokens, msg=12 ⇒ 3 tokens → total 5.
-    const msgs = [_]types.Message{.{ .role = .user, .content = "hello world!" }};
+    const msgs = [_]types.Message{types.Message.literal(.user, "hello world!")};
     const est = client.estimateRequest(.{
         .system = "sysprmpt",
         .messages = &msgs,

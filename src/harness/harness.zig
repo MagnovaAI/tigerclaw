@@ -121,7 +121,7 @@ test "Harness: start + save + resume roundtrip" {
     defer resumed.deinit();
     try testing.expectEqualStrings("abc", resumed.id());
     try testing.expectEqual(@as(u32, 1), resumed.turnCount());
-    try testing.expectEqualStrings("hello", resumed.turns.items[0].assistant.content);
+    try testing.expectEqualStrings("hello", resumed.turns.items[0].assistant.flatText());
 }
 
 test "Harness: resume of unknown id surfaces the filesystem error" {

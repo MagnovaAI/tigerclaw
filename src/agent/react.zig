@@ -67,7 +67,7 @@ pub fn step(
     var appended_text: ?[]const u8 = null;
     if (response.text) |text| if (text.len > 0) {
         const idx = try agent_state.pushAssistant(text);
-        appended_text = agent_state.messages.items[idx].content;
+        appended_text = agent_state.messages.items[idx].flatText();
     };
 
     for (response.tool_calls) |call| {

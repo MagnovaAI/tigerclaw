@@ -17,7 +17,7 @@ const agent = tigerclaw.agent;
 const types = tigerclaw.types;
 
 test "prompt: build assembles a ChatRequest the provider can dispatch" {
-    const msgs = [_]types.Message{.{ .role = .user, .content = "hi" }};
+    const msgs = [_]types.Message{types.Message.literal(.user, "hi")};
     const req = agent.prompt_builder.build(.{
         .system = "you are helpful",
         .history = &msgs,
@@ -38,10 +38,10 @@ test "prompt caching: long system prompt with short history caches system only" 
 test "prompt caching: two-breakpoint plan with system and history tail" {
     const big = "x" ** 2048;
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "1" },
-        .{ .role = .assistant, .content = "2" },
-        .{ .role = .user, .content = "3" },
-        .{ .role = .assistant, .content = "4" },
+        types.Message.literal(.user, "1"),
+        types.Message.literal(.assistant, "2"),
+        types.Message.literal(.user, "3"),
+        types.Message.literal(.assistant, "4"),
     };
     const r = agent.prompt_caching.plan(big, &msgs, .{ .history_tail_uncached = 2 });
     try testing.expectEqual(@as(usize, 2), r.len);
@@ -52,8 +52,8 @@ test "prompt caching: two-breakpoint plan with system and history tail" {
 test "prompt caching: max_breakpoints cap is honoured" {
     const big = "x" ** 2048;
     const msgs = [_]types.Message{
-        .{ .role = .user, .content = "a" },
-        .{ .role = .user, .content = "b" },
+        types.Message.literal(.user, "a"),
+        types.Message.literal(.user, "b"),
     };
     const r = agent.prompt_caching.plan(big, &msgs, .{
         .history_tail_uncached = 1,
