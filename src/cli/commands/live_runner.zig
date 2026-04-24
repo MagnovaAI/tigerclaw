@@ -266,12 +266,11 @@ pub const LiveAgentRunner = struct {
 
         var messages: std.ArrayList(types.Message) = .empty;
         defer messages.deinit(self.allocator);
-        try messages.ensureTotalCapacity(self.allocator, assembled.sections.len);
         for (assembled.sections) |section| {
             // `current_prompt` duplicates the user message we just
             // ingested; skip it rather than send the same text twice.
             if (section.kind == .current_prompt) continue;
-            messages.appendAssumeCapacity(.{
+            try messages.append(self.allocator, .{
                 .role = mapRole(section.role),
                 .content = section.content,
             });
@@ -333,8 +332,10 @@ pub const LiveAgentRunner = struct {
 
             // Execute each tool, ingest the result as a tool-role
             // message, and feed it back on the next round via the
-            // assembled messages slice.
-            messages.appendAssumeCapacity(.{
+            // assembled messages slice. Safe `append` — the
+            // pre-call `ensureTotalCapacity` was removed; the
+            // ArrayList grows on demand for the tool-use turn.
+            try messages.append(self.allocator, .{
                 .role = .assistant,
                 .content = text,
             });
