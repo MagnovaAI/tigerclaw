@@ -168,6 +168,7 @@ pub fn probe(
     args: StatusArgs,
 ) Error![]ProviderRow {
     const rows = try allocator.alloc(ProviderRow, known_providers.len);
+    errdefer allocator.free(rows);
     for (known_providers, 0..) |name, i| {
         rows[i] = .{
             .name = name,

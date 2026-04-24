@@ -35,6 +35,7 @@ const dispatcher = @import("dispatcher.zig");
 /// drain and exit. Atomic so handlers (which run on an arbitrary
 /// thread / signal context) can write it safely.
 pub var should_stop: std.atomic.Value(bool) = .init(false);
+var bound_port_for_testing: std.atomic.Value(u16) = .init(0);
 
 pub fn requestStop() void {
     should_stop.store(true, .release);
@@ -42,6 +43,11 @@ pub fn requestStop() void {
 
 pub fn resetStopForTesting() void {
     should_stop.store(false, .release);
+    bound_port_for_testing.store(0, .release);
+}
+
+pub fn boundPortForTesting() u16 {
+    return bound_port_for_testing.load(.acquire);
 }
 
 pub const ServeError = error{
@@ -75,6 +81,7 @@ pub fn serve(
 ) ServeError!void {
     var server = address.listen(io, .{ .reuse_address = true }) catch return error.BindFailed;
     defer server.deinit(io);
+    if (builtin.is_test) bound_port_for_testing.store(server.socket.address.getPort(), .release);
 
     // SO_RCVTIMEO on the listener makes accept() wake every 500ms so
     // the loop can observe `should_stop` without waiting for the next

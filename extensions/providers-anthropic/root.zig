@@ -428,25 +428,7 @@ fn runHttp(
     if (status_code != 200) {
         var transfer_buf: [4096]u8 = undefined;
         const body_reader = response.reader(&transfer_buf);
-
-        var drained: std.array_list.Aligned(u8, null) = .empty;
-        defer drained.deinit(allocator);
-
-        var read_buf: [1024]u8 = undefined;
-        while (drained.items.len < 1024) {
-            const n = body_reader.readSliceShort(&read_buf) catch break;
-            if (n == 0) break;
-            const room = 1024 - drained.items.len;
-            const take = @min(n, room);
-            try drained.appendSlice(allocator, read_buf[0..take]);
-            if (take < n) break;
-        }
-
-        return refusal(
-            allocator,
-            "anthropic api error: {d} {s}",
-            .{ status_code, drained.items },
-        );
+        return refusalFromHttp(allocator, status_code, body_reader);
     }
 
     // Anthropic's HTTP layer auto-negotiates Accept-Encoding so the
@@ -1078,6 +1060,31 @@ fn serveOne401(args: *ServerArgs) void {
         "HTTP/1.1 401 Unauthorized\r\ncontent-length: 16\r\nconnection: close\r\n\r\n{\"error\":\"oops\"}",
     ) catch {};
     _ = w.interface.flush() catch {};
+}
+
+fn refusalFromHttp(
+    allocator: std.mem.Allocator,
+    status_code: u16,
+    body_reader: *std.Io.Reader,
+) !ChatResponse {
+    var drained: std.array_list.Aligned(u8, null) = .empty;
+    defer drained.deinit(allocator);
+
+    var read_buf: [1024]u8 = undefined;
+    while (drained.items.len < 1024) {
+        const n = body_reader.readSliceShort(&read_buf) catch break;
+        if (n == 0) break;
+        const room = 1024 - drained.items.len;
+        const take = @min(n, room);
+        try drained.appendSlice(allocator, read_buf[0..take]);
+        if (take < n) break;
+    }
+
+    return refusal(
+        allocator,
+        "anthropic api error: {d} {s}",
+        .{ status_code, drained.items },
+    );
 }
 
 test "anthropic: http error path surfaces refusal" {

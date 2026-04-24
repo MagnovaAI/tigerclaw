@@ -622,9 +622,6 @@ fn fakeServerThread(args: *FakeServerArgs) void {
 }
 
 test "openrouter: HTTP error path returns a refusal containing the status" {
-    // Bind once on the test thread so the listener is guaranteed live
-    // before the client connects; probe-then-rebind races the kernel
-    // and can leave the server stuck in accept().
     const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
     var server = try addr.listen(testing.io, .{ .reuse_address = true });
     defer server.deinit(testing.io);

@@ -820,8 +820,33 @@ fn probeGatewayPort(
     host: []const u8,
     port: u16,
 ) bool {
+    return probeGatewayPortWith(allocator, io, host, port, undefined, connectGatewayPort);
+}
+
+const ConnectFn = *const fn (
+    io: std.Io,
+    address: std.Io.net.IpAddress,
+    ctx: *anyopaque,
+) bool;
+
+fn probeGatewayPortWith(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+    ctx: *anyopaque,
+    connect_fn: ConnectFn,
+) bool {
     _ = allocator;
     const address = std.Io.net.IpAddress.parse(host, port) catch return false;
+    return connect_fn(io, address, ctx);
+}
+
+fn connectGatewayPort(
+    io: std.Io,
+    address: std.Io.net.IpAddress,
+    _: *anyopaque,
+) bool {
     // No explicit timeout: Zig 0.16's posix Io has not implemented
     // netConnectIpPosix with a timeout, and this probe targets localhost
     // where the kernel returns ECONNREFUSED immediately if the port is
@@ -902,15 +927,20 @@ test "parse: stop --port with a non-integer returns InvalidPort" {
 }
 
 test "probeGatewayPort: closed port returns false" {
-    // Same trick as the http_client test: bind, capture port, close,
-    // probe — the kernel holds the port in TIME_WAIT so connect()
-    // gets ConnectionRefused and the probe reports "nobody home".
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
-    var server = try addr.listen(testing.io, .{ .reuse_address = true });
-    const port = server.socket.address.getPort();
-    server.deinit(testing.io);
+    const FakeConnector = struct {
+        fn connect(_: std.Io, _: @TypeOf(std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable), _: *anyopaque) bool {
+            return false;
+        }
+    };
 
-    try testing.expect(!probeGatewayPort(testing.allocator, testing.io, "127.0.0.1", port));
+    try testing.expect(!probeGatewayPortWith(
+        testing.allocator,
+        testing.io,
+        "127.0.0.1",
+        8765,
+        undefined,
+        FakeConnector.connect,
+    ));
 }
 
 test "parse: logs default options" {

@@ -103,20 +103,27 @@ pub fn send(
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
-    return doFetch(&client, io, req, body_out, opts);
+    return doFetchWith(io, req, body_out, opts, &client, fetchOnceFromClient);
 }
 
-fn doFetch(
-    client: *std.http.Client,
+const FetchFn = *const fn (
+    ctx: *anyopaque,
+    req: Request,
+    body_out: ?*std.Io.Writer,
+) std.http.Client.FetchError!std.http.Client.FetchResult;
+
+fn doFetchWith(
     io: std.Io,
     req: Request,
     body_out: ?*std.Io.Writer,
     opts: Options,
+    ctx: *anyopaque,
+    fetch_fn: FetchFn,
 ) Error!Response {
-    const result = fetchOnce(client, req, body_out) catch |err| switch (err) {
+    const result = fetch_fn(ctx, req, body_out) catch |err| switch (err) {
         error.ConnectionRefused => blk: {
             std.Io.sleep(io, std.Io.Duration.fromNanoseconds(@intCast(opts.retry_delay_ns)), .awake) catch {};
-            break :blk fetchOnce(client, req, body_out) catch |retry_err| switch (retry_err) {
+            break :blk fetch_fn(ctx, req, body_out) catch |retry_err| switch (retry_err) {
                 error.ConnectionRefused => return error.GatewayDown,
                 else => return classifyTransport(retry_err),
             };
@@ -127,11 +134,12 @@ fn doFetch(
     return classifyResponse(result);
 }
 
-fn fetchOnce(
-    client: *std.http.Client,
+fn fetchOnceFromClient(
+    ctx: *anyopaque,
     req: Request,
     body_out: ?*std.Io.Writer,
 ) std.http.Client.FetchError!std.http.Client.FetchResult {
+    const client: *std.http.Client = @ptrCast(@alignCast(ctx));
     var auth_buf: [256]u8 = undefined;
     var extra: [3]std.http.Header = undefined;
     var extra_len: usize = 0;
@@ -234,23 +242,30 @@ test "classifyResponse: anything else is InvalidResponse" {
 }
 
 test "send: connection-refused on a closed port surfaces GatewayDown" {
-    // Bind a listener, capture its ephemeral port, then close it. By the
-    // time `send` runs, the kernel has the port in TIME_WAIT and any
-    // new connect lands as ConnectionRefused — both attempts.
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
-    var server = try addr.listen(testing.io, .{ .reuse_address = true });
-    const port = server.socket.address.getPort();
-    server.deinit(testing.io);
+    const FakeFetcher = struct {
+        const Self = @This();
+        calls: usize = 0,
 
-    var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/health", .{port});
+        fn fetch(
+            ctx: *anyopaque,
+            _: Request,
+            _: ?*std.Io.Writer,
+        ) std.http.Client.FetchError!std.http.Client.FetchResult {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return error.ConnectionRefused;
+        }
+    };
 
-    const result = send(
-        testing.allocator,
+    var fetcher = FakeFetcher{};
+    const result = doFetchWith(
         testing.io,
-        .{ .method = .GET, .url = url },
+        .{ .method = .GET, .url = "http://127.0.0.1:8765/health" },
         null,
         .{ .retry_delay_ns = 1 * std.time.ns_per_ms },
+        &fetcher,
+        FakeFetcher.fetch,
     );
     try testing.expectError(error.GatewayDown, result);
+    try testing.expectEqual(@as(usize, 2), fetcher.calls);
 }

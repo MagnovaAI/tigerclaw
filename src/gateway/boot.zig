@@ -485,6 +485,7 @@ const harness = @import("../harness/root.zig");
 /// thread joined on stop. `receive` spins politely until the cancel
 /// flag flips, matching the contract the real adapters implement.
 const FakeChannel = struct {
+    entered_receive: std.atomic.Value(bool) = .init(false),
     saw_cancel: std.atomic.Value(bool) = .init(false),
 
     fn channel(self: *FakeChannel) spec.Channel {
@@ -503,6 +504,7 @@ const FakeChannel = struct {
         cancel: *const std.atomic.Value(bool),
     ) spec.ReceiveError!usize {
         const self: *FakeChannel = @ptrCast(@alignCast(ptr));
+        self.entered_receive.store(true, .release);
         // Poll the cancel flag rather than sleeping — keeps the test
         // deterministic and quick without relying on the Io timer.
         while (!cancel.load(.acquire)) {
@@ -549,26 +551,41 @@ fn runBootThread(args: *RunArgs) void {
     };
 }
 
+fn waitForBoundPort() !u16 {
+    var waits: u32 = 0;
+    while (waits < 100) : (waits += 1) {
+        const port = tcp_server.boundPortForTesting();
+        if (port != 0) return port;
+        std.Io.sleep(testing.io, std.Io.Duration.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
+    }
+    return error.Timeout;
+}
+
+fn wakeListener(port: u16) void {
+    const wake_addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
+    if (wake_addr.connect(testing.io, .{ .mode = .stream, .protocol = .tcp })) |stream| {
+        var wake = stream;
+        wake.close(testing.io);
+    } else |_| {}
+}
+
+fn waitForReceiveStart(fake: *const FakeChannel) !void {
+    var waits: u32 = 0;
+    while (waits < 100) : (waits += 1) {
+        if (fake.entered_receive.load(.acquire)) return;
+        std.Thread.yield() catch {};
+    }
+    return error.Timeout;
+}
+
 test "Boot lifecycle: start, requestStop, drain, manager joined" {
     tcp_server.resetStopForTesting();
     defer tcp_server.resetStopForTesting();
 
-    // Reserve an ephemeral loopback port and release it; serve rebinds
-    // via reuse_address. The tiny race is harmless because the test
-    // never talks to the port — shutdown is driven by requestStop and
-    // a no-op wake connect.
-    const probe_addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
-    var probe = try probe_addr.listen(testing.io, .{ .reuse_address = true });
-    const port = probe.socket.address.getPort();
-    probe.deinit(testing.io);
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var opts = bootTestOptions(tmp.dir);
-    opts.address = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
-
-    var boot = try Boot.init(testing.allocator, testing.io, opts);
+    var boot = try Boot.init(testing.allocator, testing.io, bootTestOptions(tmp.dir));
     defer boot.deinit();
 
     var fake: FakeChannel = .{};
@@ -579,24 +596,22 @@ test "Boot lifecycle: start, requestStop, drain, manager joined" {
 
     var args: RunArgs = .{ .boot = &boot, .ctx = &ctx };
     const thread = try std.Thread.spawn(.{}, runBootThread, .{&args});
-
-    // Give serve a moment to bind, then request stop and poke the
-    // socket so the parked accept wakes. Retry the wake connect a
-    // couple of times in case we raced bind.
-    std.Io.sleep(testing.io, std.Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
-    tcp_server.requestStop();
-    var tries: u32 = 0;
-    while (tries < 20) : (tries += 1) {
-        if (opts.address.connect(testing.io, .{ .mode = .stream, .protocol = .tcp })) |s| {
-            var wake = s;
-            wake.close(testing.io);
-            break;
-        } else |_| {
-            std.Io.sleep(testing.io, std.Io.Duration.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
+    var joined = false;
+    defer {
+        if (!joined) {
+            tcp_server.requestStop();
+            const port = tcp_server.boundPortForTesting();
+            if (port != 0) wakeListener(port);
+            thread.join();
         }
     }
 
+    const port = try waitForBoundPort();
+    try waitForReceiveStart(&fake);
+    tcp_server.requestStop();
+    wakeListener(port);
     thread.join();
+    joined = true;
 
     try testing.expect(args.result == null);
     try testing.expect(fake.saw_cancel.load(.acquire));
@@ -606,16 +621,10 @@ test "Boot drain times out without crashing when in-flight never zeros" {
     tcp_server.resetStopForTesting();
     defer tcp_server.resetStopForTesting();
 
-    const probe_addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
-    var probe = try probe_addr.listen(testing.io, .{ .reuse_address = true });
-    const port = probe.socket.address.getPort();
-    probe.deinit(testing.io);
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var opts = bootTestOptions(tmp.dir);
-    opts.address = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
     opts.drain_deadline_ns = 100 * std.time.ns_per_ms;
 
     var boot = try Boot.init(testing.allocator, testing.io, opts);
@@ -630,21 +639,22 @@ test "Boot drain times out without crashing when in-flight never zeros" {
 
     var args: RunArgs = .{ .boot = &boot, .ctx = &ctx };
     const thread = try std.Thread.spawn(.{}, runBootThread, .{&args});
-
-    std.Io.sleep(testing.io, std.Io.Duration.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch {};
-    tcp_server.requestStop();
-    var tries: u32 = 0;
-    while (tries < 20) : (tries += 1) {
-        if (opts.address.connect(testing.io, .{ .mode = .stream, .protocol = .tcp })) |s| {
-            var wake = s;
-            wake.close(testing.io);
-            break;
-        } else |_| {
-            std.Io.sleep(testing.io, std.Io.Duration.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
+    var joined = false;
+    defer {
+        if (!joined) {
+            tcp_server.requestStop();
+            const port = tcp_server.boundPortForTesting();
+            if (port != 0) wakeListener(port);
+            thread.join();
         }
     }
 
+    const port = try waitForBoundPort();
+    tcp_server.requestStop();
+    wakeListener(port);
     thread.join();
+    joined = true;
+
     try testing.expect(args.result == null);
 }
 
