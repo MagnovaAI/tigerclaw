@@ -75,13 +75,16 @@ fn walk(
     spans: *std.ArrayList(Span),
     parent_style: StyleKind,
 ) !void {
-    // Emit whatever content this node contributes, then recurse.
     const start: u32 = @intCast(text.items.len);
 
+    // Emit the open: prefix glyph for list items, leading content
+    // for leaf nodes (Text, Code). Soft/line breaks collapse to a
+    // space inside a paragraph so wrapped prose reads naturally.
     switch (node.data.value) {
         .Text => |s| try text.appendSlice(allocator, s),
         .Code => |s| try text.appendSlice(allocator, s),
         .SoftBreak, .LineBreak => try text.append(allocator, ' '),
+        .Item => try text.appendSlice(allocator, "• "),
         else => {},
     }
 
@@ -101,22 +104,32 @@ fn walk(
         try walk(allocator, child, text, spans, child_style);
     }
 
-    // Close the node: separate block-level children with blank lines.
+    // Emit the close: break style depends on node kind.
+    //   Paragraph / Heading / BlockQuote / List → `\n\n` (paragraph gap)
+    //   Item → `\n` (list rows stay tight)
+    //   CodeBlock → literal content + `\n\n`
+    // Trailing breaks are only emitted when the node has a sibling
+    // coming up, so we don't leave a dangling blank line at the end
+    // of the document.
+    const has_next = node.next != null;
     switch (node.data.value) {
-        .Paragraph, .Heading, .BlockQuote, .List, .Item => {
-            if (node.next != null) try text.appendSlice(allocator, "\n\n");
+        .Paragraph, .Heading, .BlockQuote, .List => {
+            if (has_next) try text.appendSlice(allocator, "\n\n");
+        },
+        .Item => {
+            // Always break after an item — list items separate on
+            // single newlines. The enclosing List then adds the
+            // paragraph gap after the final item when prose follows.
+            try text.append(allocator, '\n');
         },
         .CodeBlock => |blk| {
-            // CodeBlock content lives on the node itself, not its
-            // children — emit it now so the span covers the whole block.
             try text.appendSlice(allocator, blk.literal.items);
-            if (node.next != null) try text.appendSlice(allocator, "\n\n");
+            if (has_next) try text.appendSlice(allocator, "\n\n");
         },
         else => {},
     }
 
-    // Record a span if this node introduced a styled region with
-    // any actual text.
+    // Record a span for any node that introduced a styled region.
     const end: u32 = @intCast(text.items.len);
     if (end > start and child_style != parent_style) {
         try spans.append(allocator, .{

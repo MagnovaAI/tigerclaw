@@ -790,8 +790,8 @@ fn drawHeader(
     else
         " ● ready ";
 
-    const chip_len: usize = visualWidth(chip);
-    const status_len: usize = visualWidth(status_text);
+    const chip_len: usize = measureCols(chip);
+    const status_len: usize = measureCols(status_text);
     const width: usize = @intCast(win.width);
 
     if (width > chip_len + status_len + 1) {
