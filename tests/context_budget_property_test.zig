@@ -10,8 +10,14 @@ fn randomSections(
     const arr = try allocator.alloc(t.Section, count);
     errdefer allocator.free(arr);
 
-    // Allocate origin strings separately so we can free them deterministically
-    // in the caller. Build each origin as "o{d}" for index i.
+    // Track how many origins have been allocated so a mid-loop failure
+    // frees only the ones that actually got allocated.
+    var built: usize = 0;
+    errdefer {
+        var j: usize = 0;
+        while (j < built) : (j += 1) allocator.free(arr[j].origin);
+    }
+
     for (arr, 0..) |*s, i| {
         const origin = try std.fmt.allocPrint(allocator, "o{d}", .{i});
         s.* = .{
@@ -24,6 +30,7 @@ fn randomSections(
             .pinned = false,
             .origin = origin,
         };
+        built += 1;
     }
     return arr;
 }
