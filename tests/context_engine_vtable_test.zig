@@ -10,7 +10,7 @@ test "ContextEngineVTable has required fields" {
 
 test "ContextContributorVTable has required fields" {
     const V = engine_mod.ContextContributorVTable;
-    inline for (.{ "band", "contribute", "dispose" }) |name| {
+    inline for (.{ "contribute", "dispose" }) |name| {
         if (!@hasField(V, name)) @panic("missing contributor vtable field: " ++ name);
     }
 }
@@ -21,9 +21,10 @@ test "ContextEngine handle has ptr and vtable" {
     try std.testing.expect(@hasField(H, "vtable"));
 }
 
-test "ContextContributor handle has id, ptr, vtable" {
+test "ContextContributor handle has id, band, ptr, vtable" {
     const H = engine_mod.ContextContributor;
     try std.testing.expect(@hasField(H, "id"));
+    try std.testing.expect(@hasField(H, "band"));
     try std.testing.expect(@hasField(H, "ptr"));
     try std.testing.expect(@hasField(H, "vtable"));
 }

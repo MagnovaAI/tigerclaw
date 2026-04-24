@@ -1,4 +1,3 @@
-const std = @import("std");
 const t = @import("types.zig");
 const Context = @import("context").Context;
 
@@ -48,16 +47,8 @@ pub const ContextEngine = struct {
 };
 
 /// Vtable for a context contributor — a lightweight plug that injects
-/// a named band of tokens into the assembled context window.
-///
-/// `band` is a priority byte (0 = highest priority); contributors are
-/// sorted by band before `assemble` is called so the engine can fill
-/// the budget deterministically.
+/// a band of content into the assembled context window.
 pub const ContextContributorVTable = struct {
-    /// Priority band. Lower value = higher priority when the engine
-    /// allocates token budget across contributors.
-    band: u8,
-
     /// Return the content this contributor wants to place in the
     /// context window for the current turn.
     contribute: *const fn (ctx: *const Context, self: *anyopaque, p: t.ContributeParams) anyerror!t.ContributeResult,
@@ -67,10 +58,16 @@ pub const ContextContributorVTable = struct {
 };
 
 /// Opaque handle to a context contributor instance.
+///
+/// `band` lives on the handle, not the vtable: it is per-instance
+/// configuration, not a shared method. Lower band = higher priority
+/// when the engine allocates token budget across contributors.
 pub const ContextContributor = struct {
     /// Stable identifier used to deduplicate contributors and route
     /// recall queries to the right source.
     id: []const u8,
+    /// Priority band. 0 = highest priority.
+    band: u8,
     ptr: *anyopaque,
     vtable: *const ContextContributorVTable,
 };
