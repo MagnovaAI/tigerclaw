@@ -485,6 +485,13 @@ pub fn buildRequestBody(
     try stringify.beginArray();
     for (request.messages) |msg| {
         std.debug.assert(msg.role != .system);
+        // Anthropic rejects empty text content blocks with
+        // `messages: text content blocks must be non-empty` (HTTP
+        // 400). Skip any message whose content is the empty
+        // string — those arise when a model reply contains only a
+        // tool_use block and the runner later appends the empty
+        // `resp.text` as an assistant message.
+        if (msg.content.len == 0) continue;
         try stringify.beginObject();
         try stringify.objectField("role");
         switch (msg.role) {
@@ -849,6 +856,34 @@ test "scenario: buildRequestBody with no tools omits the field entirely" {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
     try testing.expect(parsed.value.object.get("tools") == null);
+}
+
+test "scenario: buildRequestBody drops empty messages (anthropic 400s on empty text blocks)" {
+    // Anthropic rejects `content: [{type:text, text:""}]` with
+    // HTTP 400 `messages: text content blocks must be non-empty`.
+    // The runner can end up with an empty assistant message when a
+    // model returns only a tool_use block. The wire layer must
+    // filter those out rather than forward them.
+    const messages = [_]types.Message{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = "" }, // tool-only reply
+        .{ .role = .tool, .content = "2026-04-23T23:45:12Z" },
+    };
+    const req: ChatRequest = .{
+        .messages = &messages,
+        .model = .{ .provider = "anthropic", .model = "claude-haiku-4-5-20251001" },
+    };
+
+    const body = try buildRequestBody(testing.allocator, req, 1024);
+    defer testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?;
+    // Only the two non-empty messages survive.
+    try testing.expectEqual(@as(usize, 2), msgs.array.items.len);
+    try testing.expectEqualStrings("hi", msgs.array.items[0].object.get("content").?.array.items[0].object.get("text").?.string);
+    try testing.expectEqualStrings("2026-04-23T23:45:12Z", msgs.array.items[1].object.get("content").?.array.items[0].object.get("text").?.string);
 }
 
 test "scenario: multi-turn body with assistant + tool role messages parses cleanly" {
