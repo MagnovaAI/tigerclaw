@@ -403,13 +403,18 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                     try line.text.appendSlice(allocator, "\u{21BB} ");
                     try line.text.appendSlice(allocator, td.name);
                     try line.text.appendSlice(allocator, " \u{2192} ");
-                    // Cap the output preview so a noisy tool result
-                    // doesn't wreck the UI; the full output is still
-                    // in the agent's conversation context.
-                    const max_preview: usize = 80;
-                    const take = safeUtf8Take(td.output, max_preview);
-                    try line.text.appendSlice(allocator, td.output[0..take]);
-                    if (take < td.output.len) try line.text.appendSlice(allocator, "\u{2026}");
+                    // Cap preview at 500 display columns (~5 wrapped
+                    // rows on a narrow terminal, one on a wide one) —
+                    // enough to see the shape of a fetch result or a
+                    // read_file without a noisy tool hijacking the
+                    // chat scroll. Full output is still in the
+                    // agent's conversation context. \`takeCols\`
+                    // walks by display columns so we don't cut a
+                    // codepoint in half.
+                    const max_preview: usize = 500;
+                    const taken = takeCols(td.output, max_preview);
+                    try line.text.appendSlice(allocator, td.output[0..taken.bytes]);
+                    if (taken.bytes < td.output.len) try line.text.appendSlice(allocator, "\u{2026}");
                     line.deinitToolId(allocator);
                 }
             },
