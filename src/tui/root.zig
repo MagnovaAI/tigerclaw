@@ -339,19 +339,29 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                 } else if (pending_agent_line) |idx| {
                     // Streaming done — re-parse the accumulated raw
                     // markdown with koino and attach the span list so
-                    // the renderer paints bold/italic/code/etc. For
-                    // robustness we silently fall back to a flat
-                    // un-styled render on parse failure rather than
-                    // dropping the reply.
+                    // the renderer paints bold/italic/code/etc. Guard
+                    // against two failure modes silently losing the
+                    // reply: parser error (fall through), and the
+                    // walker returning empty text for a non-empty
+                    // source (keep the raw bytes unchanged, skip
+                    // styling). Either is better than an empty
+                    // agent line with no explanation.
                     var line = &history.items[idx];
+                    const had_text = line.text.items.len > 0;
                     if (md.render(allocator, line.text.items)) |rendered| {
-                        line.text.clearRetainingCapacity();
-                        line.text.appendSlice(allocator, rendered.text) catch {};
-                        line.deinitSpans(allocator);
-                        line.spans = rendered.spans;
-                        // Free only the text buffer — spans ownership
-                        // moved into `line`.
-                        allocator.free(rendered.text);
+                        if (rendered.text.len > 0 or !had_text) {
+                            line.text.clearRetainingCapacity();
+                            line.text.appendSlice(allocator, rendered.text) catch {};
+                            line.deinitSpans(allocator);
+                            line.spans = rendered.spans;
+                            allocator.free(rendered.text);
+                        } else {
+                            // Parser returned nothing for non-empty
+                            // input — keep the raw bytes and drop
+                            // the (empty) spans slice.
+                            allocator.free(rendered.text);
+                            allocator.free(rendered.spans);
+                        }
                     } else |_| {}
                 }
                 pending_agent_line = null;

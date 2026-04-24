@@ -173,6 +173,22 @@ test "render: *italic* produces an italic span" {
     try testing.expectEqual(StyleKind.italic, out.spans[0].style);
 }
 
+test "render: realistic agent reply with emoji and em-dash is non-empty" {
+    // Regression: an agent reply like the one below was producing
+    // an empty `text` field from the walker, which the TUI then
+    // dropped to a blank `‹ ` line. Assert we get the readable
+    // characters back plus a bold span.
+    const input = "It's **2026-04-24 at 03:57:41 UTC** — pretty early! 🌙\n";
+    var out = try render(testing.allocator, input);
+    defer out.deinit(testing.allocator);
+    try testing.expect(out.text.len > 0);
+    try testing.expect(std.mem.indexOf(u8, out.text, "2026-04-24") != null);
+    try testing.expect(std.mem.indexOf(u8, out.text, "🌙") != null);
+    // Bold span over the timestamp.
+    try testing.expectEqual(@as(usize, 1), out.spans.len);
+    try testing.expectEqual(StyleKind.bold, out.spans[0].style);
+}
+
 test "render: `code` spans mark inline code" {
     var out = try render(testing.allocator, "run `foo()` now");
     defer out.deinit(testing.allocator);
