@@ -82,11 +82,17 @@ pub const DefaultEngine = struct {
                 return .{ .ingested = false };
             }
         }
+        const sid = try self.allocator.dupe(u8, params.session_id);
+        errdefer self.allocator.free(sid);
+        const mid = try self.allocator.dupe(u8, params.message_id);
+        errdefer self.allocator.free(mid);
+        const cnt = try self.allocator.dupe(u8, params.content);
+        errdefer self.allocator.free(cnt);
         try self.messages.append(self.allocator, .{
-            .session_id = try self.allocator.dupe(u8, params.session_id),
-            .message_id = try self.allocator.dupe(u8, params.message_id),
+            .session_id = sid,
+            .message_id = mid,
             .role = params.role,
-            .content = try self.allocator.dupe(u8, params.content),
+            .content = cnt,
         });
         return .{ .ingested = true };
     }
