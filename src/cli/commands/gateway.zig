@@ -53,9 +53,9 @@ pub const LogsOptions = struct {
 };
 
 pub const StopOptions = struct {
-    /// Skip the SIGTERM grace period and go straight to SIGKILL.
-    /// Also used when the grace wait expires without the pid clearing.
-    force: bool = false,
+    /// Always force-kill. The graceful drain path flaked on
+    /// Ctrl-Z'd daemons and nobody wanted it in practice.
+    force: bool = true,
     /// Port to probe when the pidfile is missing or stale. If a
     /// listener answers on this port we surface an orphan-listener
     /// error instead of the misleading "gateway is not running".
@@ -139,7 +139,8 @@ fn parseStopOptions(argv: []const []const u8) ParseError!StopOptions {
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
         if (std.mem.eql(u8, a, "--force") or std.mem.eql(u8, a, "-9")) {
-            opts.force = true;
+            // Retained as a no-op so existing scripts don't error.
+            // Stop is always forceful now.
             continue;
         }
         if (std.mem.eql(u8, a, "--port") or std.mem.eql(u8, a, "-p")) {
@@ -879,15 +880,15 @@ test "parse: bogus positional returns UnknownSubVerb" {
     try testing.expectError(error.UnknownSubVerb, parse(&argv));
 }
 
-test "parse: stop default options" {
+test "parse: stop is always force-kill" {
     const argv = [_][]const u8{"stop"};
     const v = try parse(&argv);
-    try testing.expect(!v.stop.force);
+    try testing.expect(v.stop.force);
     try testing.expectEqualStrings("127.0.0.1", v.stop.host);
     try testing.expectEqual(@as(u16, 8765), v.stop.port);
 }
 
-test "parse: stop --force and --port override defaults" {
+test "parse: stop --force is accepted as a no-op for script compatibility" {
     const argv = [_][]const u8{ "stop", "--force", "--port", "9100", "--host", "0.0.0.0" };
     const v = try parse(&argv);
     try testing.expect(v.stop.force);
