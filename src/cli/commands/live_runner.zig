@@ -390,7 +390,12 @@ pub const LiveAgentRunner = struct {
                 .messages = messages.items,
                 .model = .{ .provider = @tagName(self.provider_kind), .model = self.model },
                 .system = self.system_prompt,
-                .max_output_tokens = 1024,
+                // 1024 was small enough that bulk tool-use turns (e.g.
+                // a dozen write_file calls) ran out of output budget
+                // mid-block, leaving the last tool_use's partial_json
+                // truncated. 8192 is the safe ceiling shared by every
+                // currently-supported Haiku/Sonnet/GPT model.
+                .max_output_tokens = 8192,
                 .tools = &builtin_tools,
             };
 
