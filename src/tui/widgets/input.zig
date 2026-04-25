@@ -66,9 +66,23 @@ fn eventHandler(
 }
 
 fn handleKey(self: *Input, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
-    // Submit: Enter fires the callback with the buffer contents.
-    if (key.matches(vaxis.Key.enter, .{})) {
-        if (self.on_submit) |cb| cb(self.submit_ctx, self.buf.items);
+    // Submit: Enter fires the callback with the buffer contents. Match
+    // every form a terminal might send Enter as so we don't silently
+    // swallow submits on quirky setups:
+    //   - 0x0D / 13 → standard CR (matches vaxis.Key.enter)
+    //   - 0x0A / 10 → LF (vaxis remaps this to Ctrl+J in ground-state)
+    //   - 57414     → kp_enter (numeric keypad Enter)
+    //   - text "\r" / "\n" → some terminals deliver Enter as text
+    //   - Ctrl+J    → fallback for the LF-as-Ctrl+J remap above
+    const is_enter_codepoint = key.codepoint == 13 or key.codepoint == 10 or key.codepoint == 57414;
+    const is_enter_text = if (key.text) |t| std.mem.eql(u8, t, "\r") or std.mem.eql(u8, t, "\n") else false;
+    const is_ctrl_j = key.codepoint == 'j' and key.mods.ctrl and key.text == null;
+    const is_enter = is_enter_codepoint or is_enter_text or is_ctrl_j;
+
+    if (is_enter) {
+        if (self.on_submit) |cb| {
+            cb(self.submit_ctx, self.buf.items);
+        }
         self.buf.clearRetainingCapacity();
         self.cursor = 0;
         ctx.consumeAndRedraw();

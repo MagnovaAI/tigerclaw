@@ -174,6 +174,13 @@ fn beginTurn(self: *Root, typed: []const u8) !void {
     self.thinking.elapsed_ms = 0;
     self.turn_started_ms = vxfw.milliTimestamp();
 
+    // Note: we do NOT kick the tick chain via `app.loop.postEvent(.tick)`
+    // here — App.run holds the queue mutex while iterating drained events,
+    // so re-entering postEvent from inside a key_press handler deadlocks
+    // on the (non-recursive) pthread mutex. The caller (eventHandler in
+    // Root) re-arms the tick chain via `ctx.tick(0, …)` after this returns,
+    // which routes through the cmd list / timers and bypasses the queue.
+
     // Dup the message so the worker owns it independent of the
     // input buffer (which clears right after on_submit returns).
     const message_copy = try self.allocator.dupe(u8, typed);
@@ -350,7 +357,15 @@ fn eventHandler(
             // automatically once we call `request_focus` — we're
             // manually bridging for now since Root is the only
             // widget receiving events.
+            const was_pending = self.thinking.pending;
             try self.input.widget().handleEvent(ctx, event);
+            // If onSubmit just flipped a turn to pending, kick the
+            // spinner tick chain via ctx.tick (cmd list / timers) —
+            // we can't postEvent into the loop here because App.run
+            // holds the queue mutex while draining.
+            if (!was_pending and self.thinking.pending) {
+                try ctx.tick(0, self.widget());
+            }
         },
         .winsize => ctx.redraw = true,
         .init => {
@@ -364,10 +379,9 @@ fn eventHandler(
                 self.thinking.spinner_tick +%= 1;
                 self.thinking.elapsed_ms = @intCast(@max(0, vxfw.milliTimestamp() - self.turn_started_ms));
                 ctx.redraw = true;
+                // Reschedule tick only while a turn is pending.
+                try ctx.tick(80, self.widget());
             }
-            // Keep the tick chain alive so the spinner keeps
-            // ticking as soon as pending flips back on.
-            try ctx.tick(80, self.widget());
         },
         .app => |ue| try self.handleUserEvent(ctx, ue),
         else => {},
