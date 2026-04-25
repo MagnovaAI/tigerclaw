@@ -9,7 +9,7 @@ pub const TokenUsage = struct {
     cache_write: u32 = 0,
 
     pub fn total(self: TokenUsage) u64 {
-        return @as(u64, self.input) + self.output + self.cache_read + self.cache_write;
+        return @as(u64, self.input) +| self.output +| self.cache_read +| self.cache_write;
     }
 };
 
