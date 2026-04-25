@@ -92,6 +92,7 @@ pub const ChannelKind = enum {
             .{ "chan-collab-http-a2a", ChannelKind.collab_http_a2a },
             .{ "chan-collab-mcp", ChannelKind.collab_mcp },
             .{ "chan-test-fake", ChannelKind.test_fake },
+            .{ "chan-unknown", ChannelKind.unknown },
         };
         inline for (pairs) |pair| {
             if (std.mem.eql(u8, p, pair[0])) return pair[1];
