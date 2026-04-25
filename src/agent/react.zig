@@ -99,6 +99,7 @@ fn renderToolResult(allocator: std.mem.Allocator, r: types.ToolResult) ![]u8 {
             break :blk try std.fmt.allocPrint(allocator, "ok:{s}", .{payload});
         },
         .err => |b| blk: {
+            // b.id is a canonical error string (static), only detail is heap-allocated
             defer allocator.free(b.detail);
             break :blk try std.fmt.allocPrint(allocator, "err[{s}]:{s}", .{ b.id, b.detail });
         },
