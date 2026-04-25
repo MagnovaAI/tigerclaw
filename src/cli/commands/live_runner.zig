@@ -700,7 +700,7 @@ const builtin_tools = [_]types.Tool{
     },
     .{
         .name = "fetch_url",
-        .description = "Fetch a web page via the Lightpanda headless browser and return it as readable markdown (headings, links, lists) rather than raw HTML. JavaScript runs before the page is dumped, so SPA content is included. Call this tool whenever the user says 'fetch', 'browse', 'scrape', 'look up <a topic> online', 'visit', 'check this page', 'open this URL', or names Lightpanda directly. Only http:// and https:// URLs are allowed; private and loopback addresses are refused. Response is capped at 64 KB.",
+        .description = "Fetch a web page via the Lightpanda headless browser and return it as readable markdown (headings, links, lists) rather than raw HTML. JavaScript runs before the page is dumped, so SPA content is included. Call this tool whenever the user says 'fetch', 'browse', 'scrape', 'look up <a topic> online', 'visit', 'check this page', 'open this URL', or names Lightpanda directly. Only http:// and https:// URLs are allowed; private and loopback addresses are refused. Response is capped at 8 KB and truncated with a visible marker; if you need more, re-issue with a more specific URL.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute URL to fetch.\"}},\"required\":[\"url\"]}",
     },
     .{
@@ -922,11 +922,26 @@ fn runFetchUrl(allocator: std.mem.Allocator, io: std.Io, arguments_json: []const
     return runLightpanda(allocator, url);
 }
 
+/// Hard cap on rendered-page bytes returned to the model. Pages
+/// larger than this are truncated with a trailing `[truncated …]`
+/// marker. Sized to fit comfortably in a single LLM tool-result
+/// turn — a Haiku-class model handling 8 KiB of markdown is fast;
+/// 64 KiB stalls the agent loop and bloats history beyond what
+/// the TUI can re-render at 60 FPS.
+const fetch_max_bytes: usize = 8 * 1024;
+
+/// Bytes we read from lightpanda before deciding to truncate. A few
+/// KiB of headroom over the hard cap so the truncation marker can
+/// honestly say "more was available".
+const fetch_read_window: usize = fetch_max_bytes + 4 * 1024;
+
 /// Spawn `lightpanda fetch --dump markdown <url>` via libc popen (the
 /// same pattern `findOrphanPid` uses in `gateway.zig`, for the same
 /// reason: Zig 0.16's `std.process.Child` spawn-and-read pipeline is
-/// still in transition). Reads up to 64 KiB of stdout; anything past
-/// the cap is truncated so a runaway page can't exhaust the heap.
+/// still in transition). Reads up to `fetch_read_window` bytes of
+/// stdout, then truncates the result to `fetch_max_bytes` with a
+/// visible marker so a runaway page can't exhaust the heap or
+/// stall the LLM.
 fn runLightpanda(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     // Build the shell command. URL must be sanitised — refuse any
     // single-quote in the URL so the shell can't be talked out of its
@@ -954,19 +969,22 @@ fn runLightpanda(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     const f = popen(cmd.ptr, "r") orelse return error.FetchFailed;
     defer _ = pclose(f);
 
-    const max_bytes: usize = 64 * 1024;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, 4096);
 
     var chunk: [4096]u8 = undefined;
-    while (out.items.len < max_bytes) {
+    var saw_more = false;
+    while (true) {
         const n = fread(&chunk, 1, chunk.len, f);
         if (n == 0) break;
-        const room = max_bytes - out.items.len;
+        const room = fetch_read_window - out.items.len;
         const take = @min(n, room);
         try out.appendSlice(allocator, chunk[0..take]);
-        if (take < n) break;
+        if (take < n or out.items.len >= fetch_read_window) {
+            saw_more = true;
+            break;
+        }
     }
 
     if (out.items.len == 0) {
@@ -975,6 +993,21 @@ fn runLightpanda(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
             "lightpanda fetch timed out or returned no output for {s}",
             .{url},
         );
+    }
+
+    // Apply the visible cap. If the page was longer than the cap,
+    // shrink the buffer and append a marker so the model knows it's
+    // looking at a prefix.
+    const truncated = saw_more or out.items.len > fetch_max_bytes;
+    if (out.items.len > fetch_max_bytes) {
+        out.shrinkRetainingCapacity(fetch_max_bytes);
+    }
+    if (truncated) {
+        try out.appendSlice(allocator, "\n\n[truncated to ");
+        var num_buf: [32]u8 = undefined;
+        const num = std.fmt.bufPrint(&num_buf, "{d}", .{fetch_max_bytes}) catch "8192";
+        try out.appendSlice(allocator, num);
+        try out.appendSlice(allocator, " bytes — re-issue fetch_url with a more specific URL if you need more]");
     }
 
     return out.toOwnedSlice(allocator);
