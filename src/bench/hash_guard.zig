@@ -33,7 +33,7 @@ pub fn sha256Hex(allocator: std.mem.Allocator, bytes: []const u8) !Digest {
 
     const out = try allocator.alloc(u8, raw.len * 2);
     errdefer allocator.free(out);
-    _ = std.fmt.bufPrint(out, "{x}", .{&raw}) catch unreachable;
+    _ = try std.fmt.bufPrint(out, "{x}", .{&raw});
     return .{ .hex = out };
 }
 
