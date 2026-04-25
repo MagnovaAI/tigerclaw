@@ -35,9 +35,13 @@ pub fn parseJsonl(allocator: std.mem.Allocator, bytes: []const u8) ![]Item {
         defer parsed.deinit();
         // Copy strings out of the parse arena into the output
         // allocator so the returned items survive `parsed.deinit`.
+        // Use errdefer to cleanup partial allocations on failure.
+        const scenario_id = try allocator.dupe(u8, parsed.value.scenario_id);
+        errdefer allocator.free(scenario_id);
+        const input = try allocator.dupe(u8, parsed.value.input);
         out[idx] = .{
-            .scenario_id = try allocator.dupe(u8, parsed.value.scenario_id),
-            .input = try allocator.dupe(u8, parsed.value.input),
+            .scenario_id = scenario_id,
+            .input = input,
         };
         idx += 1;
     }
