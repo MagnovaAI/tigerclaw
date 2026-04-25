@@ -60,22 +60,130 @@ pub const InFlightCounter = struct {
 pub const StreamSink = *const fn (ctx: ?*anyopaque, fragment: []const u8) void;
 
 /// Phase reported to `ToolEventSink`. `started` fires before the
-/// runner dispatches the tool; `finished` fires after dispatch, with
-/// the rendered result slice. A failure during dispatch still ends
-/// with a `finished` event — the rendered output carries the error
-/// reason so the client can show it.
-pub const ToolEventPhase = enum { started, finished };
+/// runner dispatches the tool; `progress` may fire any number of
+/// times during long-running dispatches (currently bash); `finished`
+/// fires once when the tool returns. A failure during dispatch still
+/// terminates with `finished` — the rendered output carries the
+/// error reason so the client can show it.
+pub const ToolEventPhase = enum { started, progress, finished };
 
-/// Event callback for tool-use turns. Each tool call the runner
-/// dispatches invokes this sink twice: once before the tool runs
-/// (phase=.started), once after (phase=.finished). `output` is only
-/// populated on `.finished`; on `.started` it is an empty slice.
-pub const ToolEventSink = *const fn (
-    ctx: ?*anyopaque,
-    phase: ToolEventPhase,
+/// Started payload. `args_summary` is a tool-specific one-line
+/// preview the consumer can render in the "tool fired" pill (for
+/// example, the bash command). Empty when the runner has nothing
+/// useful to say upfront.
+pub const ToolStartedPayload = struct {
     id: []const u8,
     name: []const u8,
-    output: []const u8,
+    args_summary: []const u8 = "",
+};
+
+/// Progress chunk surfaced mid-dispatch. Phase 9 (TUI streaming)
+/// consumes these; the gateway path is free to ignore them.
+pub const ToolProgressPayload = struct {
+    id: []const u8,
+    stream: enum { stdout, stderr },
+    chunk: []const u8,
+};
+
+/// Finished payload. `kind` carries the tool-shaped result; consumers
+/// that only deal with text can read `kind.text` (always populated as
+/// a flat preview, even when a richer variant is also set).
+pub const ToolFinishedPayload = struct {
+    id: []const u8,
+    name: []const u8,
+    kind: ToolFinishedKind,
+};
+
+/// Tagged union of per-tool result shapes. Every variant carries a
+/// flat-text view (`text` field on the inner struct, or the `text`
+/// arm itself) so naive consumers don't need to switch on variant.
+pub const ToolFinishedKind = union(enum) {
+    /// Generic / unknown tool. The `text` slice is the rendered
+    /// tool_result body verbatim.
+    text: []const u8,
+    bash: BashFinished,
+    read: ReadFinished,
+    glob: GlobFinished,
+    grep: GrepFinished,
+    web_search: WebSearchFinished,
+    todo_write: TodoWriteFinished,
+
+    /// Flat text view, suitable for the gateway's SSE serializer or
+    /// any client that doesn't care about the structured shape.
+    pub fn flatText(self: ToolFinishedKind) []const u8 {
+        return switch (self) {
+            .text => |t| t,
+            .bash => |b| b.text,
+            .read => |r| r.text,
+            .glob => |g| g.text,
+            .grep => |g| g.text,
+            .web_search => |w| w.text,
+            .todo_write => |t| t.text,
+        };
+    }
+};
+
+pub const BashFinished = struct {
+    text: []const u8,
+    command: []const u8 = "",
+    exit_code: i32 = 0,
+    interrupted: bool = false,
+    duration_ms: u64 = 0,
+};
+
+pub const ReadFinished = struct {
+    text: []const u8,
+    path: []const u8 = "",
+    /// One of `text`, `unchanged`, `empty`, `past_eof`.
+    variant: enum { text, unchanged, empty, past_eof } = .text,
+    num_lines: u32 = 0,
+    total_lines: u32 = 0,
+};
+
+pub const GlobFinished = struct {
+    text: []const u8,
+    pattern: []const u8 = "",
+    match_count: u32 = 0,
+    truncated: bool = false,
+};
+
+pub const GrepFinished = struct {
+    text: []const u8,
+    pattern: []const u8 = "",
+    file_count: u32 = 0,
+    match_count: u32 = 0,
+    truncated: bool = false,
+};
+
+pub const WebSearchFinished = struct {
+    text: []const u8,
+    query: []const u8 = "",
+    result_count: u32 = 0,
+};
+
+pub const TodoWriteFinished = struct {
+    text: []const u8,
+    pending: u32 = 0,
+    in_progress: u32 = 0,
+    done: u32 = 0,
+};
+
+/// Tagged-union event passed to `ToolEventSink`.
+pub const ToolEvent = union(ToolEventPhase) {
+    started: ToolStartedPayload,
+    progress: ToolProgressPayload,
+    finished: ToolFinishedPayload,
+};
+
+/// Event callback for tool-use turns. Each tool call the runner
+/// dispatches invokes this sink at least twice: once on `.started`,
+/// once on `.finished`, with optional `.progress` events in between.
+/// All slices on the event are borrowed for the duration of the
+/// call; consumers that need to hold them past the sink invocation
+/// must dupe.
+pub const ToolEventSink = *const fn (
+    ctx: ?*anyopaque,
+    event: ToolEvent,
 ) void;
 
 pub const TurnRequest = struct {

@@ -318,6 +318,12 @@ pub fn build(b: *std.Build) void {
         }),
     }).module("uucode"));
     exe_mod.addImport("koino", koino_mod);
+    // The library module re-exports the TUI namespace, which now
+    // pulls in koino-backed markdown rendering (`src/tui/md.zig`).
+    // External consumers reaching through `@import("tigerclaw")`
+    // need koino on the module graph or the TUI imports fail to
+    // resolve.
+    tigerclaw_mod.addImport("koino", koino_mod);
 
     const exe = b.addExecutable(.{
         .name = "tigerclaw",

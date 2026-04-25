@@ -39,7 +39,9 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
-const md = @import("md.zig");
+pub const md = @import("md.zig");
+pub const ansi = @import("ansi.zig");
+const tool_preview = @import("tool_preview.zig");
 const live_runner = @import("../cli/commands/live_runner.zig");
 const harness = @import("../harness/root.zig");
 const HeaderWidget = @import("widgets/header.zig");
@@ -48,6 +50,9 @@ test {
     // Ensure md tests are discovered when the unit-test binary
     // walks references from this file.
     std.testing.refAllDecls(md);
+    std.testing.refAllDecls(ansi);
+    std.testing.refAllDecls(tool_preview);
+    std.testing.refAllDecls(@import("widgets/history.zig"));
     // Force body compilation of every vxfw widget in the subset
     // we plan to migrate onto, so any 0.16 API regression in
     // packages/vaxis/src/vxfw surfaces here at build time instead
@@ -100,6 +105,9 @@ pub const widgets = struct {
     pub const history = @import("widgets/history.zig");
     pub const input = @import("widgets/input.zig");
     pub const thinking = @import("widgets/thinking.zig");
+    pub const hint = @import("widgets/hint.zig");
+    pub const status_bar = @import("widgets/status_bar.zig");
+    pub const user_message = @import("widgets/user_message.zig");
 };
 
 pub const Line = struct {
@@ -151,33 +159,71 @@ const EventLoop = vaxis.Loop(Event);
 /// WezTerm, Kitty, modern Terminal.app). On a non-truecolor term the
 /// sequences gracefully degrade to the nearest 256-color index.
 pub const palette = struct {
-    // Core tiger colours — reused as field values in Style below. Kept
-    // in one block so tweaking the theme means editing nine numbers,
-    // not nine separate Style entries.
-    pub const orange: vaxis.Color = .{ .rgb = .{ 0xFF, 0x8C, 0x1A } }; // tiger orange
-    const amber: vaxis.Color = .{ .rgb = .{ 0xD9, 0x6A, 0x00 } }; // deep amber
-    const cream: vaxis.Color = .{ .rgb = .{ 0xF5, 0xE6, 0xD3 } }; // warm cream
-    const gold: vaxis.Color = .{ .rgb = .{ 0xFF, 0xC8, 0x57 } }; // hot gold
-    const green: vaxis.Color = .{ .rgb = .{ 0x6B, 0xAF, 0x58 } }; // jungle green
-    const stripe: vaxis.Color = .{ .rgb = .{ 0x1A, 0x12, 0x10 } }; // charcoal stripe
-    const smoke: vaxis.Color = .{ .rgb = .{ 0x6B, 0x5E, 0x56 } }; // smoke gray
-    const ember: vaxis.Color = .{ .rgb = .{ 0xE8, 0x60, 0x3C } }; // ember red
-    const moss: vaxis.Color = .{ .rgb = .{ 0x4A, 0x6B, 0x40 } }; // moss dim
-    const code_bg: vaxis.Color = .{ .rgb = .{ 0x2A, 0x1F, 0x1A } }; // inline-code background
+    // Core palette. Tigerclaw still keeps an amber accent for the
+    // brand banner and the prompt, but body text leans neutral so
+    // the eye isn't fighting saturated colours line after line.
+    pub const orange: vaxis.Color = .{ .rgb = .{ 0xFF, 0x8C, 0x1A } }; // tiger orange (banner only)
+    const cream: vaxis.Color = .{ .rgb = .{ 0xEC, 0xE4, 0xDA } }; // warm cream (agent body)
+    const sand: vaxis.Color = .{ .rgb = .{ 0xC9, 0xB8, 0xA0 } }; // muted sand (user echo)
+    const stripe: vaxis.Color = .{ .rgb = .{ 0x1A, 0x12, 0x10 } }; // charcoal stripe (chip bg)
+    const smoke: vaxis.Color = .{ .rgb = .{ 0x7A, 0x73, 0x6C } }; // medium grey (system / hints)
+    const dim: vaxis.Color = .{ .rgb = .{ 0x8E, 0x88, 0x7E } }; // tool grey
+    const ember: vaxis.Color = .{ .rgb = .{ 0xE8, 0x60, 0x3C } }; // ember red (errors / busy)
+    const link: vaxis.Color = .{ .rgb = .{ 0xC0, 0x90, 0x55 } }; // dim link amber
+    const code_fg: vaxis.Color = .{ .rgb = .{ 0xD9, 0xCB, 0xB4 } }; // soft cream for code
+    const code_bg: vaxis.Color = .{ .rgb = .{ 0x22, 0x22, 0x22 } }; // neutral dark grey
+    const heading: vaxis.Color = .{ .rgb = .{ 0xE7, 0xC0, 0x82 } }; // softened heading amber
+    /// Panel background -- the tinted block under the
+    /// input box and the user-message echoes. Needs a noticeable
+    /// step up from the terminal default black so the half-block
+    /// trick (`▄`/`▀` painted in this colour over a default-bg
+    /// cell) reads as a half-cell of tint rather than as a muddy
+    /// uniform row. With too little contrast the eye can't tell
+    /// the half-blocks from the solid content row, and the band
+    /// looks like one thick brick instead of a slim floating panel.
+    const panel_bg: vaxis.Color = .{ .rgb = .{ 0x3D, 0x3D, 0x3D } };
+    /// Status-bar background -- a half-shade lighter than the panel
+    /// so the bar reads as a footer rather than part of the input.
+    const status_bg: vaxis.Color = .{ .rgb = .{ 0x1E, 0x1E, 0x1E } };
+    /// Caution / warning accent (locked / plan mode) — a
+    /// muted yellow that doesn't fight the tiger orange.
+    const caution: vaxis.Color = .{ .rgb = .{ 0xC9, 0xB8, 0xA0 } };
 
     const title: vaxis.Style = .{ .fg = stripe, .bg = orange, .bold = true };
-    const agent_chip: vaxis.Style = .{ .fg = stripe, .bg = gold, .bold = true };
-    const status_idle: vaxis.Style = .{ .fg = green, .bold = true };
-    const status_busy: vaxis.Style = .{ .fg = amber, .bold = true };
+    const agent_chip: vaxis.Style = .{ .fg = stripe, .bg = sand, .bold = true };
+    const status_idle: vaxis.Style = .{ .fg = dim, .bold = true };
+    const status_busy: vaxis.Style = .{ .fg = ember, .bold = true };
     const separator: vaxis.Style = .{ .fg = smoke };
-    pub const user: vaxis.Style = .{ .fg = gold, .bold = true };
+    /// User echo: muted sand, no hot saturation. Bold keeps it
+    /// distinct from agent text without fighting the eye.
+    pub const user: vaxis.Style = .{ .fg = sand, .bold = true };
     pub const agent: vaxis.Style = .{ .fg = cream };
-    pub const system: vaxis.Style = .{ .fg = smoke, .italic = true };
-    /// Tool-call trace lines. Dim moss — enough to read but clearly
-    /// subordinate to the user/agent conversation.
-    pub const tool: vaxis.Style = .{ .fg = moss, .italic = true };
+    /// System notices: dim grey, no italic — italics in monospace
+    /// fonts often render as oblique slants that look broken,
+    /// especially on the speaker glyph itself.
+    pub const system: vaxis.Style = .{ .fg = smoke };
+    /// Tool-call trace lines. Plain dim grey — clearly subordinate
+    /// to the conversation but readable. No green, no italic.
+    pub const tool: vaxis.Style = .{ .fg = dim };
     pub const prompt: vaxis.Style = .{ .fg = orange, .bold = true };
-    pub const hint: vaxis.Style = .{ .fg = smoke, .italic = true };
+    pub const hint: vaxis.Style = .{ .fg = smoke };
+    /// Input box: cream foreground on the lifted panel background.
+    pub const input_text: vaxis.Style = .{ .fg = cream, .bg = panel_bg };
+    /// Muted prompt for the input panel and the user-message echo
+    /// in history. Dim sand keeps the `›` from screaming over the
+    /// content the user is composing.
+    pub const input_prompt: vaxis.Style = .{ .fg = sand, .bg = panel_bg };
+    /// Ghost placeholder: dim grey, same panel bg.
+    pub const input_ghost: vaxis.Style = .{ .fg = smoke, .bg = panel_bg };
+    /// Empty cell of the input panel — paints the bg tint.
+    pub const input_blank: vaxis.Style = .{ .bg = panel_bg };
+    /// Status bar: dim text on a slightly darker bg than the input
+    /// panel, so the eye reads "footer" instead of "another input".
+    pub const status_label: vaxis.Style = .{ .fg = smoke, .bg = status_bg };
+    pub const status_value: vaxis.Style = .{ .fg = cream, .bg = status_bg };
+    pub const status_blank: vaxis.Style = .{ .bg = status_bg };
+    /// Status caution text (e.g. `untrusted`).
+    pub const status_caution: vaxis.Style = .{ .fg = caution, .bg = status_bg };
     const picker_border: vaxis.Style = .{ .fg = orange };
     const picker_item: vaxis.Style = .{ .fg = cream };
     const picker_item_selected: vaxis.Style = .{ .fg = stripe, .bg = orange, .bold = true };
@@ -193,15 +239,15 @@ pub const palette = struct {
             .bold => s.bold = true,
             .italic => s.italic = true,
             .code => {
-                s.fg = gold;
+                s.fg = code_fg;
                 s.bg = code_bg;
             },
             .link => {
-                s.fg = orange;
+                s.fg = link;
                 s.ul_style = .single;
             },
             .heading => {
-                s.fg = orange;
+                s.fg = heading;
                 s.bold = true;
             },
             .block_quote => s.fg = smoke,
@@ -283,16 +329,47 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
         .agent_name = default_agent,
         .model_line = model_line,
         .workspace = cwd,
+        .home = opts.home,
+        .io = io,
     });
     defer root.deinit();
     root.wireSubmit();
     root.attachRunner(&agent_runner, &app);
-
-    // Seed a short welcome so the history isn't empty on first
-    // launch.
-    try root.appendLine(.agent, "Type a message and press Enter. Ctrl-C quits.");
+    root.attachSandbox(&live, sandboxAdapter, askGateAdapter);
+    live.ask_user_bridge = .{
+        .ctx = &root,
+        .post = askUserPostAdapter,
+        .take = askUserTakeAdapter,
+        .cancel = askUserCancelAdapter,
+    };
 
     try app.run(root.widget(), .{});
+}
+
+fn sandboxAdapter(ctx: *anyopaque, mode: u8, path: []const u8) void {
+    const live: *live_runner.LiveAgentRunner = @ptrCast(@alignCast(ctx));
+    const m: live_runner.LiveAgentRunner.SandboxMode = @enumFromInt(mode);
+    live.setSandboxMode(m, path) catch {};
+}
+
+fn askGateAdapter(ctx: *anyopaque, value: bool) void {
+    const live: *live_runner.LiveAgentRunner = @ptrCast(@alignCast(ctx));
+    live.setAskUserGate(value);
+}
+
+fn askUserPostAdapter(ctx: *anyopaque, allocator: std.mem.Allocator, question: []const u8) anyerror!void {
+    const root: *RootWidget = @ptrCast(@alignCast(ctx));
+    return root.askUserPost(allocator, question);
+}
+
+fn askUserTakeAdapter(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8 {
+    const root: *RootWidget = @ptrCast(@alignCast(ctx));
+    return root.askUserTake(allocator);
+}
+
+fn askUserCancelAdapter(ctx: *anyopaque) void {
+    const root: *RootWidget = @ptrCast(@alignCast(ctx));
+    root.askUserCancel();
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
@@ -1512,33 +1589,39 @@ fn chunkSink(sink_ctx: ?*anyopaque, fragment: []const u8) void {
     ctx.loop.postEvent(.{ .turn_chunk = owned });
 }
 
-/// Sink adapter for tool-dispatch boundaries. Both phases produce
-/// owned slices so the main loop can free them after handling.
+/// Sink adapter for tool-dispatch boundaries. Each variant of the
+/// `ToolEvent` union maps to a vaxis event the main loop frees after
+/// handling. `progress` events are dropped here today (phase 9 will
+/// route them into a streaming widget); the runner still fires them
+/// for any consumer that wants to.
 fn toolEventSink(
     sink_ctx: ?*anyopaque,
-    phase: harness.agent_runner.ToolEventPhase,
-    id: []const u8,
-    name: []const u8,
-    output: []const u8,
+    event: harness.agent_runner.ToolEvent,
 ) void {
     const ctx: *WorkerCtx = @ptrCast(@alignCast(sink_ctx.?));
-    switch (phase) {
-        .started => {
-            const id_owned = ctx.allocator.dupe(u8, id) catch return;
+    switch (event) {
+        .started => |s| {
+            const id_owned = ctx.allocator.dupe(u8, s.id) catch return;
             errdefer ctx.allocator.free(id_owned);
-            const name_owned = ctx.allocator.dupe(u8, name) catch return;
+            const name_owned = ctx.allocator.dupe(u8, s.name) catch return;
             ctx.loop.postEvent(.{ .turn_tool_start = .{ .id = id_owned, .name = name_owned } });
         },
-        .finished => {
-            const id_owned = ctx.allocator.dupe(u8, id) catch return;
+        .progress => {
+            // Phase 9 hook. Today the streamed bash chunks are
+            // visible in the final tool_result block once dispatch
+            // completes, so dropping in-flight chunks loses nothing.
+        },
+        .finished => |f| {
+            const id_owned = ctx.allocator.dupe(u8, f.id) catch return;
             errdefer ctx.allocator.free(id_owned);
-            const name_owned = ctx.allocator.dupe(u8, name) catch return;
+            const name_owned = ctx.allocator.dupe(u8, f.name) catch return;
             errdefer ctx.allocator.free(name_owned);
-            const output_owned = ctx.allocator.dupe(u8, output) catch return;
+            const preview = tool_preview.render(ctx.allocator, f.name, f.kind) catch
+                ctx.allocator.dupe(u8, f.kind.flatText()) catch return;
             ctx.loop.postEvent(.{ .turn_tool_done = .{
                 .id = id_owned,
                 .name = name_owned,
-                .output = output_owned,
+                .output = preview,
             } });
         },
     }

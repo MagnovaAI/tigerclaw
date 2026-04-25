@@ -51,8 +51,8 @@ const rule_smoke_style: vaxis.Style = .{ .fg = smoke };
 // --- wordmark ---
 
 /// ANSIShadow "TIGERCLAW" wordmark. Six visible rows rendered
-/// in a three-band gradient (gold → tiger orange → deep ember),
-/// using a three-band gradient. The asset is
+/// in a three-band gradient (gold → tiger orange → deep ember).
+/// The asset is
 /// 72 visible cells wide; thin box-drawing connectors (╔═╗) are
 /// part of the font and read as a unified shape in normal
 /// monospace fonts.
@@ -68,9 +68,9 @@ const wordmark_tc_cols: u16 = 17;
 const wordmark_tc_rows: u16 = 6;
 
 /// Per-row style: three bands, each spanning two rows. Top band
-/// is bold for emphasis (bold for emphasis); the
-/// remaining bands ride normal weight so the gradient reads as
-/// a soft falloff rather than a heavy block.
+/// is bold for emphasis; the remaining bands ride normal weight
+/// so the gradient reads as a soft falloff rather than a heavy
+/// block.
 const wordmark_styles = [wordmark_rows]vaxis.Style{
     .{ .fg = .{ .rgb = .{ 0xFF, 0xC8, 0x57 } }, .bold = true }, // gold
     .{ .fg = .{ .rgb = .{ 0xFF, 0xC8, 0x57 } }, .bold = true }, // gold
@@ -173,24 +173,12 @@ fn drawWide(self: *const Header, ctx: vxfw.DrawContext, surface: vxfw.Surface, w
     ) catch "tigerclaw";
     col += writeGraphemesCounted(ctx, surface, col, info_row, version_segment, title_style, width);
 
-    if (self.model_line.len > 0 and col + 3 < width) {
-        writeGraphemes(ctx, surface, col, info_row, " · ", info_style);
-        col += 3;
-        col += writeGraphemesCounted(ctx, surface, col, info_row, self.model_line, info_style, width);
-    }
-
     if (col + 3 < width) {
         writeGraphemes(ctx, surface, col, info_row, " · ", info_style);
         col += 3;
         writeGraphemes(ctx, surface, col, info_row, self.agent_name, agent_accent_style);
     }
 
-    // Workspace path on the next row, dim.
-    if (self.workspace.len > 0) {
-        const ws_row: u16 = info_row + 1;
-        const ws_line = contractHome(self.workspace);
-        writeGraphemes(ctx, surface, info_col, ws_row, ws_line, info_style);
-    }
 
     // Divider on the final row.
     drawDivider(surface, width, wide_rows - 1);
@@ -222,29 +210,8 @@ fn drawCompact(self: *const Header, ctx: vxfw.DrawContext, surface: vxfw.Surface
         ) catch "tigerclaw";
         writeGraphemes(ctx, surface, info_col, 0, version_line, title_style);
 
-        if (self.model_line.len > 0) {
-            const model_written = writeGraphemesCounted(
-                ctx,
-                surface,
-                info_col,
-                1,
-                self.model_line,
-                info_style,
-                width,
-            );
-            const sep_col = info_col + model_written;
-            if (sep_col + 3 < width) {
-                writeGraphemes(ctx, surface, sep_col, 1, " · ", info_style);
-                writeGraphemes(ctx, surface, sep_col + 3, 1, self.agent_name, agent_accent_style);
-            }
-        } else {
-            writeGraphemes(ctx, surface, info_col, 1, self.agent_name, agent_accent_style);
-        }
+        writeGraphemes(ctx, surface, info_col, 1, self.agent_name, agent_accent_style);
 
-        if (self.workspace.len > 0) {
-            const ws_line = contractHome(self.workspace);
-            writeGraphemes(ctx, surface, info_col, 2, ws_line, info_style);
-        }
     }
 
     drawDivider(surface, width, compact_rows - 1);

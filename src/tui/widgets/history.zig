@@ -1,33 +1,36 @@
 //! vxfw history widget.
 //!
-//! Renders a bottom-anchored list of chat lines — each one a
-//! speaker glyph + styled body with per-byte markdown spans. The
-//! widget borrows a `[]const Line` from the owner (RootWidget);
-//! it doesn't manage the history's lifecycle.
+//! Renders a bottom-anchored, scrollable list of chat lines. Each
+//! line is a speaker glyph + styled body with per-byte markdown
+//! spans. The widget borrows a `[]const Line` from the owner
+//! (RootWidget); it doesn't manage history's lifecycle.
 //!
-//! Behavior preserved from the hand-rolled drawHistory:
-//!   * Bottom-up rendering (newest line at the pane's bottom row).
-//!   * Column-aware wrapping via vaxis's grapheme-width table.
-//!   * Hard-break on embedded `\n` so multi-line tool output
-//!     paints in the correct order.
-//!   * Role prefix at the first row of each line; continuation
-//!     rows indent under it.
-//!   * Markdown spans overlaid on the line's base style.
+//! Rendering is two-pass:
+//!   1. Walk the lines and emit one `LogicalRow` per wrapped /
+//!      hard-broken row (the "buffer").
+//!   2. Slice a height-tall viewport out of the buffer, anchored
+//!      by `scroll_offset`, and paint it into the surface.
 //!
-//! Intentionally not preserved: the old bits of math that mixed
-//! bytes with columns. Everything here is measured in display
-//! cells from the start.
+//! `scroll_offset` is the number of rows the user has scrolled up
+//! from the live tail. 0 = newest content sits at the bottom row;
+//! larger values reveal older content above. The owner reset to
+//! 0 on every new chunk so streaming output is always visible.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const tui = @import("../root.zig");
 const md = @import("../md.zig");
+const user_message = @import("user_message.zig");
 
 const History = @This();
 
 // --- state (borrowed) ---
 lines: []const tui.Line,
+/// Rows of scrollback above the live tail. 0 = bottom (newest at
+/// the last row); larger values shift the viewport upward into
+/// older content. Clamped at draw time.
+scroll_offset: u32 = 0,
 
 pub fn widget(self: *const History) vxfw.Widget {
     return .{
@@ -41,6 +44,32 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     return self.draw(ctx);
 }
 
+/// One physical row of the rendered buffer. `bytes` and the
+/// associated metadata point into the source `Line.text`; `spans`
+/// is the same span slice the source line carries (or null), with
+/// the row's `bytes_start_in_line` offset to feed `pickStyle`.
+///
+/// `kind = .blank` rows occupy vertical space (used to gap role
+/// transitions) but paint nothing -- they have no source line.
+/// `kind = .user_pad_top` paints `▄` (lower-half block) full-width
+/// in the panel tint -- the bottom half of the row is tinted, the
+/// top half is the terminal default. `kind = .user_pad_bot` mirrors
+/// with `▀`. Together with a solid-tint content row in between,
+/// they form the half-block centred-prompt look.
+const LogicalRow = struct {
+    kind: Kind,
+    line_idx: u32 = 0,
+    /// Offset within `line.text.items` where this row starts.
+    bytes_offset: u32 = 0,
+    /// Length of this row's bytes within `line.text.items`.
+    bytes_len: u32 = 0,
+    /// True only for the line's first physical row -- the row that
+    /// gets the speaker glyph painted at column 0.
+    is_first: bool = false,
+
+    pub const Kind = enum { content, blank, user_pad_top, user_pad_bot };
+};
+
 pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
     const width = ctx.max.width orelse 0;
     const height = ctx.max.height orelse 0;
@@ -52,95 +81,204 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
     );
     if (width == 0 or height == 0 or self.lines.len == 0) return surface;
 
-    // Walk bottom-up. `row_cursor` is the next row to paint into,
-    // starting from the last row of the pane. For each history
-    // entry we compute how many rows it needs, then paint top-down
-    // starting at `row_cursor - rows_needed + 1`.
-    var row_cursor: i32 = @as(i32, @intCast(height)) - 1;
-    var i: usize = self.lines.len;
-    while (i > 0 and row_cursor >= 0) {
-        i -= 1;
-        const line = self.lines[i];
-        const prefix = prefixFor(line.role);
-        const prefix_cols = measureCols(prefix);
-        const avail = if (width > prefix_cols) width - prefix_cols else 1;
+    // Pass 1: flatten the history into a list of physical rows. We
+    // allocate into the draw context's arena so the slice's lifetime
+    // ends with the frame.
+    var rows: std.ArrayList(LogicalRow) = .empty;
+    // No deinit -- arena reclaims on frame end.
 
-        // Rows needed, counting embedded newlines as hard breaks.
-        var rows_needed: usize = 0;
-        var seg_it = std.mem.splitScalar(u8, line.text.items, '\n');
-        while (seg_it.next()) |seg| {
-            const seg_cols = measureCols(seg);
-            const seg_rows: usize = if (seg_cols == 0) 1 else (seg_cols + avail - 1) / avail;
-            rows_needed += seg_rows;
+    // Insert a blank row before every speaker change (and before
+    // every fresh user/agent turn following a tool block) so the
+    // chat doesn't read as one dense wall. Tool lines stay tight
+    // under the agent line they belong to.
+    var prev_role: ?tui.Line.Role = null;
+    for (self.lines, 0..) |line, idx| {
+        // Inter-role gap. User lines bracket themselves with
+        // half-block pad rows below, so they don't take a regular
+        // gap row -- the `▄` above the content already separates
+        // them visually from whatever came before.
+        if (line.role == .user) {
+            try rows.append(ctx.arena, .{ .kind = .user_pad_top });
+        } else if (shouldGapBefore(prev_role, line.role)) {
+            try rows.append(ctx.arena, .{ .kind = .blank });
         }
-        if (rows_needed == 0) rows_needed = 1;
-        if (rows_needed > 32) rows_needed = 32;
+        prev_role = line.role;
 
-        var remaining = line.text.items;
-        var start_row = row_cursor - @as(i32, @intCast(rows_needed - 1));
+        const prefix_cols = measureCols(prefixFor(line.role));
+        const avail: usize = if (width > prefix_cols) width - prefix_cols else 1;
 
-        // Off-screen top: skip the appropriate number of leading
-        // display cols so what's visible starts at row 0.
-        if (start_row < 0) {
-            const drop = @as(usize, @intCast(-start_row));
-            if (drop >= rows_needed) {
-                row_cursor -= @intCast(rows_needed);
-                continue;
+        // Per-line cap mirrors the old renderer: a runaway tool
+        // dump shouldn't be able to fill the whole buffer with one
+        // entry. The remainder is silently truncated.
+        var rows_in_line: u32 = 0;
+        const max_rows_per_line: u32 = 32;
+
+        var seg_start: usize = 0;
+        while (seg_start <= line.text.items.len and rows_in_line < max_rows_per_line) {
+            const nl_pos = std.mem.indexOfScalarPos(u8, line.text.items, seg_start, '\n');
+            const seg_end = nl_pos orelse line.text.items.len;
+            const segment = line.text.items[seg_start..seg_end];
+
+            // Empty segment (a literal blank line) still occupies
+            // one row.
+            if (segment.len == 0) {
+                try rows.append(ctx.arena, .{
+                    .kind = .content,
+                    .line_idx = @intCast(idx),
+                    .bytes_offset = @intCast(seg_start),
+                    .bytes_len = 0,
+                    .is_first = (rows_in_line == 0),
+                });
+                rows_in_line += 1;
+            } else {
+                // Soft-wrap by display columns.
+                var off: usize = 0;
+                while (off < segment.len and rows_in_line < max_rows_per_line) {
+                    const taken = takeCols(segment[off..], avail);
+                    const take = if (taken.bytes == 0) safeUtf8Take(segment[off..], 1) else taken.bytes;
+                    if (take == 0) break;
+                    try rows.append(ctx.arena, .{
+                        .kind = .content,
+                        .line_idx = @intCast(idx),
+                        .bytes_offset = @intCast(seg_start + off),
+                        .bytes_len = @intCast(take),
+                        .is_first = (rows_in_line == 0),
+                    });
+                    rows_in_line += 1;
+                    off += take;
+                }
             }
-            var cols_to_skip: usize = drop * avail;
-            while (cols_to_skip > 0 and remaining.len > 0) {
-                const taken = takeCols(remaining, cols_to_skip);
-                if (taken.bytes == 0) break;
-                remaining = remaining[taken.bytes..];
-                cols_to_skip -= taken.cols;
-                if (taken.cols == 0) break;
+
+            // Move past the newline if any. When we ran out at the
+            // end of the buffer (no newline) this exits the loop.
+            if (nl_pos) |p| {
+                seg_start = p + 1;
+            } else {
+                break;
             }
-            rows_needed -= drop;
-            start_row = 0;
+        }
+
+        // Edge case: a line with empty text and no newline still
+        // wants a row so the speaker glyph is visible.
+        if (rows_in_line == 0) {
+            try rows.append(ctx.arena, .{
+                .kind = .content,
+                .line_idx = @intCast(idx),
+                .bytes_offset = 0,
+                .bytes_len = 0,
+                .is_first = true,
+            });
+        }
+
+        // Trailing half-block: closes the user-message tint band.
+        if (line.role == .user) {
+            try rows.append(ctx.arena, .{ .kind = .user_pad_bot });
+        }
+    }
+
+    if (rows.items.len == 0) return surface;
+
+    const total_rows: u32 = @intCast(rows.items.len);
+
+    // Compute the viewport over the rows buffer.
+    //
+    // viewport_top = first row of the buffer that lands on screen.
+    // When the buffer fits entirely in the pane, we anchor to the
+    // bottom (newer content at the bottom row, older above) -- this
+    // matches the user's prior expectation of a chat log.
+    //
+    // When the buffer is larger than the pane, scroll_offset slides
+    // the window upward by N rows. Clamped so the oldest row is
+    // always at least partially visible.
+    const max_offset: u32 = if (total_rows > height) total_rows - height else 0;
+    const offset: u32 = if (self.scroll_offset > max_offset) max_offset else self.scroll_offset;
+
+    const viewport_bottom: u32 = total_rows - offset;
+    const viewport_top: u32 = if (viewport_bottom > height) viewport_bottom - height else 0;
+
+    // First screen row that holds content. When total_rows < height
+    // we leave the top of the pane blank so the newest line still
+    // sits at the bottom row.
+    const screen_first_row: u32 = if (viewport_bottom < height) height - viewport_bottom else 0;
+
+    // Pass 2: paint each visible row.
+    var screen_row: u16 = @intCast(screen_first_row);
+    var i: u32 = viewport_top;
+    while (i < viewport_bottom and screen_row < height) : (i += 1) {
+        const r = rows.items[i];
+        // Blank rows just consume vertical space — the surface is
+        // already zero-initialized so we don't need to paint
+        // anything to leave them empty.
+        if (r.kind == .blank) {
+            screen_row += 1;
+            continue;
+        }
+        // Half-block pad rows -- delegated to the user_message
+        // widget so the band's look (half-block glyphs, tint,
+        // inset) lives in one place.
+        if (r.kind == .user_pad_top or r.kind == .user_pad_bot) {
+            user_message.paintRow(
+                ctx,
+                surface,
+                screen_row,
+                if (r.kind == .user_pad_top) .top else .bot,
+                "",
+                0,
+                null,
+                false,
+                0,
+                0,
+            );
+            screen_row += 1;
+            continue;
+        }
+        const line = &self.lines[r.line_idx];
+
+        // User-message content rows are owned by the user_message
+        // widget so the band's look (tinted bg, prompt glyph,
+        // body text style) lives in one module.
+        if (line.role == .user) {
+            const body_user = line.text.items[r.bytes_offset..][0..r.bytes_len];
+            user_message.paintRow(
+                ctx,
+                surface,
+                screen_row,
+                .content,
+                body_user,
+                r.bytes_offset,
+                line.spans,
+                r.is_first,
+                0,
+                0,
+            );
+            screen_row += 1;
+            continue;
         }
 
         const base_style = styleFor(line.role);
+        const prefix = prefixFor(line.role);
+        const prefix_cols = measureCols(prefix);
 
-        // Paint the prefix at the first row of the line.
-        writeGraphemes(ctx, surface, 0, @intCast(start_row), prefix, base_style);
-
-        // Paint the body, segment by segment (hard-wrap on \n),
-        // then soft-wrap on `avail` columns.
-        const total_len = line.text.items.len;
-        const span_offset_start: usize = total_len - remaining.len;
-
-        var row = start_row;
-        var col_offset: usize = prefix_cols;
-        var cursor_abs: usize = span_offset_start;
-        while (remaining.len > 0 and row < height) {
-            const nl_pos: ?usize = std.mem.indexOfScalar(u8, remaining, '\n');
-            const limit = if (nl_pos) |p| p else remaining.len;
-
-            const taken = takeCols(remaining[0..limit], avail);
-            const take = if (taken.bytes == 0) safeUtf8Take(remaining[0..limit], 1) else taken.bytes;
-
-            paintRow(
-                ctx,
-                surface,
-                @intCast(row),
-                @intCast(col_offset),
-                remaining[0..take],
-                cursor_abs,
-                base_style,
-                line.spans,
-            );
-
-            remaining = remaining[take..];
-            cursor_abs += take;
-            if (remaining.len > 0 and remaining[0] == '\n') {
-                remaining = remaining[1..];
-                cursor_abs += 1;
-            }
-            row += 1;
-            col_offset = prefix_cols;
+        // First physical row of the line gets the speaker glyph.
+        // Continuation rows indent under it so wrapped text aligns
+        // visually with the body of the first row.
+        if (r.is_first) {
+            writeGraphemes(ctx, surface, 0, screen_row, prefix, base_style);
         }
 
-        row_cursor -= @intCast(rows_needed);
+        const body = line.text.items[r.bytes_offset..][0..r.bytes_len];
+        paintRow(
+            ctx,
+            surface,
+            screen_row,
+            @intCast(prefix_cols),
+            body,
+            r.bytes_offset,
+            base_style,
+            line.spans,
+        );
+
+        screen_row += 1;
     }
 
     return surface;
@@ -208,6 +346,56 @@ fn measureCols(bytes: []const u8) usize {
     return @intCast(vaxis.gwidth.gwidth(bytes, .unicode));
 }
 
+/// Decide whether to insert a one-row gap before a line of `cur`
+/// that follows a line of `prev`. Tool lines stay tight under the
+/// agent line they belong to. User lines bracket themselves with
+/// half-block pad rows, so they don't need a regular gap on top of
+/// that -- the `▄` row already separates them visually from
+/// whatever came before. Every other transition gets one row of
+/// breathing room.
+fn shouldGapBefore(prev: ?tui.Line.Role, cur: tui.Line.Role) bool {
+    const p = prev orelse return false; // first line: no leading gap
+    if (p == cur) return false;
+    if (cur == .tool) return false; // tool clings to the line above
+    if (cur == .user) return false; // user_pad_top already separates
+    if (p == .user) return false; // user_pad_bot already separates
+    return true;
+}
+
+/// Sum the wrapped row count of every line as it would render at
+/// `width`, including the inter-role gap rows the draw pass injects.
+/// Used for max-scroll computations and tests; mirrors the per-line
+/// capping the draw loop applies.
+pub fn totalRowsFor(lines: []const tui.Line, width: u16) u32 {
+    if (width == 0) return 0;
+    var total: u32 = 0;
+    var prev_role: ?tui.Line.Role = null;
+    for (lines) |line| {
+        if (line.role == .user) {
+            total += 2; // half-block pads above and below the content
+        } else if (shouldGapBefore(prev_role, line.role)) {
+            total += 1;
+        }
+        prev_role = line.role;
+
+        const prefix = prefixFor(line.role);
+        const prefix_cols = measureCols(prefix);
+        const avail: usize = if (width > prefix_cols) width - prefix_cols else 1;
+
+        var rows_needed: u32 = 0;
+        var seg_it = std.mem.splitScalar(u8, line.text.items, '\n');
+        while (seg_it.next()) |seg| {
+            const seg_cols = measureCols(seg);
+            const seg_rows: u32 = if (seg_cols == 0) 1 else @intCast((seg_cols + avail - 1) / avail);
+            rows_needed += seg_rows;
+        }
+        if (rows_needed == 0) rows_needed = 1;
+        if (rows_needed > 32) rows_needed = 32;
+        total += rows_needed;
+    }
+    return total;
+}
+
 fn safeUtf8Take(bytes: []const u8, max: usize) usize {
     if (max >= bytes.len) return bytes.len;
     if (max == 0) return 0;
@@ -240,15 +428,12 @@ fn writeGraphemes(
 }
 
 fn prefixFor(role: tui.Line.Role) []const u8 {
-    // Line glyph scheme:
-    //   ⏺  every action/utterance (agent + tool)
-    //   ❯  the user's input echo
-    //   ∙  system notices
-    // Single-cell ASCII-adjacent glyphs only — no wide emoji,
-    // no braille spinners inline. Animation lives in the
-    // dedicated thinking row above the input.
+    // Single-cell ASCII-adjacent glyphs only -- no wide emoji,
+    // no braille spinners inline. The `›` for user mirrors the
+    // input box's prompt so a sent message visually echoes the
+    // panel it was typed into.
     return switch (role) {
-        .user => "❯ ",
+        .user => "› ",
         .agent => "⏺ ",
         .system => "∙ ",
         .tool => "⎿ ",
@@ -257,7 +442,10 @@ fn prefixFor(role: tui.Line.Role) []const u8 {
 
 fn styleFor(role: tui.Line.Role) vaxis.Style {
     return switch (role) {
-        .user => tui.palette.user,
+        // User echo gets the input panel's bg tint + cream fg, so a
+        // sent message looks like a frozen copy of the input row.
+        // Bold keeps the prefix prompt glyph visually weighted.
+        .user => tui.palette.input_text,
         .agent => tui.palette.agent,
         .system => tui.palette.system,
         .tool => tui.palette.tool,
@@ -276,4 +464,60 @@ fn pickStyle(abs: usize, base: vaxis.Style, spans: ?[]md.Span) vaxis.Style {
         }
     }
     return s;
+}
+
+// --- tests -----------------------------------------------------------------
+
+const testing = std.testing;
+
+test "totalRowsFor: single short agent line counts as one row" {
+    const allocator = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, "hello");
+    const lines = [_]tui.Line{.{ .role = .agent, .text = text }};
+    try testing.expectEqual(@as(u32, 1), totalRowsFor(&lines, 80));
+}
+
+test "totalRowsFor: wraps long agent line by available columns" {
+    const allocator = testing.allocator;
+    // 200 cols of content at width 50 (less the 2-col agent prefix
+    // = 48 avail) wraps to 5 rows: ceil(200 / 48).
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendNTimes(allocator, 'x', 200);
+    const lines = [_]tui.Line{.{ .role = .agent, .text = text }};
+    try testing.expectEqual(@as(u32, 5), totalRowsFor(&lines, 50));
+}
+
+test "totalRowsFor: user line gets half-block pads above and below" {
+    const allocator = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, "hi");
+    const lines = [_]tui.Line{.{ .role = .user, .text = text }};
+    // 1 top pad + 1 content + 1 bottom pad = 3.
+    try testing.expectEqual(@as(u32, 3), totalRowsFor(&lines, 80));
+}
+
+test "totalRowsFor: hard \\n breaks count distinct rows" {
+    const allocator = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, "a\nb\nc");
+    const lines = [_]tui.Line{.{ .role = .agent, .text = text }};
+    try testing.expectEqual(@as(u32, 3), totalRowsFor(&lines, 80));
+}
+
+test "totalRowsFor: empty list is zero" {
+    try testing.expectEqual(@as(u32, 0), totalRowsFor(&.{}, 80));
+}
+
+test "totalRowsFor: per-line cap at 32 rows" {
+    const allocator = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendNTimes(allocator, 'x', 10_000);
+    const lines = [_]tui.Line{.{ .role = .agent, .text = text }};
+    try testing.expectEqual(@as(u32, 32), totalRowsFor(&lines, 21));
 }

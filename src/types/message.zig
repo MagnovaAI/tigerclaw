@@ -8,8 +8,8 @@
 //!
 //! Roles are `system`, `user`, `assistant`. There is intentionally no
 //! `.tool` role — tool results ride on a `user` message via a
-//! `tool_result` content block, mirroring Anthropic's API and how
-//! the wire shape the provider expects. The TUI's display-side
+//! `tool_result` content block, matching the wire shape the
+//! provider expects. The TUI's display-side
 //! `Line.Role` keeps a `.tool` category for rendering, which is
 //! unrelated to the wire role.
 

@@ -116,7 +116,7 @@ fn writeTimestamp(w: *std.Io.Writer, color: bool) void {
     w.writeAll(" ") catch return;
 }
 
-// ── Banner line (one-liner) ───────────────────
+// ── Banner line (one-liner) ──────────────────────────────────
 
 pub const BannerOptions = struct {
     version: []const u8 = "dev",

@@ -18,11 +18,17 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const tui = @import("../root.zig");
+const tool_preview = @import("../tool_preview.zig");
+const md = @import("../md.zig");
 const harness = @import("../../harness/root.zig");
 const Header = @import("header.zig");
 const History = @import("history.zig");
 const Input = @import("input.zig");
 const Thinking = @import("thinking.zig");
+const Hint = @import("hint.zig");
+const StatusBar = @import("status_bar.zig");
+const CommandMenu = @import("command_menu.zig");
+const skills_mod = @import("../../skills/skills.zig");
 
 const Root = @This();
 
@@ -36,6 +42,14 @@ header: Header,
 history: std.ArrayList(tui.Line) = .empty,
 input: Input,
 thinking: Thinking = .{},
+/// Hint strip above the input. Texts are short borrowed slices
+/// — owned by the widget when literal, owned by the Root when
+/// dynamic.
+hint: Hint = .{ .left = "↑↓ scroll  ·  ctrl-c quit", .right = "" },
+/// Status bar below the input. Values reset to sensible defaults;
+/// the agent name lives in the model line so the workspace and
+/// sandbox columns stay focused on environment context.
+status_bar: StatusBar = .{},
 /// Wall-clock instant the current turn started, in ms since
 /// the Unix epoch. 0 when no turn is in flight.
 turn_started_ms: i64 = 0,
@@ -55,11 +69,68 @@ pending_agent_line: ?usize = null,
 /// line yet. If the turn finishes with zero text (tool-only
 /// reply, error mid-stream), we drop the empty placeholder.
 pending_saw_text: bool = false,
+/// Rows of scrollback offset. 0 = the newest line sits at the
+/// bottom of the history pane (default behavior). PageUp/Ctrl-U
+/// nudge the value up; PageDown/Ctrl-D and any new chunk reset
+/// to 0 so streaming output is never hidden.
+scroll_offset: u32 = 0,
+/// Slash command popup. Visible whenever the input buffer starts
+/// with `/`. Cursor selects which command Enter will execute.
+command_menu: CommandMenu = .{},
+command_menu_cursor: usize = 0,
+/// User-toggled: when false, tool_start / tool_done UEs do not
+/// add lines to the history. Default off so the chat reads as a
+/// plain conversation; `/tools on` re-enables for debugging.
+tool_output_enabled: bool = false,
+/// Set to true when a slash command requests app shutdown (e.g.
+/// `/quit`). The submit handler can't call `ctx.quit = true`
+/// directly because the Input widget owns the EventContext at
+/// callback time; we flip this flag and the eventHandler honours
+/// it on the next pass.
+quit_requested: bool = false,
+/// Borrowed home dir, used by `/skills` to scan the skills root
+/// on demand (so newly-installed skills appear without restart).
+home_dir: []const u8 = "",
+/// Borrowed workspace dir (process cwd at launch). `/lock` with
+/// no args defaults to this.
+workspace_dir: []const u8 = "",
+/// Borrowed std.Io for filesystem reads from slash commands.
+io: ?std.Io = null,
+/// Sandbox mode mirror. The runner is the source of truth; we
+/// keep a local copy so the UI can paint without poking the
+/// runner from the draw thread.
+sandbox_mode: SandboxMode = .unlocked,
+/// Active path when sandbox_mode == .locked. Owned by the
+/// allocator; freed on update + on deinit.
+sandbox_path: []u8 = &.{},
+/// `ask_user` gate mirror — see runner's flag of the same name.
+ask_user_gate: bool = true,
+/// Set when the agent has called `ask_user` and we're waiting
+/// for the user's reply. The next submit will be captured into
+/// `pending_reply` instead of starting a new turn. Atomic
+/// because the worker thread reads it (via the gate-flip
+/// reset path) while the UI thread sets/clears it.
+ask_user_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+/// One-shot slot for the user's reply to `ask_user`. Owned;
+/// freed by the worker thread after it consumes it.
+pending_reply: ?[]u8 = null,
+/// Spinlock guarding `pending_reply` since the worker thread
+/// reads it concurrently with the UI thread's writes.
+pending_reply_busy: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+/// Bridge into the runner. Wired by `attachSandbox` from the
+/// TUI runtime; null in tests where the runner doesn't exist.
+sandbox_setter: ?*const fn (ctx: *anyopaque, mode: u8, path: []const u8) void = null,
+ask_gate_setter: ?*const fn (ctx: *anyopaque, value: bool) void = null,
+sandbox_ctx: ?*anyopaque = null,
+
+pub const SandboxMode = enum(u8) { unlocked = 0, locked = 1, plan = 2 };
 
 pub const InitOptions = struct {
     agent_name: []const u8 = "tiger",
     model_line: []const u8 = "",
     workspace: []const u8 = "",
+    home: []const u8 = "",
+    io: ?std.Io = null,
 };
 
 pub fn init(allocator: std.mem.Allocator, opts: InitOptions) Root {
@@ -72,6 +143,15 @@ pub fn init(allocator: std.mem.Allocator, opts: InitOptions) Root {
         },
         .input = Input.init(allocator),
         .session_id = opts.agent_name,
+        .home_dir = opts.home,
+        .workspace_dir = opts.workspace,
+        .io = opts.io,
+        .status_bar = .{
+            .workspace = if (opts.workspace.len == 0) "~" else opts.workspace,
+            .sandbox = "unlocked",
+            .model = opts.model_line,
+            .sandbox_caution = false,
+        },
     };
 }
 
@@ -82,7 +162,20 @@ pub fn attachRunner(self: *Root, runner: *harness.AgentRunner, app: *vxfw.App) v
     self.app = app;
 }
 
+/// Wire the runner-side bridges for sandbox + ask gate.
+pub fn attachSandbox(
+    self: *Root,
+    ctx: *anyopaque,
+    sandbox_setter: *const fn (ctx: *anyopaque, mode: u8, path: []const u8) void,
+    ask_gate_setter: *const fn (ctx: *anyopaque, value: bool) void,
+) void {
+    self.sandbox_ctx = ctx;
+    self.sandbox_setter = sandbox_setter;
+    self.ask_gate_setter = ask_gate_setter;
+}
+
 pub fn deinit(self: *Root) void {
+    if (self.sandbox_path.len > 0) self.allocator.free(self.sandbox_path);
     for (self.history.items) |*l| {
         l.text.deinit(self.allocator);
         l.deinitSpans(self.allocator);
@@ -103,6 +196,57 @@ pub fn wireSubmit(self: *Root) void {
 fn onSubmit(ctx: ?*anyopaque, text: []const u8) void {
     const self: *Root = @ptrCast(@alignCast(ctx.?));
     if (text.len == 0) return;
+
+    // ask_user wait: when an agent question is pending, the next
+    // user submit is the reply. We park it in `pending_reply`
+    // (worker thread polls), echo the answer in history, and
+    // clear the pending flag.
+    if (self.ask_user_pending.load(.seq_cst)) {
+        const reply_copy = self.allocator.dupe(u8, text) catch return;
+        self.beginPendingReply();
+        if (self.pending_reply) |old| self.allocator.free(old);
+        self.pending_reply = reply_copy;
+        self.endPendingReply();
+        self.appendLine(.user, text) catch {};
+        self.ask_user_pending.store(false, .seq_cst);
+        self.hint.left = "↑↓ scroll  ·  ctrl-c quit";
+        return;
+    }
+
+    // Slash commands are intercepted before they reach the runner.
+    // The leading `/` plus the typed name becomes a built-in
+    // action; nothing is sent to the LLM.
+    if (text.len > 0 and text[0] == '/') {
+        // If the menu is open, prefer the highlighted item over
+        // the literal typed name — that way users can fuzzy-type
+        // a few letters and Enter the menu's pick.
+        const literal = text[1..];
+        const cmd = blk: {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const visible = CommandMenu.filter(arena.allocator(), literal) catch break :blk literal;
+            if (visible.len == 0) break :blk literal;
+            const idx = if (self.command_menu_cursor < visible.len) self.command_menu_cursor else 0;
+            // The menu entry name might just be a prefix (e.g.
+            // user types `/age` and the menu highlights `agents`).
+            // Append any literal trailing args (after the first
+            // space in `literal`) so `/agents foo` still routes
+            // arguments through.
+            const space = std.mem.indexOfScalar(u8, literal, ' ');
+            if (space) |s| {
+                const args_with_space = literal[s..];
+                const joined = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ visible[idx].name, args_with_space }) catch break :blk literal;
+                self.dispatchCommand(joined);
+                self.allocator.free(joined);
+                return;
+            } else {
+                break :blk visible[idx].name;
+            }
+        };
+        self.dispatchCommand(cmd);
+        return;
+    }
+
     // Don't start a second turn while one is in flight. The user
     // can type the next message — it'll just queue up as another
     // history line but the runner won't fire.
@@ -115,6 +259,243 @@ fn onSubmit(ctx: ?*anyopaque, text: []const u8) void {
         const msg = std.fmt.bufPrint(&buf, "! could not start turn: {s}", .{@errorName(err)}) catch "! turn failed";
         self.appendLine(.system, msg) catch {};
     };
+}
+
+/// Run a slash command. `cmd` is the bare name (no leading `/`),
+/// optionally followed by a single space and arguments.
+fn dispatchCommand(self: *Root, cmd: []const u8) void {
+    const space = std.mem.indexOfScalar(u8, cmd, ' ');
+    const name = if (space) |s| cmd[0..s] else cmd;
+    const args = if (space) |s| std.mem.trim(u8, cmd[s + 1 ..], " \t") else "";
+
+    if (std.mem.eql(u8, name, "quit") or std.mem.eql(u8, name, "exit")) {
+        self.quit_requested = true;
+        return;
+    }
+    if (std.mem.eql(u8, name, "tools")) {
+        if (std.mem.eql(u8, args, "on")) {
+            self.tool_output_enabled = true;
+            self.appendLine(.system, "tool output: on") catch {};
+        } else if (std.mem.eql(u8, args, "off")) {
+            self.tool_output_enabled = false;
+            self.appendLine(.system, "tool output: off") catch {};
+        } else {
+            const msg = if (self.tool_output_enabled) "tool output: on (use `/tools off` to hide)" else "tool output: off (use `/tools on` to show)";
+            self.appendLine(.system, msg) catch {};
+        }
+        return;
+    }
+    if (std.mem.eql(u8, name, "config")) {
+        self.runConfigCommand() catch {};
+        return;
+    }
+    if (std.mem.eql(u8, name, "skills")) {
+        self.runSkillsCommand() catch {};
+        return;
+    }
+    if (std.mem.eql(u8, name, "lock")) {
+        // /lock           -> lock to the launch cwd
+        // /lock <path>    -> lock to a user-specified path
+        const path_arg = if (args.len > 0) args else self.workspace_dir;
+        if (path_arg.len == 0) {
+            self.appendLine(.system, "lock: no path available; try `/lock <path>`") catch {};
+            return;
+        }
+        const path_z = self.allocator.dupeZ(u8, path_arg) catch return;
+        defer self.allocator.free(path_z);
+        var resolved_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const resolved_ptr = std.c.realpath(path_z.ptr, &resolved_buf);
+        if (resolved_ptr == null) {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "lock: cannot resolve `{s}`", .{path_arg}) catch "lock: cannot resolve path";
+            self.appendLine(.system, msg) catch {};
+            return;
+        }
+        const resolved_len = std.mem.indexOfScalar(u8, &resolved_buf, 0) orelse resolved_buf.len;
+        const resolved = resolved_buf[0..resolved_len];
+        if (resolved.len == 0) {
+            self.appendLine(.system, "lock: resolved path is empty; aborting") catch {};
+            return;
+        }
+        self.setSandboxMode(.locked, resolved);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        buf.appendSlice(self.allocator, "workspace: locked to ") catch {};
+        buf.appendSlice(self.allocator, resolved) catch {};
+        self.appendLine(.system, buf.items) catch {};
+        return;
+    }
+    if (std.mem.eql(u8, name, "unlock")) {
+        self.setSandboxMode(.unlocked, "");
+        self.appendLine(.system, "workspace: unlocked") catch {};
+        return;
+    }
+    if (std.mem.eql(u8, name, "plan")) {
+        self.setSandboxMode(.plan, "");
+        self.appendLine(.system, "workspace: plan mode (read-only; no write_file / edit_file / bash)") catch {};
+        return;
+    }
+    if (std.mem.eql(u8, name, "ask")) {
+        if (std.mem.eql(u8, args, "on")) {
+            self.setAskGate(true);
+            self.appendLine(.system, "ask_user gate: on (the agent can pause to ask questions)") catch {};
+        } else if (std.mem.eql(u8, args, "off")) {
+            self.setAskGate(false);
+            self.appendLine(.system, "ask_user gate: off (the agent will decide on its own)") catch {};
+        } else {
+            const msg = if (self.ask_user_gate) "ask_user gate: on (use `/ask off` to disable)" else "ask_user gate: off (use `/ask on` to enable)";
+            self.appendLine(.system, msg) catch {};
+        }
+        return;
+    }
+    if (std.mem.eql(u8, name, "agents")) {
+        // Re-using the picker requires hooking back into legacy TUI
+        // state that lives outside this widget; surface a hint.
+        self.appendLine(.system, "agents picker: press Ctrl-E (slash trigger TBD)") catch {};
+        return;
+    }
+
+    var buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "unknown command: /{s}", .{name}) catch "unknown command";
+    self.appendLine(.system, msg) catch {};
+}
+
+/// Set the active sandbox mode and (optionally) lock path. Mirrors
+/// the change into the runner via the bridge so tool dispatch on
+/// the worker thread sees the new value on its next call.
+fn setSandboxMode(self: *Root, mode: SandboxMode, path: []const u8) void {
+    self.sandbox_mode = mode;
+    if (self.sandbox_path.len > 0) self.allocator.free(self.sandbox_path);
+    self.sandbox_path = if (mode == .locked and path.len > 0)
+        self.allocator.dupe(u8, path) catch &.{}
+    else
+        &.{};
+
+    self.status_bar.sandbox = switch (mode) {
+        .unlocked => "unlocked",
+        .locked => "locked",
+        .plan => "plan",
+    };
+    self.status_bar.sandbox_caution = mode != .unlocked;
+
+    if (self.sandbox_setter) |setter| {
+        if (self.sandbox_ctx) |ctx| setter(ctx, @intFromEnum(mode), self.sandbox_path);
+    }
+}
+
+fn beginPendingReply(self: *Root) void {
+    while (self.pending_reply_busy.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn endPendingReply(self: *Root) void {
+    self.pending_reply_busy.store(0, .release);
+}
+
+/// Worker-thread entry: post a question into the UI. Hands off
+/// ownership of `question` (caller-owned slice copy) to the UE
+/// payload; the UI handler frees it after rendering.
+pub fn askUserPost(self: *Root, allocator: std.mem.Allocator, question: []const u8) anyerror!void {
+    const app = self.app orelse return error.NoApp;
+    const payload = try allocator.create(AskUserPayload);
+    errdefer allocator.destroy(payload);
+    payload.* = .{ .question = try allocator.dupe(u8, question) };
+    const loop = app.loop orelse return error.NoLoop;
+    loop.postEvent(.{ .app = .{ .name = ue_ask_user, .data = payload } });
+}
+
+/// Worker-thread entry: signal that the agent gave up waiting
+/// (typically because the ask_user gate flipped off). The UI
+/// handler clears `ask_user_pending` and resets the hint.
+pub fn askUserCancel(self: *Root) void {
+    const app = self.app orelse return;
+    const loop = app.loop orelse return;
+    loop.postEvent(.{ .app = .{ .name = ue_ask_user_cancel, .data = null } });
+}
+
+/// Worker-thread entry: try to consume a pending reply. Returns
+/// caller-owned slice when one exists, else null.
+pub fn askUserTake(self: *Root, allocator: std.mem.Allocator) anyerror!?[]u8 {
+    self.beginPendingReply();
+    defer self.endPendingReply();
+    const slot = self.pending_reply orelse return null;
+    self.pending_reply = null;
+    defer self.allocator.free(slot);
+    return try allocator.dupe(u8, slot);
+}
+
+fn setAskGate(self: *Root, value: bool) void {
+    self.ask_user_gate = value;
+    if (self.ask_gate_setter) |setter| {
+        if (self.sandbox_ctx) |ctx| setter(ctx, value);
+    }
+}
+
+fn runConfigCommand(self: *Root) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(self.allocator);
+    try buf.appendSlice(self.allocator, "config:\n");
+    try buf.appendSlice(self.allocator, "  agent: ");
+    try buf.appendSlice(self.allocator, self.session_id);
+    try buf.append(self.allocator, '\n');
+    try buf.appendSlice(self.allocator, "  tool_output: ");
+    try buf.appendSlice(self.allocator, if (self.tool_output_enabled) "on" else "off");
+    try buf.append(self.allocator, '\n');
+    try buf.appendSlice(self.allocator, "  sandbox: ");
+    try buf.appendSlice(self.allocator, switch (self.sandbox_mode) {
+        .unlocked => "unlocked",
+        .locked => "locked",
+        .plan => "plan",
+    });
+    if (self.sandbox_mode == .locked and self.sandbox_path.len > 0) {
+        try buf.appendSlice(self.allocator, " @ ");
+        try buf.appendSlice(self.allocator, self.sandbox_path);
+    }
+    try buf.append(self.allocator, '\n');
+    try buf.appendSlice(self.allocator, "  ask_user: ");
+    try buf.appendSlice(self.allocator, if (self.ask_user_gate) "on" else "off");
+    try buf.append(self.allocator, '\n');
+    try buf.appendSlice(self.allocator, "  home: ");
+    try buf.appendSlice(self.allocator, if (self.home_dir.len == 0) "(unset)" else self.home_dir);
+    try self.appendLine(.system, buf.items);
+}
+
+fn runSkillsCommand(self: *Root) !void {
+    if (self.home_dir.len == 0) {
+        try self.appendLine(.system, "skills: HOME unset; cannot scan");
+        return;
+    }
+    const io = self.io orelse {
+        try self.appendLine(.system, "skills: io unavailable");
+        return;
+    };
+    var list = skills_mod.load(self.allocator, io, self.home_dir) catch |err| {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "skills: failed to load ({s})", .{@errorName(err)}) catch "skills: failed to load";
+        try self.appendLine(.system, msg);
+        return;
+    };
+    defer list.deinit();
+
+    if (list.items.len == 0) {
+        try self.appendLine(.system, "skills: none installed at ~/.tigerclaw/skills/");
+        return;
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(self.allocator);
+    try buf.appendSlice(self.allocator, "skills:");
+    for (list.items) |s| {
+        try buf.append(self.allocator, '\n');
+        try buf.appendSlice(self.allocator, "  ");
+        try buf.appendSlice(self.allocator, s.name);
+        if (s.description.len > 0) {
+            try buf.appendSlice(self.allocator, " — ");
+            try buf.appendSlice(self.allocator, s.description);
+        }
+    }
+    try self.appendLine(.system, buf.items);
 }
 
 // --- Turn orchestration ----------------------------------------------------
@@ -136,8 +517,11 @@ pub const ue_tool_done = "tui.tool_done";
 pub const ue_done = "tui.done";
 pub const ue_error = "tui.error";
 pub const ue_tick = "tui.tick";
+pub const ue_ask_user = "tui.ask_user";
+pub const ue_ask_user_cancel = "tui.ask_user_cancel";
 
 pub const ChunkPayload = struct { text: []u8 };
+pub const AskUserPayload = struct { question: []u8 };
 pub const ToolStartPayload = struct { id: []u8, name: []u8 };
 pub const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8 };
 pub const ErrorPayload = struct { message: []u8 };
@@ -157,6 +541,10 @@ fn beginTurn(self: *Root, typed: []const u8) !void {
     const app = self.app orelse return error.NoApp;
 
     try self.appendLine(.user, typed);
+    // Submitting a new turn snaps the viewport back to the live
+    // tail. If the user was reviewing scrollback, their fresh
+    // message — and its incoming reply — should be visible.
+    self.scroll_offset = 0;
     // No pre-reserved agent line. Chunks that arrive before a
     // tool_start get a fresh agent line via the lazy path in
     // the chunk handler; chunks that arrive *after* tool lines
@@ -246,21 +634,18 @@ fn chunkSink(sink_ctx: ?*anyopaque, fragment: []const u8) void {
 
 fn toolEventSink(
     sink_ctx: ?*anyopaque,
-    phase: harness.agent_runner.ToolEventPhase,
-    id: []const u8,
-    name: []const u8,
-    output: []const u8,
+    event: harness.agent_runner.ToolEvent,
 ) void {
     const ctx: *WorkerCtx = @ptrCast(@alignCast(sink_ctx.?));
-    switch (phase) {
-        .started => {
+    switch (event) {
+        .started => |s| {
             const payload = ctx.allocator.create(ToolStartPayload) catch return;
             payload.* = .{
-                .id = ctx.allocator.dupe(u8, id) catch {
+                .id = ctx.allocator.dupe(u8, s.id) catch {
                     ctx.allocator.destroy(payload);
                     return;
                 },
-                .name = ctx.allocator.dupe(u8, name) catch {
+                .name = ctx.allocator.dupe(u8, s.name) catch {
                     ctx.allocator.free(payload.id);
                     ctx.allocator.destroy(payload);
                     return;
@@ -268,24 +653,27 @@ fn toolEventSink(
             };
             postUserEvent(ctx, ue_tool_start, payload);
         },
-        .finished => {
-            const payload = ctx.allocator.create(ToolDonePayload) catch return;
+        .progress => return,
+        .finished => |f| {
+            const preview = tool_preview.render(ctx.allocator, f.name, f.kind) catch
+                ctx.allocator.dupe(u8, f.kind.flatText()) catch return;
+            const payload = ctx.allocator.create(ToolDonePayload) catch {
+                ctx.allocator.free(preview);
+                return;
+            };
             payload.* = .{
-                .id = ctx.allocator.dupe(u8, id) catch {
+                .id = ctx.allocator.dupe(u8, f.id) catch {
+                    ctx.allocator.free(preview);
                     ctx.allocator.destroy(payload);
                     return;
                 },
-                .name = ctx.allocator.dupe(u8, name) catch {
+                .name = ctx.allocator.dupe(u8, f.name) catch {
+                    ctx.allocator.free(preview);
                     ctx.allocator.free(payload.id);
                     ctx.allocator.destroy(payload);
                     return;
                 },
-                .output = ctx.allocator.dupe(u8, output) catch {
-                    ctx.allocator.free(payload.id);
-                    ctx.allocator.free(payload.name);
-                    ctx.allocator.destroy(payload);
-                    return;
-                },
+                .output = preview,
             };
             postUserEvent(ctx, ue_tool_done, payload);
         },
@@ -352,6 +740,65 @@ fn eventHandler(
                 ctx.quit = true;
                 return;
             }
+
+            // History scrollback.
+            //   PageUp / Ctrl-U   — scroll up one page
+            //   PageDown / Ctrl-D — scroll down one page
+            //   Home / Ctrl-Home  — jump to the top of history
+            //   End  / Ctrl-G     — snap back to the live tail
+            //
+            // The History widget clamps `scroll_offset` against the
+            // total wrapped row count, so a wildly-large value here
+            // still settles on the first row of the buffer; we use
+            // `maxInt(u32)` as a "go all the way up" sentinel rather
+            // than computing the exact bound (which would require
+            // knowing the pane width here).
+            const page_step: u32 = 16;
+            if (key.matches(vaxis.Key.page_up, .{}) or key.matches('u', .{ .ctrl = true })) {
+                self.scroll_offset +|= page_step;
+                ctx.redraw = true;
+                return;
+            }
+            if (key.matches(vaxis.Key.page_down, .{}) or key.matches('d', .{ .ctrl = true })) {
+                self.scroll_offset -|= page_step;
+                ctx.redraw = true;
+                return;
+            }
+            if (key.matches(vaxis.Key.home, .{}) or key.matches(vaxis.Key.home, .{ .ctrl = true })) {
+                self.scroll_offset = std.math.maxInt(u32);
+                ctx.redraw = true;
+                return;
+            }
+            if (key.matches(vaxis.Key.end, .{}) or key.matches('g', .{ .ctrl = true })) {
+                self.scroll_offset = 0;
+                ctx.redraw = true;
+                return;
+            }
+
+            // Slash-menu navigation: when the input buffer starts
+            // with `/`, intercept ↑/↓/Esc before they reach the
+            // input widget so the popup feels like a real menu.
+            const menu_open = self.input.buf.items.len > 0 and self.input.buf.items[0] == '/';
+            if (menu_open) {
+                if (key.matches(vaxis.Key.escape, .{})) {
+                    self.input.buf.clearRetainingCapacity();
+                    self.input.cursor = 0;
+                    self.command_menu_cursor = 0;
+                    ctx.consumeAndRedraw();
+                    return;
+                }
+                if (key.matches(vaxis.Key.up, .{})) {
+                    if (self.command_menu_cursor > 0) self.command_menu_cursor -= 1;
+                    ctx.consumeAndRedraw();
+                    return;
+                }
+                if (key.matches(vaxis.Key.down, .{})) {
+                    self.command_menu_cursor +|= 1;
+                    ctx.consumeAndRedraw();
+                    return;
+                }
+            }
+
             // Everything else is forwarded to the input widget's
             // handler. vxfw's focus system would do this
             // automatically once we call `request_focus` — we're
@@ -359,12 +806,46 @@ fn eventHandler(
             // widget receiving events.
             const was_pending = self.thinking.pending;
             try self.input.widget().handleEvent(ctx, event);
+            // Slash command requested shutdown: honour it on the
+            // Root's pass since onSubmit can't reach ctx.quit.
+            if (self.quit_requested) {
+                ctx.quit = true;
+                self.quit_requested = false;
+                return;
+            }
+            // Reset menu cursor when the buffer no longer starts
+            // with `/` so the next time it does, we land on top.
+            if (self.input.buf.items.len == 0 or self.input.buf.items[0] != '/') {
+                self.command_menu_cursor = 0;
+            }
             // If onSubmit just flipped a turn to pending, kick the
             // spinner tick chain via ctx.tick (cmd list / timers) —
             // we can't postEvent into the loop here because App.run
             // holds the queue mutex while draining.
             if (!was_pending and self.thinking.pending) {
                 try ctx.tick(0, self.widget());
+            }
+        },
+        .mouse => |m| {
+            // Touchpad / wheel scrollback. Wheel events fire on
+            // `press`; release fires too but we only need one. Step
+            // size is intentionally smaller than PageUp's 16 — wheel
+            // ticks come fast and a big multiplier gets jumpy.
+            const wheel_step: u32 = 3;
+            if (m.type == .press) {
+                switch (m.button) {
+                    .wheel_up => {
+                        self.scroll_offset +|= wheel_step;
+                        ctx.redraw = true;
+                        return;
+                    },
+                    .wheel_down => {
+                        self.scroll_offset -|= wheel_step;
+                        ctx.redraw = true;
+                        return;
+                    },
+                    else => {},
+                }
             }
         },
         .winsize => ctx.redraw = true,
@@ -390,6 +871,11 @@ fn eventHandler(
 
 pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent) !void {
     if (std.mem.eql(u8, ue.name, ue_chunk)) {
+        // Live tail policy: incoming chunks always snap the
+        // viewport back to the bottom so the user never types into
+        // a session whose latest reply scrolled off-screen.
+        self.scroll_offset = 0;
+
         const p: *const ChunkPayload = @ptrCast(@alignCast(ue.data.?));
         // Defers run LIFO: capture `text` into a local so we can
         // free it *after* destroying the payload allocation —
@@ -429,6 +915,16 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         // line below the tool entry.
         self.pending_agent_line = null;
 
+        // Tool-output suppression: when the user has hidden tool
+        // lines (default), skip the history append so the chat
+        // reads as plain conversation. We still null out
+        // `pending_agent_line` above because the runner-side
+        // turn flow is unchanged either way.
+        if (!self.tool_output_enabled) {
+            ctx.redraw = true;
+            return;
+        }
+
         // Append a pending tool line. Just the tool name —
         // when the tool completes, \`tool_done\` promotes this
         // line with " → <output preview>". The thinking row
@@ -467,16 +963,55 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
             if (entry.tool_id) |id| {
                 if (std.mem.eql(u8, id, p.id)) {
                     entry.text.clearRetainingCapacity();
+                    // First line: tool name as the header.
                     try entry.text.appendSlice(self.allocator, p.name);
-                    try entry.text.appendSlice(self.allocator, " → ");
-                    const cap: usize = @min(p.output.len, 500);
-                    try entry.text.appendSlice(self.allocator, p.output[0..cap]);
-                    if (cap < p.output.len) try entry.text.appendSlice(self.allocator, "…");
+                    // Subsequent lines: each line of the preview
+                    // indented with `│ ` so the block reads as one
+                    // structured unit and the eye can pick out tool
+                    // results from prose at a glance.
+                    const trimmed = std.mem.trimEnd(u8, p.output, "\n");
+                    if (trimmed.len > 0) {
+                        try entry.text.append(self.allocator, '\n');
+                        var line_iter = std.mem.splitScalar(u8, trimmed, '\n');
+                        var first = true;
+                        while (line_iter.next()) |body_line| {
+                            if (!first) try entry.text.append(self.allocator, '\n');
+                            first = false;
+                            try entry.text.appendSlice(self.allocator, "  │ ");
+                            try entry.text.appendSlice(self.allocator, body_line);
+                        }
+                    }
                     entry.deinitToolId(self.allocator);
                     break;
                 }
             }
         }
+        ctx.redraw = true;
+    } else if (std.mem.eql(u8, ue.name, ue_ask_user)) {
+        const p: *const AskUserPayload = @ptrCast(@alignCast(ue.data.?));
+        const q_slice = p.question;
+        defer self.allocator.destroy(@as(*AskUserPayload, @constCast(p)));
+        defer self.allocator.free(q_slice);
+
+        // Render the question as a system line and arm the
+        // pending-reply state so the next submit is captured
+        // instead of starting a new turn.
+        var buf: [1024]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "? {s}", .{p.question}) catch p.question;
+        try self.appendLine(.system, line);
+        self.ask_user_pending.store(true, .seq_cst);
+        self.hint.left = "type a reply  ·  esc cancels";
+        ctx.redraw = true;
+    } else if (std.mem.eql(u8, ue.name, ue_ask_user_cancel)) {
+        // Worker bailed (gate flipped off mid-wait). Clear the
+        // pending flag so the next user submit starts a normal
+        // turn, drop any orphan reply, and restore the hint.
+        self.ask_user_pending.store(false, .seq_cst);
+        self.beginPendingReply();
+        if (self.pending_reply) |slot| self.allocator.free(slot);
+        self.pending_reply = null;
+        self.endPendingReply();
+        self.hint.left = "↑↓ scroll  ·  ctrl-c quit";
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_error)) {
         const p: *const ErrorPayload = @ptrCast(@alignCast(ue.data.?));
@@ -489,6 +1024,16 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         try self.appendLine(.system, line);
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_done)) {
+        // Re-parse every agent line we accumulated this turn as
+        // markdown, swapping the raw text + null spans for the
+        // walker's flat text + style spans. The history widget
+        // already paints under spans when present; we just need to
+        // populate them. Streaming chunks land in raw form; the
+        // re-parse only runs once the turn is complete so the model
+        // sees consistent partials and the user sees a styled
+        // final.
+        renderAgentMarkdown(self) catch {};
+
         // No placeholder to drop — the chunk handler creates the
         // agent line lazily, so an empty turn leaves no empty
         // line behind.
@@ -505,12 +1050,23 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     const width = ctx.max.width orelse 0;
     const height = ctx.max.height orelse 0;
 
-    // Bail on degenerate sizes. The input box alone needs 3
-    // rows; below that the underflow math (`height - input_rows`)
-    // panics and the input-border loop blows past the visible
-    // area. Returning a blank surface lets the next resize event
-    // paint properly without an abort in between.
-    if (width == 0 or height < 3) {
+    // Layout (top → bottom):
+    //   header                       Header.bannerRows(width)
+    //   history                      flex (whatever's left)
+    //   thinking                     1 row when pending, else 0
+    //   hint                         1 row when texts non-empty, else 0
+    //   input panel                  3 rows tinted, text on middle row
+    //   status bar                   1 row tinted (workspace · sandbox · model)
+    //
+    // Bail on degenerate sizes. The footer (input + status_bar)
+    // alone needs 4 rows; below that we paint nothing rather than
+    // letting the underflow math wrap and corrupt the surface.
+    const input_rows: u16 = 3;
+    const status_rows: u16 = 1;
+    const bottom_pad_rows: u16 = 1;
+    const footer_min: u16 = input_rows + status_rows + bottom_pad_rows;
+
+    if (width == 0 or height < footer_min) {
         return try vxfw.Surface.init(
             ctx.arena,
             self.widget(),
@@ -518,29 +1074,49 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
         );
     }
 
-    // Layout (top → bottom):
-    //   header                       Header.bannerRows(width)
-    //   history                      whatever is left
-    //   thinking_row                 1 row when pending, 0 else
-    //   input box                    3 rows
-    const input_rows: u16 = 3;
     const thinking_rows: u16 = if (self.thinking.pending) 1 else 0;
+    const hint_rows: u16 = if (self.hint.left.len > 0 or self.hint.right.len > 0) 1 else 0;
+
+    // Slash-command popup. Visible whenever the input buffer
+    // starts with `/`. Items computed once per frame from the
+    // arena so we don't allocate on the heap from drawFn.
+    const menu_query: []const u8 = if (self.input.buf.items.len > 0 and self.input.buf.items[0] == '/')
+        self.input.buf.items[1..]
+    else
+        "";
+    const menu_visible: bool = self.input.buf.items.len > 0 and self.input.buf.items[0] == '/';
+    const menu_items: []const CommandMenu.Item = if (menu_visible)
+        try CommandMenu.filter(ctx.arena, menu_query)
+    else
+        &.{};
+    const menu_cursor: usize = if (menu_items.len == 0) 0 else @min(self.command_menu_cursor, menu_items.len - 1);
+    var menu = CommandMenu{
+        .visible_items = menu_items,
+        .selected = menu_cursor,
+    };
+    const menu_rows: u16 = menu.rows();
+
+    // The menu renders below the status bar. When visible, it
+    // takes its own rows; the 1-row bottom pad is preserved
+    // beneath it so the popup never sits flush with the screen
+    // edge.
+    const trailing_rows: u16 = if (menu_rows > 0) menu_rows + bottom_pad_rows else bottom_pad_rows;
 
     // Header collapses to zero rows when the terminal is too
-    // short to fit it alongside the input + thinking row.
+    // short to fit it alongside the bottom stack.
+    const bottom_stack: u16 = thinking_rows + hint_rows + input_rows + status_rows + trailing_rows;
     const requested_header: u16 = Header.bannerRows(width);
-    const non_header_min: u16 = input_rows + thinking_rows;
-    const header_rows: u16 = if (height > non_header_min + requested_header)
+    const header_rows: u16 = if (height > bottom_stack + requested_header)
         requested_header
-    else if (height > non_header_min)
-        height - non_header_min
+    else if (height > bottom_stack)
+        height - bottom_stack
     else
         0;
 
-    const reserved: u16 = header_rows + thinking_rows + input_rows;
+    const reserved: u16 = header_rows + bottom_stack;
     const history_rows: u16 = if (height > reserved) height - reserved else 0;
 
-    const children = try ctx.arena.alloc(vxfw.SubSurface, 4);
+    const children = try ctx.arena.alloc(vxfw.SubSurface, 7);
     const surface = try vxfw.Surface.initWithChildren(
         ctx.arena,
         self.widget(),
@@ -548,53 +1124,129 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
         children,
     );
 
+    var cur_row: u16 = 0;
+
     // Header.
-    const header_surface = try self.header.widget().draw(ctx.withConstraints(
-        .{ .width = 0, .height = 0 },
-        .{ .width = width, .height = header_rows },
-    ));
-    surface.children[0] = .{
-        .origin = .{ .row = 0, .col = 0 },
-        .surface = header_surface,
-        .z_index = 0,
-    };
+    {
+        const s = try self.header.widget().draw(ctx.withConstraints(
+            .{ .width = 0, .height = 0 },
+            .{ .width = width, .height = header_rows },
+        ));
+        surface.children[0] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
+        cur_row += header_rows;
+    }
 
-    // History with 1-cell side margin.
-    const history_width: u16 = if (width > 2) width - 2 else width;
-    const history_view: History = .{ .lines = self.history.items };
-    const history_surface = try history_view.widget().draw(ctx.withConstraints(
-        .{ .width = 0, .height = 0 },
-        .{ .width = history_width, .height = history_rows },
-    ));
-    surface.children[1] = .{
-        .origin = .{ .row = @intCast(header_rows), .col = 1 },
-        .surface = history_surface,
-        .z_index = 0,
-    };
+    // History at full width. Earlier we kept a 1-cell side margin
+    // for visual breathing room, but that left a tiny untinted
+    // gutter on user-message tints (which span their child surface
+    // edge to edge). Going flush keeps the user-message half-block
+    // band lined up vertically with the input panel below.
+    {
+        const view: History = .{
+            .lines = self.history.items,
+            .scroll_offset = self.scroll_offset,
+        };
+        const s = try view.widget().draw(ctx.withConstraints(
+            .{ .width = 0, .height = 0 },
+            .{ .width = width, .height = history_rows },
+        ));
+        surface.children[1] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
+        cur_row += history_rows;
+    }
 
-    // Thinking row — draws nothing when not pending.
-    const thinking_surface = try self.thinking.widget().draw(ctx.withConstraints(
-        .{ .width = 0, .height = 0 },
-        .{ .width = width, .height = thinking_rows },
-    ));
-    const thinking_row: u16 = @intCast(header_rows + history_rows);
-    surface.children[2] = .{
-        .origin = .{ .row = thinking_row, .col = 0 },
-        .surface = thinking_surface,
-        .z_index = 0,
-    };
+    // Thinking row — collapses to 0 when not pending.
+    {
+        const s = try self.thinking.widget().draw(ctx.withConstraints(
+            .{ .width = 0, .height = 0 },
+            .{ .width = width, .height = thinking_rows },
+        ));
+        surface.children[2] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
+        cur_row += thinking_rows;
+    }
 
-    // Input at the bottom. Guarded against `height < input_rows`
-    // by the early-return at the top of this function.
-    const input_surface = try self.input.widget().draw(ctx.withConstraints(
-        .{ .width = 0, .height = 0 },
-        .{ .width = width, .height = input_rows },
-    ));
-    surface.children[3] = .{
-        .origin = .{ .row = height - input_rows, .col = 0 },
-        .surface = input_surface,
-        .z_index = 0,
-    };
+    // Hint row.
+    {
+        const s = try self.hint.widget().draw(ctx.withConstraints(
+            .{ .width = 0, .height = 0 },
+            .{ .width = width, .height = hint_rows },
+        ));
+        surface.children[3] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
+        cur_row += hint_rows;
+    }
+
+    // Input panel spans full width, edge to edge. The visual
+    // breathing room on the sides comes from the terminal window's
+    // own padding, not from an explicit widget inset.
+    {
+        const s = try self.input.widget().draw(ctx.withConstraints(
+            .{ .width = 0, .height = 0 },
+            .{ .width = width, .height = input_rows },
+        ));
+        surface.children[4] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
+        cur_row += input_rows;
+    }
+
+    // Status bar sits above the trailing rows (slash menu when
+    // open, otherwise just the bottom pad). Pinned by absolute
+    // row so a stray off-by-one earlier in the stack can't hide
+    // the footer.
+    const status_origin: u16 = height - trailing_rows - status_rows;
+    {
+        const s = try self.status_bar.widget().draw(ctx.withConstraints(
+            .{ .width = 0, .height = 0 },
+            .{ .width = width, .height = status_rows },
+        ));
+        surface.children[5] = .{ .origin = .{ .row = status_origin, .col = 0 }, .surface = s, .z_index = 0 };
+    }
+
+    // Slash-command popup below the status bar. When the menu is
+    // hidden, it draws as a zero-height surface and the bottom
+    // pad fills the gap.
+    {
+        const s = try menu.widget().draw(ctx.withConstraints(
+            .{ .width = 0, .height = 0 },
+            .{ .width = width, .height = menu_rows },
+        ));
+        surface.children[6] = .{ .origin = .{ .row = status_origin + status_rows, .col = 0 }, .surface = s, .z_index = 0 };
+    }
 
     return surface;
+}
+
+/// Walk recent agent lines and re-render their text as markdown.
+/// Spans-bearing lines are skipped (already processed). Failures are
+/// silent: the line keeps its raw text and renders unstyled, which is
+/// strictly less helpful but never wrong.
+fn renderAgentMarkdown(self: *Root) !void {
+    var i: usize = self.history.items.len;
+    while (i > 0) {
+        i -= 1;
+        const line = &self.history.items[i];
+        // Stop scanning once we cross a non-agent line: earlier
+        // agent lines from prior turns already had their markdown
+        // baked in on a previous ue_done. This keeps the loop O(N)
+        // in lines added _this_ turn, not total history.
+        if (line.role != .agent) break;
+        if (line.spans != null) continue;
+        if (line.text.items.len == 0) continue;
+
+        var rendered = md.render(self.allocator, line.text.items) catch continue;
+        // Tolerate the parser returning empty text for non-empty
+        // input: keep the raw bytes, drop the empty spans slice. The
+        // user still sees their reply just without styling.
+        if (rendered.text.len == 0) {
+            rendered.deinit(self.allocator);
+            continue;
+        }
+        line.text.clearRetainingCapacity();
+        line.text.appendSlice(self.allocator, rendered.text) catch {
+            rendered.deinit(self.allocator);
+            continue;
+        };
+        line.deinitSpans(self.allocator);
+        line.spans = rendered.spans;
+        // We took ownership of `spans`; only the text slice is ours
+        // to free here.
+        self.allocator.free(rendered.text);
+    }
 }

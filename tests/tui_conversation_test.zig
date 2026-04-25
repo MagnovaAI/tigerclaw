@@ -64,6 +64,7 @@ fn postDone(root: *Root, ctx: *vxfw.EventContext) !void {
 
 test "tui: chunk-only turn appends a single agent line" {
     var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    root.tool_output_enabled = true;
     defer root.deinit();
 
     var ctx = makeCtx(testing.allocator);
@@ -81,6 +82,7 @@ test "tui: chunk-only turn appends a single agent line" {
 
 test "tui: chunks around a tool call land on separate agent lines in order" {
     var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    root.tool_output_enabled = true;
     defer root.deinit();
 
     var ctx = makeCtx(testing.allocator);
@@ -112,6 +114,7 @@ test "tui: tool-done without a matching pending line is a noop" {
     // Tool-done landing before its tool-start (shouldn't happen
     // in practice, but handler must not crash).
     var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    root.tool_output_enabled = true;
     defer root.deinit();
 
     var ctx = makeCtx(testing.allocator);
@@ -125,6 +128,7 @@ test "tui: tool-done without a matching pending line is a noop" {
 
 test "tui: two tool calls in a row each get their own line" {
     var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    root.tool_output_enabled = true;
     defer root.deinit();
 
     var ctx = makeCtx(testing.allocator);
@@ -148,6 +152,7 @@ test "tui: two tool calls in a row each get their own line" {
 
 test "tui: empty turn (done with no chunks and no tools) leaves history empty" {
     var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    root.tool_output_enabled = true;
     defer root.deinit();
 
     var ctx = makeCtx(testing.allocator);

@@ -8,10 +8,10 @@
 //!     Read the daemon log file. Read-side helper — does NOT touch the
 //!     running daemon.
 //!
-//! The CLI flattens "start the gateway" to bare `gateway`
-//! with optional bind flags rather than a `start` sub-verb. We follow
-//! that convention so muscle memory transfers; sub-verbs only exist
-//! for read-side helpers that don't conflict with the run intent.
+//! "Start the gateway" is the bare `gateway` invocation with
+//! optional bind flags rather than a `start` sub-verb; sub-verbs
+//! only exist for read-side helpers that don't conflict with the
+//! run intent.
 
 const std = @import("std");
 

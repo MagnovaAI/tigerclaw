@@ -160,7 +160,15 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
 
 pub fn draw(self: *Input, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
     const width = ctx.max.width orelse 0;
-    const height: u16 = 3; // top border, input row, bottom border
+    // Three real cells, but visually two rows via the half-block
+    // trick: top row gets `▄` (lower-half block) in
+    // the tint colour with terminal-default bg, so only the bottom
+    // half-cell is tinted. Middle row has solid tinted bg with the
+    // text. Bottom row mirrors with `▀` (upper-half block). Net
+    // painted height ≈ 0.5 + 1 + 0.5 = ~2 visual rows, text centred
+    // on the midline between the two half-blocks.
+    const height: u16 = 3;
+    const text_row: u16 = 1;
 
     const surface = try vxfw.Surface.init(
         ctx.arena,
@@ -169,86 +177,118 @@ pub fn draw(self: *Input, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Su
     );
     if (width < 3) return surface;
 
-    const border_style: vaxis.Style = .{ .fg = tui.palette.orange };
-    const prompt_style: vaxis.Style = tui.palette.prompt;
-    const text_style: vaxis.Style = tui.palette.agent;
-    const hint_style: vaxis.Style = tui.palette.hint;
+    const blank_style: vaxis.Style = tui.palette.input_blank;
+    const prompt_style: vaxis.Style = tui.palette.input_prompt;
+    const text_style: vaxis.Style = tui.palette.input_text;
+    const ghost_style: vaxis.Style = tui.palette.input_ghost;
 
-    // Top border: ┏━━━...━━━┓ (heavy weight matches the
-    // header divider rule and tiles flush across cells —
-    // thin/rounded glyphs leave visible gaps in fonts with
-    // any cell padding).
-    surface.writeCell(0, 0, .{ .char = .{ .grapheme = "┏", .width = 1 }, .style = border_style });
-    var c: u16 = 1;
-    while (c < width - 1) : (c += 1) {
-        surface.writeCell(c, 0, .{ .char = .{ .grapheme = "━", .width = 1 }, .style = border_style });
+    // Tapered side detail: the leftmost and rightmost cells of
+    // the content row use `▌` / `▐` (left/right half blocks) so
+    // the band's corners taper -- only the inside half of the
+    // edge cell is tinted, leaving the outer half terminal
+    // default. Combined with `▄` on top and `▀` on bottom, the
+    // band reads as a tinted pill with rounded shoulders rather
+    // than a hard rectangle.
+    const half_style: vaxis.Style = .{ .fg = tui.palette.input_blank.bg };
+    var bg_col: u16 = 0;
+    while (bg_col < width) : (bg_col += 1) {
+        // Top + bottom: full-row half-blocks.
+        surface.writeCell(bg_col, 0, .{ .char = .{ .grapheme = "▄", .width = 1 }, .style = half_style });
+        surface.writeCell(bg_col, 2, .{ .char = .{ .grapheme = "▀", .width = 1 }, .style = half_style });
+
+        // Middle row: ▌ at the left edge, ▐ at the right edge,
+        // solid tint everywhere in between.
+        const mid_glyph: []const u8 = if (bg_col == 0)
+            "▐" // tint occupies the right half of the leftmost cell
+        else if (bg_col == width - 1)
+            "▌" // tint occupies the left half of the rightmost cell
+        else
+            " ";
+        const mid_style: vaxis.Style = if (bg_col == 0 or bg_col == width - 1)
+            half_style
+        else
+            blank_style;
+        surface.writeCell(bg_col, 1, .{ .char = .{ .grapheme = mid_glyph, .width = 1 }, .style = mid_style });
     }
-    surface.writeCell(width - 1, 0, .{ .char = .{ .grapheme = "┓", .width = 1 }, .style = border_style });
 
-    // Sides + prompt + content on row 1.
-    surface.writeCell(0, 1, .{ .char = .{ .grapheme = "┃", .width = 1 }, .style = border_style });
-    surface.writeCell(width - 1, 1, .{ .char = .{ .grapheme = "┃", .width = 1 }, .style = border_style });
-    // Prompt glyph at col 1.
-    surface.writeCell(1, 1, .{ .char = .{ .grapheme = "❯", .width = 1 }, .style = prompt_style });
-    surface.writeCell(2, 1, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = prompt_style });
+    // Prompt glyph at col 2 -- col 0 is the tapered `▐` corner,
+    // col 1 is breathing room. '›' is single-cell.
+    surface.writeCell(2, text_row, .{ .char = .{ .grapheme = "›", .width = 1 }, .style = prompt_style });
+    // col 3 stays blank for breathing room before the body.
 
-    // Content / placeholder.
-    const content_col: u16 = 3;
-    const content_width: u16 = if (width > 4) width - 4 else 0;
+    const content_col: u16 = 4;
+    // Reserve the rightmost cell for the `▌` corner, plus one
+    // cell of breathing room before that.
+    const content_width: u16 = if (width > content_col + 2) width - content_col - 2 else 0;
+
+    // Cursor cell is the text style with fg/bg swapped. Painted as
+    // an inverted block so the user can see where insert lands.
+    const cursor_style: vaxis.Style = .{
+        .fg = text_style.bg,
+        .bg = text_style.fg,
+    };
+
     if (self.buf.items.len == 0) {
-        writeGraphemes(ctx, surface, content_col, 1, "message the tiger…", hint_style, content_width);
-    } else {
-        // Render as much of the buffer as fits; horizontal scroll
-        // keeps the cursor visible. First compute how many cols
-        // are to the left of the cursor; if that exceeds the
-        // content width, scroll right so the cursor sits near the
-        // right edge.
-        const cursor_cols = measureCols(self.buf.items[0..self.cursor]);
-        var scroll_cols: usize = 0;
-        if (cursor_cols >= content_width) {
-            scroll_cols = cursor_cols - content_width + 1;
-        }
-        // Walk the buffer grapheme by grapheme, skipping
-        // `scroll_cols` leading cells, painting up to
-        // `content_width` cells of text.
-        var col: u16 = content_col;
-        var walked: usize = 0;
-        var iter = ctx.graphemeIterator(self.buf.items);
-        while (iter.next()) |g| {
-            const grapheme = g.bytes(self.buf.items);
-            const w: u8 = @intCast(ctx.stringWidth(grapheme));
-            if (walked < scroll_cols) {
-                walked += w;
-                continue;
-            }
-            if (col + w > content_col + content_width) break;
-            surface.writeCell(col, 1, .{
-                .char = .{ .grapheme = grapheme, .width = w },
-                .style = text_style,
+        writeGraphemes(ctx, surface, content_col, text_row, "Type your message or @path/to/file", ghost_style, content_width);
+        if (content_width > 0) {
+            surface.writeCell(content_col, text_row, .{
+                .char = .{ .grapheme = " ", .width = 1 },
+                .style = cursor_style,
             });
-            col += if (w == 0) 1 else w;
         }
-
-        // Cursor. The vxfw Surface has a cursor field on the
-        // top-level widget's surface; setting it here makes the
-        // App.render call showCursor at the right place.
-        // Cursor position tracking lives on the Surface struct,
-        // but `Surface.init` returns a value copy and vxfw's
-        // Widget.draw signature is `Allocator.Error!Surface`
-        // (by-value). Setting `surface.cursor` here would be a
-        // dead write. A proper blinking terminal cursor needs
-        // either returning a mutable Surface or wrapping the
-        // widget in a container that tracks cursor state —
-        // follow-up.
+        return surface;
     }
 
-    // Bottom border: ┗━━━...━━━┛
-    surface.writeCell(0, 2, .{ .char = .{ .grapheme = "┗", .width = 1 }, .style = border_style });
-    c = 1;
-    while (c < width - 1) : (c += 1) {
-        surface.writeCell(c, 2, .{ .char = .{ .grapheme = "━", .width = 1 }, .style = border_style });
+    // Horizontal scroll: keep the cursor visible. Compute how many
+    // display cells precede the cursor; if that exceeds the
+    // content width, scroll right so the cursor sits near the right
+    // edge.
+    const cursor_cols = measureCols(self.buf.items[0..self.cursor]);
+    var scroll_cols: usize = 0;
+    if (cursor_cols >= content_width) {
+        scroll_cols = cursor_cols - content_width + 1;
     }
-    surface.writeCell(width - 1, 2, .{ .char = .{ .grapheme = "┛", .width = 1 }, .style = border_style });
+
+    // Screen column of the cursor (after horizontal scroll). u32
+    // sentinel signals "off-screen" so we don't paint a stray
+    // cursor when scroll math pushes it past the visible window.
+    const off_screen: u32 = std.math.maxInt(u32);
+    var cursor_screen_col: u32 = off_screen;
+    {
+        const visible = cursor_cols - scroll_cols;
+        const candidate = content_col + visible;
+        if (candidate < content_col + content_width) {
+            cursor_screen_col = @intCast(candidate);
+        }
+    }
+
+    var col: u16 = content_col;
+    var walked: usize = 0;
+    var iter = ctx.graphemeIterator(self.buf.items);
+    while (iter.next()) |g| {
+        const grapheme = g.bytes(self.buf.items);
+        const w: u8 = @intCast(ctx.stringWidth(grapheme));
+        if (walked < scroll_cols) {
+            walked += w;
+            continue;
+        }
+        if (col + w > content_col + content_width) break;
+        const is_cursor_cell = cursor_screen_col != off_screen and col == cursor_screen_col;
+        surface.writeCell(col, text_row, .{
+            .char = .{ .grapheme = grapheme, .width = w },
+            .style = if (is_cursor_cell) cursor_style else text_style,
+        });
+        col += if (w == 0) 1 else w;
+    }
+
+    // Cursor at the end of the buffer: paint a blank inverted cell
+    // at the cursor column.
+    if (cursor_screen_col != off_screen and self.cursor == self.buf.items.len) {
+        surface.writeCell(@intCast(cursor_screen_col), text_row, .{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = cursor_style,
+        });
+    }
 
     return surface;
 }

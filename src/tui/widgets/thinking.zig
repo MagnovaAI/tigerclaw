@@ -1,8 +1,7 @@
 //! Thinking-status row, rendered just above the input box.
 //!
 //! Shown only while a turn is pending. Compact single-row
-//! compact spinner treatment:
-//! a dim braille spinner glyph, a verb + ellipsis, and
+//! treatment: a dim braille spinner glyph, a verb + ellipsis, and
 //! optional elapsed time once the turn's been running long
 //! enough to be worth announcing.
 //!

@@ -19,6 +19,13 @@ const types = @import("types");
 const clock_mod = @import("clock");
 const context_mod = @import("context");
 const context_root = @import("ctx_root");
+const tool_bash = @import("tool_bash.zig");
+const tool_read = @import("tool_read.zig");
+const tool_glob = @import("tool_glob.zig");
+const tool_grep = @import("tool_grep.zig");
+const tool_web_search = @import("tool_web_search.zig");
+const tool_todo_write = @import("tool_todo_write.zig");
+const skills_mod = @import("../../skills/skills.zig");
 
 pub const LoadError = error{
     HomeMissing,
@@ -60,12 +67,110 @@ pub const LiveAgentRunner = struct {
     /// each run ingests the user message, assembles the context
     /// window from prior turns, then ingests the assistant reply.
     context_engine: *context_root.default_engine.DefaultEngine,
+
+    /// Per-session dedup table for `read_file`. A repeated read of
+    /// the same path+range returns an `<unchanged>` marker as long
+    /// as the file's mtime/size haven't moved -- the model already
+    /// has the content in transcript and doesn't need it re-served.
+    read_state: tool_read.ReadStateTable = .{},
+
+    /// Per-session todo list. The TUI surfaces this as a checklist
+    /// (later phase); for now the runner just stores it and returns
+    /// a confirmation so the model has feedback after each write.
+    todo_state: tool_todo_write.TodoState = .{},
     /// Wall clock for the `Context` bundle handed to engine methods.
     system_clock: clock_mod.SystemClock = .{},
     /// Monotonic counter feeding unique `message_id`s into ingest.
     /// Ingest is idempotent on (session_id, message_id) so collisions
     /// silently drop the duplicate — we avoid that with a counter.
     next_message_id: u64 = 0,
+
+    /// Sandbox mode. The TUI flips this from the slash menu
+    /// (`/unlock`, `/lock <path>`, `/plan`); tool dispatch
+    /// consults it on every tool call.
+    ///
+    ///   - .unlocked: every tool, no path restriction.
+    ///   - .locked:   mutating tools confined to `lock_path`
+    ///                subtree; reads unrestricted.
+    ///   - .plan:     mutating tools refuse outright (read-only
+    ///                exploration + ask_user only).
+    sandbox_mode: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(SandboxMode.unlocked)),
+    /// Spinlock guarding `lock_path` so the TUI can swap it from
+    /// the slash thread while a worker is running tools. Slot is
+    /// owned, freed on overwrite + on deinit. Spinlock keeps the
+    /// dispatch path free of any std.Io.Mutex dependency (which
+    /// would force every tool call through a Cancelable).
+    lock_path_busy: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    lock_path: []u8 = &.{},
+    /// Whether `ask_user` waits for a real user reply. When the
+    /// gate is off (e.g. autonomous batch runs) the tool returns
+    /// immediately with a "user unavailable" message so the
+    /// agent never stalls. Default on for interactive TUI.
+    ask_user_gate: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    /// Bridge that lets the worker thread surface a question to
+    /// the TUI and block until the user replies. Set by the TUI
+    /// after constructing the runner; null in tests / headless
+    /// runs (where the gate is also expected to be off).
+    ask_user_bridge: ?AskUserBridge = null,
+
+    pub const SandboxMode = enum(u8) { unlocked = 0, locked = 1, plan = 2 };
+
+    pub const AskUserBridge = struct {
+        ctx: *anyopaque,
+        /// Surface the question to the user. Caller-owned slice.
+        post: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, question: []const u8) anyerror!void,
+        /// Atomically pull the user's reply if one has been set,
+        /// returning a caller-owned slice. Returns null while no
+        /// reply is pending.
+        take: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8,
+        /// Tell the UI to drop pending-question state — used when
+        /// the worker abandons the wait (e.g. gate flipped off).
+        /// Best-effort; failures are ignored.
+        cancel: *const fn (ctx: *anyopaque) void,
+    };
+
+    pub fn getSandboxMode(self: *const LiveAgentRunner) SandboxMode {
+        return @enumFromInt(self.sandbox_mode.load(.seq_cst));
+    }
+
+    fn lockPathBegin(self: *LiveAgentRunner) void {
+        while (self.lock_path_busy.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn lockPathEnd(self: *LiveAgentRunner) void {
+        self.lock_path_busy.store(0, .release);
+    }
+
+    /// Switch sandbox mode. `path` is required for `.locked`,
+    /// ignored otherwise. The runner takes a copy of the path.
+    pub fn setSandboxMode(self: *LiveAgentRunner, mode: SandboxMode, path: []const u8) !void {
+        self.sandbox_mode.store(@intFromEnum(mode), .seq_cst);
+        self.lockPathBegin();
+        defer self.lockPathEnd();
+        if (self.lock_path.len > 0) self.allocator.free(self.lock_path);
+        self.lock_path = if (mode == .locked and path.len > 0)
+            try self.allocator.dupe(u8, path)
+        else
+            &.{};
+    }
+
+    /// Caller-owned snapshot of the current lock path. Empty
+    /// slice when no lock path is set.
+    pub fn snapshotLockPath(self: *LiveAgentRunner, allocator: std.mem.Allocator) ![]u8 {
+        self.lockPathBegin();
+        defer self.lockPathEnd();
+        return allocator.dupe(u8, self.lock_path);
+    }
+
+    pub fn setAskUserGate(self: *LiveAgentRunner, value: bool) void {
+        self.ask_user_gate.store(value, .seq_cst);
+    }
+
+    pub fn isAskUserGateOpen(self: *const LiveAgentRunner) bool {
+        return self.ask_user_gate.load(.seq_cst);
+    }
 
     /// Load an agent config with workspace-then-global cascade.
     /// For each file (agent.json, config.json, SOUL.md) tries
@@ -131,7 +236,13 @@ pub const LiveAgentRunner = struct {
         ) catch null;
         defer if (soul) |s| allocator.free(s);
 
-        const system_prompt = try buildSystemPrompt(allocator, soul);
+        var skills_list = skills_mod.load(allocator, io, home) catch skills_mod.List{
+            .allocator = allocator,
+            .items = allocator.alloc(skills_mod.Skill, 0) catch return error.OutOfMemory,
+        };
+        defer skills_list.deinit();
+
+        const system_prompt = try buildSystemPrompt(allocator, soul, skills_list.items);
 
         // Resolve the file-tool sandbox root: prefer the workspace
         // copy (per-project scratch dir) with fallback to the home
@@ -165,7 +276,11 @@ pub const LiveAgentRunner = struct {
     /// generated rather than authored so adding a tool to the
     /// table immediately teaches every agent about it — no
     /// per-agent prompt edit needed.
-    fn buildSystemPrompt(allocator: std.mem.Allocator, soul: ?[]const u8) LoadError!?[]u8 {
+    fn buildSystemPrompt(
+        allocator: std.mem.Allocator,
+        soul: ?[]const u8,
+        skills: []const skills_mod.Skill,
+    ) LoadError!?[]u8 {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
@@ -208,6 +323,30 @@ pub const LiveAgentRunner = struct {
             buf.append(allocator, '\n') catch return error.OutOfMemory;
         }
 
+        if (skills.len > 0) {
+            try buf.appendSlice(allocator,
+                \\
+                \\# Available skills
+                \\
+                \\Each skill is a Markdown file under ~/.tigerclaw/skills/<name>/SKILL.md.
+                \\When the user references a skill by name, read the file with `read_file`
+                \\and follow the instructions inside before doing the task.
+                \\
+            );
+            for (skills) |s| {
+                try buf.append(allocator, '-');
+                try buf.append(allocator, ' ');
+                try buf.append(allocator, '`');
+                try buf.appendSlice(allocator, s.name);
+                try buf.append(allocator, '`');
+                if (s.description.len > 0) {
+                    try buf.appendSlice(allocator, " — ");
+                    try buf.appendSlice(allocator, s.description);
+                }
+                try buf.append(allocator, '\n');
+            }
+        }
+
         if (buf.items.len == 0) return null;
         return try buf.toOwnedSlice(allocator);
     }
@@ -228,6 +367,9 @@ pub const LiveAgentRunner = struct {
         if (self.system_prompt) |s| self.allocator.free(s);
         if (self.last_output.len > 0) self.allocator.free(self.last_output);
         self.allocator.free(self.agent_workspace_root);
+        if (self.lock_path.len > 0) self.allocator.free(self.lock_path);
+        self.read_state.deinit(self.allocator);
+        self.todo_state.deinit(self.allocator);
         self.context_engine.deinit();
         self.* = undefined;
     }
@@ -532,7 +674,11 @@ pub const LiveAgentRunner = struct {
                 // sees the sink output; it's a side channel for the
                 // gateway's SSE forwarder.
                 if (req.tool_event_sink) |s| {
-                    s(req.tool_event_sink_ctx, .started, tc.id, tc.name, "");
+                    s(req.tool_event_sink_ctx, .{ .started = .{
+                        .id = tc.id,
+                        .name = tc.name,
+                        .args_summary = summarizeArgs(tc.name, tc.arguments_json),
+                    } });
                 }
                 var tool_failed = false;
                 const result_text = dispatchBuiltinTool(
@@ -540,6 +686,8 @@ pub const LiveAgentRunner = struct {
                     self.io,
                     clock_value,
                     self.agent_workspace_root,
+                    self,
+                    req.session_id,
                     tc.name,
                     tc.arguments_json,
                 ) catch |e| blk: {
@@ -551,7 +699,11 @@ pub const LiveAgentRunner = struct {
                     ) catch return error.OutOfMemory;
                 };
                 if (req.tool_event_sink) |s| {
-                    s(req.tool_event_sink_ctx, .finished, tc.id, tc.name, result_text);
+                    s(req.tool_event_sink_ctx, .{ .finished = .{
+                        .id = tc.id,
+                        .name = tc.name,
+                        .kind = classifyFinishedKind(tc.name, result_text),
+                    } });
                 }
 
                 // Persist the result with both a flat-text view AND
@@ -704,14 +856,24 @@ const builtin_tools = [_]types.Tool{
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"min\":{\"type\":\"integer\"},\"max\":{\"type\":\"integer\"}},\"required\":[\"min\",\"max\"]}",
     },
     .{
+        .name = "web_search",
+        .description = "Search the web via DuckDuckGo. Returns the top N results as title/URL/snippet entries. Use this when you need to find a URL the user hasn't given you; pair with `fetch_url` to read actual page contents. Optional `domain_filter` is a list of substrings the URL must contain (e.g. [\"github.com\", \"ziglang.org\"]). `count` defaults to 10, clamped to [1, 20].",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"minLength\":2},\"domain_filter\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"count\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":20}},\"required\":[\"query\"]}",
+    },
+    .{
         .name = "fetch_url",
         .description = "Fetch a web page via the Lightpanda headless browser and return it as readable markdown (headings, links, lists) rather than raw HTML. JavaScript runs before the page is dumped, so SPA content is included. Call this tool whenever the user says 'fetch', 'browse', 'scrape', 'look up <a topic> online', 'visit', 'check this page', 'open this URL', or names Lightpanda directly. Only http:// and https:// URLs are allowed; private and loopback addresses are refused. Response is capped at 8 KB and truncated with a visible marker; if you need more, re-issue with a more specific URL.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute URL to fetch.\"}},\"required\":[\"url\"]}",
     },
     .{
+        .name = "bash",
+        .description = "Execute a shell command via `/bin/sh -c`. Returns exit code, duration, and captured stdout/stderr (each capped at 32 KiB). Default timeout 120s, max 600s. Destructive patterns (sudo, `rm -rf /`, fork bombs, dd to a raw disk, `mkfs.*`) are refused. Use this for `git`, `zig build`, `cargo test`, `gh pr view`, and similar workflow tools.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600000},\"description\":{\"type\":\"string\"}},\"required\":[\"command\"]}",
+    },
+    .{
         .name = "read_file",
-        .description = "Read a UTF-8 text file from the agent's workspace. `path` is relative to the workspace root; absolute paths and `..` traversal are refused. Returns up to 64 KiB.",
-        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}",
+        .description = "Read a UTF-8 text file from the agent's workspace. Returns content with line numbers prefixed (`     1\u{2192}hello world`). Default reads first 2000 lines; pass `offset` (1-based) and `limit` for windowed reads. Repeat reads of the same path+range return an `<unchanged>` marker if the file hasn't been touched since. 256 KiB total-file cap; relative paths only, no `..`.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"minimum\":1},\"limit\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"path\"]}",
     },
     .{
         .name = "write_file",
@@ -724,19 +886,156 @@ const builtin_tools = [_]types.Tool{
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}",
     },
     .{
+        .name = "glob",
+        .description = "Find files in the workspace by glob pattern. Supports `*`, `**`, `?`, character classes `[abc]`, and brace expansion `{a,b}`. Results are sorted by mtime descending (most recently edited first), capped at 500 with a marker. Hidden files are skipped unless the pattern itself starts with `.`. Standard noise dirs are pruned (`.git`, `.zig-cache`, `zig-out`, `node_modules`, `target`, `dist`, `build`, `.venv`, `venv`, `__pycache__`, `.next`, `.cache`).",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}},\"required\":[\"pattern\"]}",
+    },
+    .{
+        .name = "grep",
+        .description = "Search workspace files for a pattern. Default `output_mode=content` returns matching lines as `path:lineno:line` (rg's `--no-heading -n` shape). Other modes: `files_with_matches` (one path per line) and `count` (`path:N` per file). Optional `path` (file or dir, default workspace root), `glob` filter, `case_insensitive`, and rg-only `context_before`/`context_after` for surrounding lines. Capped at 100 matches with marker. When ripgrep is on $PATH the full regex syntax is supported; the in-process fallback only does literal substring matching.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"output_mode\":{\"enum\":[\"content\",\"files_with_matches\",\"count\"]},\"case_insensitive\":{\"type\":\"boolean\"},\"context_before\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10},\"context_after\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10}},\"required\":[\"pattern\"]}",
+    },
+    .{
+        .name = "todo_write",
+        .description = "Maintain a structured task list for the current session. Use this to plan multi-step work and surface progress to the user. Each call REPLACES the entire list -- pass the full updated set every time. Statuses: `pending` (not started), `in_progress` (exactly one at a time), `done`. Max 50 items, titles max 200 chars. Optional `active_form` is the present-progressive phrasing shown while the item is in_progress (e.g. \"Refactoring the parser\" for a title \"Refactor the parser\").",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"items\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":200},\"active_form\":{\"type\":\"string\",\"maxLength\":200},\"status\":{\"enum\":[\"pending\",\"in_progress\",\"done\"]}},\"required\":[\"title\",\"status\"]}}},\"required\":[\"items\"]}",
+    },
+    .{
         .name = "edit_file",
         .description = "Replace the first occurrence of `old_text` with `new_text` inside a file under the agent's workspace. Fails if `old_text` is not found or appears more than once. Use for small in-place edits.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old_text\":{\"type\":\"string\"},\"new_text\":{\"type\":\"string\"}},\"required\":[\"path\",\"old_text\",\"new_text\"]}",
     },
+    .{
+        .name = "ask_user",
+        .description = "Pause the turn and ask the user a clarifying question. Use sparingly: only when you cannot reasonably proceed without an answer (e.g. truly ambiguous instruction, missing critical info). The tool returns the user's reply as a plain string. If the user is unavailable (autonomous mode), the tool returns immediately with a 'user unavailable' marker; do not retry — make the best decision yourself and explain it.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"question\":{\"type\":\"string\",\"minLength\":1}},\"required\":[\"question\"]}",
+    },
 };
+
+/// One-line preview of the tool's argument JSON, surfaced on the
+/// `.started` event so the consumer can render "running bash: git
+/// status" instead of a generic "running bash" line. Best-effort —
+/// we don't allocate; on parse failure return an empty slice and the
+/// consumer renders the bare tool name.
+fn summarizeArgs(name: []const u8, arguments_json: []const u8) []const u8 {
+    // Pull a single string field out of the args JSON without
+    // allocating. The fields we want are short and unambiguous; we
+    // walk the JSON looking for them.
+    const field: []const u8 = if (std.mem.eql(u8, name, "bash"))
+        "command"
+    else if (std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "write_file") or
+        std.mem.eql(u8, name, "edit_file") or std.mem.eql(u8, name, "list_files"))
+        "path"
+    else if (std.mem.eql(u8, name, "glob"))
+        "pattern"
+    else if (std.mem.eql(u8, name, "grep"))
+        "pattern"
+    else if (std.mem.eql(u8, name, "web_search"))
+        "query"
+    else if (std.mem.eql(u8, name, "fetch_url"))
+        "url"
+    else
+        return "";
+    return extractStringField(arguments_json, field);
+}
+
+/// Borrow a string-valued JSON field without allocating. Returns an
+/// empty slice on any parse anomaly. Recognizes only the simple
+/// cases (`"field":"value"`); escapes inside the string truncate the
+/// preview at the first backslash, which is fine for a one-liner.
+fn extractStringField(json: []const u8, field: []const u8) []const u8 {
+    const key_buf_max = 64;
+    if (field.len + 4 > key_buf_max) return "";
+    var pattern: [key_buf_max]u8 = undefined;
+    pattern[0] = '"';
+    @memcpy(pattern[1 .. 1 + field.len], field);
+    pattern[1 + field.len] = '"';
+    pattern[1 + field.len + 1] = ':';
+    const needle = pattern[0 .. field.len + 3];
+
+    const at = std.mem.indexOf(u8, json, needle) orelse return "";
+    var i = at + needle.len;
+    while (i < json.len and (json[i] == ' ' or json[i] == '\t')) i += 1;
+    if (i >= json.len or json[i] != '"') return "";
+    i += 1;
+    const start = i;
+    while (i < json.len) : (i += 1) {
+        if (json[i] == '\\') return json[start..i];
+        if (json[i] == '"') return json[start..i];
+    }
+    return "";
+}
+
+/// Pack the rendered tool_result string into a tool-specific
+/// `ToolFinishedKind`. The auxiliary fields are best-effort parses
+/// out of the rendered output; the `text` arm always carries the
+/// flat string so naive consumers can treat it like the old shape.
+fn classifyFinishedKind(name: []const u8, result_text: []const u8) harness.agent_runner.ToolFinishedKind {
+    if (std.mem.eql(u8, name, "bash")) {
+        return .{ .bash = .{
+            .text = result_text,
+            .command = "",
+            .exit_code = parseExitCode(result_text),
+            .interrupted = std.mem.indexOf(u8, result_text, "interrupted: true") != null,
+            .duration_ms = parseDurationMs(result_text),
+        } };
+    }
+    if (std.mem.eql(u8, name, "read_file")) {
+        return .{ .read = .{ .text = result_text, .variant = classifyReadVariant(result_text) } };
+    }
+    if (std.mem.eql(u8, name, "glob")) {
+        return .{ .glob = .{ .text = result_text } };
+    }
+    if (std.mem.eql(u8, name, "grep")) {
+        return .{ .grep = .{ .text = result_text } };
+    }
+    if (std.mem.eql(u8, name, "web_search")) {
+        return .{ .web_search = .{ .text = result_text } };
+    }
+    if (std.mem.eql(u8, name, "todo_write")) {
+        return .{ .todo_write = .{ .text = result_text } };
+    }
+    return .{ .text = result_text };
+}
+
+fn parseExitCode(s: []const u8) i32 {
+    const tag = "exit_code: ";
+    const at = std.mem.indexOf(u8, s, tag) orelse return 0;
+    const start = at + tag.len;
+    var end = start;
+    while (end < s.len and s[end] != '\n') : (end += 1) {}
+    return std.fmt.parseInt(i32, s[start..end], 10) catch 0;
+}
+
+fn parseDurationMs(s: []const u8) u64 {
+    const tag = "duration_ms: ";
+    const at = std.mem.indexOf(u8, s, tag) orelse return 0;
+    const start = at + tag.len;
+    var end = start;
+    while (end < s.len and s[end] != '\n') : (end += 1) {}
+    return std.fmt.parseInt(u64, s[start..end], 10) catch 0;
+}
+
+fn classifyReadVariant(s: []const u8) @TypeOf(@as(harness.agent_runner.ReadFinished, undefined).variant) {
+    if (std.mem.startsWith(u8, s, "<File ")) return .unchanged;
+    if (std.mem.indexOf(u8, s, "exists but is empty") != null) return .empty;
+    if (std.mem.indexOf(u8, s, "but offset ") != null) return .past_eof;
+    return .text;
+}
 
 /// Execute a built-in tool by name. Returns caller-owned text; errors
 /// bubble so the runner can record the failure as the tool result.
+///
+/// `runner` is null only in unit tests for the stateless tools — every
+/// production path passes the live runner so per-session state (read
+/// dedup, todo lists) has somewhere to live.
 fn dispatchBuiltinTool(
     allocator: std.mem.Allocator,
     io: std.Io,
     clock: clock_mod.Clock,
     workspace_root: []const u8,
+    runner: ?*LiveAgentRunner,
+    session_id: []const u8,
     name: []const u8,
     arguments_json: []const u8,
 ) ![]u8 {
@@ -752,19 +1051,252 @@ fn dispatchBuiltinTool(
     if (std.mem.eql(u8, name, "fetch_url")) {
         return runFetchUrl(allocator, io, arguments_json);
     }
+    if (std.mem.eql(u8, name, "web_search")) {
+        return runWebSearch(allocator, io, arguments_json);
+    }
+    if (std.mem.eql(u8, name, "bash")) {
+        if (runner) |r| {
+            switch (r.getSandboxMode()) {
+                .unlocked => {},
+                .locked => return refuseSandbox(allocator, name, .locked, ""),
+                .plan => return refuseSandbox(allocator, name, .plan, ""),
+            }
+        }
+        const out = try runBash(allocator, io, workspace_root, arguments_json, null, null);
+        // Bash may have touched any file; drop the whole session's
+        // read cache so the next read sees real content.
+        if (runner) |r| r.read_state.invalidateSession(r.allocator, session_id);
+        return out;
+    }
     if (std.mem.eql(u8, name, "read_file")) {
-        return runReadFile(allocator, io, workspace_root, arguments_json);
+        return runReadFile(allocator, io, workspace_root, runner, session_id, arguments_json);
     }
     if (std.mem.eql(u8, name, "write_file")) {
-        return runWriteFile(allocator, io, workspace_root, arguments_json);
+        if (runner) |r| {
+            switch (r.getSandboxMode()) {
+                .unlocked => {},
+                .plan => return refuseSandbox(allocator, name, .plan, ""),
+                .locked => {
+                    const path_violation = try checkLockedPath(allocator, r, workspace_root, name, arguments_json);
+                    if (path_violation) |msg| return msg;
+                },
+            }
+        }
+        const out = try runWriteFile(allocator, io, workspace_root, arguments_json);
+        invalidateRead(runner, session_id, workspace_root, arguments_json);
+        return out;
     }
     if (std.mem.eql(u8, name, "list_files")) {
         return runListFiles(allocator, io, workspace_root, arguments_json);
     }
+    if (std.mem.eql(u8, name, "glob")) {
+        return runGlob(allocator, io, workspace_root, arguments_json);
+    }
+    if (std.mem.eql(u8, name, "grep")) {
+        return runGrep(allocator, io, workspace_root, arguments_json);
+    }
+    if (std.mem.eql(u8, name, "todo_write")) {
+        return runTodoWrite(allocator, runner, session_id, arguments_json);
+    }
     if (std.mem.eql(u8, name, "edit_file")) {
-        return runEditFile(allocator, io, workspace_root, arguments_json);
+        if (runner) |r| {
+            switch (r.getSandboxMode()) {
+                .unlocked => {},
+                .plan => return refuseSandbox(allocator, name, .plan, ""),
+                .locked => {
+                    const path_violation = try checkLockedPath(allocator, r, workspace_root, name, arguments_json);
+                    if (path_violation) |msg| return msg;
+                },
+            }
+        }
+        const out = try runEditFile(allocator, io, workspace_root, arguments_json);
+        invalidateRead(runner, session_id, workspace_root, arguments_json);
+        return out;
+    }
+    if (std.mem.eql(u8, name, "ask_user")) {
+        return runAskUser(allocator, runner, arguments_json);
     }
     return error.UnknownTool;
+}
+
+fn runAskUser(
+    allocator: std.mem.Allocator,
+    runner: ?*LiveAgentRunner,
+    arguments_json: []const u8,
+) ![]u8 {
+    const Args = struct { question: []const u8 = "" };
+    var parsed = try std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    const question = parsed.value.question;
+    if (question.len == 0) {
+        return allocator.dupe(u8, "ask_user: question is empty; nothing to ask");
+    }
+
+    const r = runner orelse return allocator.dupe(u8, "user unavailable: no interactive session attached. Decide on your own and explain.");
+    if (!r.isAskUserGateOpen()) {
+        return allocator.dupe(u8, "user unavailable: ask_user gate is off (autonomous mode). Decide on your own and explain.");
+    }
+    const bridge = r.ask_user_bridge orelse {
+        return allocator.dupe(u8, "user unavailable: no UI bridge attached. Decide on your own and explain.");
+    };
+    try bridge.post(bridge.ctx, allocator, question);
+
+    // Poll for the user's reply. usleep keeps the worker thread
+    // off the CPU while the user types. The gate may flip to off
+    // while we wait (autonomous switch); when that happens we
+    // tell the UI to drop the pending question (bridge.cancel)
+    // so the next user submit isn't silently captured as a stale
+    // reply, then return the unavailable marker.
+    while (true) {
+        if (!r.isAskUserGateOpen()) {
+            bridge.cancel(bridge.ctx);
+            return allocator.dupe(u8, "user unavailable: ask_user gate flipped off mid-wait. Decide on your own and explain.");
+        }
+        if (try bridge.take(bridge.ctx, allocator)) |reply| {
+            return reply;
+        }
+        // 50ms poll: low enough to feel instant on submit,
+        // long enough that we don't burn CPU while a user
+        // ponders. Tigerclaw links libc on all targets — the
+        // top-level @compileError below catches a future Windows
+        // port that drops libc.
+        var ts: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+}
+
+comptime {
+    if (!@import("builtin").link_libc) {
+        @compileError("live_runner.zig requires libc (uses std.c.nanosleep, std.c.realpath); link libc in build.zig");
+    }
+}
+
+/// Caller-owned refusal text returned to the agent when a tool
+/// is blocked by the active sandbox mode. The message is plain
+/// text so the agent reads it as a normal tool result and can
+/// relay the situation to the user instead of retrying blindly.
+fn refuseSandbox(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    mode: LiveAgentRunner.SandboxMode,
+    detail: []const u8,
+) ![]u8 {
+    return switch (mode) {
+        .unlocked => allocator.dupe(u8, "refused: tool unavailable"),
+        .locked => if (detail.len > 0) std.fmt.allocPrint(
+            allocator,
+            "refused: workspace is locked. `{s}` may not run on this path: {s}. Ask the user to unlock (`/unlock`) or to widen the lock with `/lock <new-path>`.",
+            .{ tool_name, detail },
+        ) else std.fmt.allocPrint(
+            allocator,
+            "refused: workspace is locked. The user has disabled `{s}` while a path lock is active. Tell the user the workspace is locked and ask them to unlock with `/unlock`.",
+            .{tool_name},
+        ),
+        .plan => std.fmt.allocPrint(
+            allocator,
+            "refused: plan mode. `{s}` cannot run while in plan mode (read-only exploration only). Summarise the plan and ask the user to leave plan mode with `/unlock` before applying changes.",
+            .{tool_name},
+        ),
+    };
+}
+
+/// Verify the path argument of a write/edit call falls inside
+/// the runner's `lock_path`. Returns null on success, or a
+/// caller-owned refusal message on violation.
+///
+/// Path resolution is symlink-aware: we realpath the joined
+/// candidate so a symlink inside the locked tree pointing
+/// outside is correctly rejected. The `..` / absolute-path
+/// pre-check via `ensureSafeRelPath` guards us from one class
+/// of escape; realpath catches the rest.
+fn checkLockedPath(
+    allocator: std.mem.Allocator,
+    runner: *LiveAgentRunner,
+    workspace_root: []const u8,
+    tool_name: []const u8,
+    arguments_json: []const u8,
+) !?[]u8 {
+    const Args = struct { path: []const u8 = "" };
+    var parsed = std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return try refuseSandbox(allocator, tool_name, .locked, "(invalid arguments)");
+    defer parsed.deinit();
+
+    // Lexical pre-check: refuse `..` / absolute paths up front
+    // before realpath has a chance to normalise them away.
+    _ = ensureSafeRelPath(parsed.value.path) catch {
+        return try refuseSandbox(allocator, tool_name, .locked, parsed.value.path);
+    };
+
+    const lock_path = try runner.snapshotLockPath(allocator);
+    defer allocator.free(lock_path);
+    // An empty lock_path with mode==.locked would mean "no
+    // restriction," which is the wrong default for a lock —
+    // refuse explicitly so the user has to pick a path.
+    if (lock_path.len == 0) {
+        return try refuseSandbox(allocator, tool_name, .locked, "(no lock path set)");
+    }
+
+    const joined = try tool_read.canonicalPath(allocator, workspace_root, parsed.value.path);
+    defer allocator.free(joined);
+
+    // Best-effort realpath: if the file doesn't exist yet
+    // (write_file creating new files), realpath fails. In that
+    // case, fall back to the joined lexical path — the lexical
+    // check is correct for a path that doesn't traverse symlinks.
+    const candidate = realpathOrLexical(allocator, joined) catch joined;
+    defer if (candidate.ptr != joined.ptr) allocator.free(candidate);
+
+    if (!pathIsUnder(candidate, lock_path)) {
+        return try refuseSandbox(allocator, tool_name, .locked, parsed.value.path);
+    }
+    return null;
+}
+
+/// Resolve `path` through symlinks via libc realpath. Returns
+/// caller-owned bytes. Errors on missing files.
+fn realpathOrLexical(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const ptr = std.c.realpath(path_z.ptr, &buf);
+    if (ptr == null) return error.PathNotFound;
+    const len = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
+    return allocator.dupe(u8, buf[0..len]);
+}
+
+/// Returns true when `path` equals `root` or sits anywhere
+/// beneath it. Both must be absolute, lexically normalized.
+/// Empty `root` is rejected by the caller — there's no
+/// meaningful "everything passes" semantics for a lock.
+fn pathIsUnder(path: []const u8, root: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    if (path.len == root.len) return true;
+    return path[root.len] == '/';
+}
+
+/// After a write/edit, invalidate the read cache for the touched path
+/// so the next read sees the new content. Best-effort; argument
+/// parsing failures here just leave the cache stale until the next
+/// session-wide invalidation.
+fn invalidateRead(
+    runner: ?*LiveAgentRunner,
+    session_id: []const u8,
+    workspace_root: []const u8,
+    arguments_json: []const u8,
+) void {
+    const r = runner orelse return;
+    const Args = struct { path: []const u8 };
+    var parsed = std.json.parseFromSlice(Args, r.allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return;
+    defer parsed.deinit();
+
+    const canonical = tool_read.canonicalPath(r.allocator, workspace_root, parsed.value.path) catch return;
+    defer r.allocator.free(canonical);
+    r.read_state.invalidatePath(r.allocator, session_id, canonical);
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,6 +1609,309 @@ fn ensurePublicHost(host: []const u8) !void {
 }
 
 // ---------------------------------------------------------------------------
+// bash
+
+/// JSON adapter for the `tool_bash` module. Parses arguments, calls
+/// out for execution, and renders a structured human-readable result.
+fn runBash(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_root: []const u8,
+    arguments_json: []const u8,
+    progress_sink: ?tool_bash.ProgressSink,
+    progress_ctx: ?*anyopaque,
+) ![]u8 {
+    const Args = struct {
+        command: []const u8,
+        timeout: ?u64 = null,
+        description: ?[]const u8 = null,
+    };
+    var parsed = std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidArgs;
+    defer parsed.deinit();
+
+    if (parsed.value.command.len == 0) return error.InvalidArgs;
+
+    const cwd: []const u8 = if (workspace_root.len > 0) workspace_root else ".";
+
+    const result = tool_bash.run(allocator, io, .{
+        .command = parsed.value.command,
+        .cwd = cwd,
+        .timeout_ms = parsed.value.timeout orelse 120_000,
+        .progress_sink = progress_sink,
+        .progress_ctx = progress_ctx,
+    }) catch |e| switch (e) {
+        error.DeniedCommand => return std.fmt.allocPrint(
+            allocator,
+            "denied: command matches a destructive pattern (sudo, rm -rf /, fork bomb, dd-disk, mkfs, device-write).",
+            .{},
+        ),
+        error.SpawnFailed => return std.fmt.allocPrint(
+            allocator,
+            "bash: failed to spawn /bin/sh",
+            .{},
+        ),
+        else => return e,
+    };
+    defer result.deinit(allocator);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "exit_code: {d}\nduration_ms: {d}\ninterrupted: {}\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n",
+        .{ result.exit_code, result.duration_ms, result.interrupted, result.stdout, result.stderr },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// glob
+
+/// JSON adapter for `tool_glob`. Returns a newline-joined list of
+/// matched workspace-relative paths, mtime-desc, with optional
+/// truncation marker.
+fn runGlob(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_root: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
+    const Args = struct { pattern: []const u8, path: ?[]const u8 = null };
+    var parsed = std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidArgs;
+    defer parsed.deinit();
+
+    if (parsed.value.pattern.len == 0) return error.InvalidArgs;
+
+    const result = tool_glob.run(allocator, io, workspace_root, .{
+        .pattern = parsed.value.pattern,
+        .path = parsed.value.path,
+    }) catch |e| switch (e) {
+        error.InvalidPattern => return std.fmt.allocPrint(
+            allocator,
+            "glob: invalid pattern: {s}",
+            .{parsed.value.pattern},
+        ),
+        error.OpenFailed => return std.fmt.allocPrint(
+            allocator,
+            "glob: cannot open search root",
+            .{},
+        ),
+        else => return e,
+    };
+    defer result.deinit(allocator);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (result.matches) |m| {
+        try out.appendSlice(allocator, m.path);
+        try out.append(allocator, '\n');
+    }
+    if (result.truncated) {
+        try out.appendSlice(allocator, "[matched more files; cap=500. Refine pattern or `path` to narrow.]\n");
+    } else if (result.matches.len == 0) {
+        try out.appendSlice(allocator, "[no matches]\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ---------------------------------------------------------------------------
+// web_search
+
+fn runWebSearch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    arguments_json: []const u8,
+) ![]u8 {
+    const Args = struct {
+        query: []const u8,
+        domain_filter: ?[]const []const u8 = null,
+        count: u32 = 10,
+    };
+    var parsed = std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidArgs;
+    defer parsed.deinit();
+
+    const response = tool_web_search.run(allocator, io, .{
+        .query = parsed.value.query,
+        .domain_filter = parsed.value.domain_filter,
+        .count = parsed.value.count,
+    }) catch |e| switch (e) {
+        error.QueryTooShort => return std.fmt.allocPrint(
+            allocator,
+            "web_search: query must be at least 2 characters",
+            .{},
+        ),
+        error.HttpFailed => return std.fmt.allocPrint(
+            allocator,
+            "web_search: HTTP request to DuckDuckGo failed",
+            .{},
+        ),
+        error.ParseFailed => return std.fmt.allocPrint(
+            allocator,
+            "web_search: no results for \"{s}\"",
+            .{parsed.value.query},
+        ),
+        else => return e,
+    };
+    defer response.deinit(allocator);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (response.results, 0..) |r, idx| {
+        const rendered = try std.fmt.allocPrint(
+            allocator,
+            "[{d}] {s}\n    {s}\n    {s}\n\n",
+            .{ idx + 1, r.title, r.url, r.snippet },
+        );
+        defer allocator.free(rendered);
+        try out.appendSlice(allocator, rendered);
+    }
+    if (out.items.len == 0) {
+        try out.appendSlice(allocator, "[no results]\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ---------------------------------------------------------------------------
+// todo_write
+
+fn runTodoWrite(
+    allocator: std.mem.Allocator,
+    runner: ?*LiveAgentRunner,
+    session_id: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
+    const ItemArg = struct {
+        title: []const u8,
+        active_form: ?[]const u8 = null,
+        status: []const u8,
+    };
+    const Args = struct { items: []const ItemArg };
+    var parsed = std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidArgs;
+    defer parsed.deinit();
+
+    var items = try allocator.alloc(tool_todo_write.TodoItem, parsed.value.items.len);
+    defer allocator.free(items);
+    for (parsed.value.items, 0..) |arg, idx| {
+        const status: tool_todo_write.TodoStatus = if (std.mem.eql(u8, arg.status, "pending"))
+            .pending
+        else if (std.mem.eql(u8, arg.status, "in_progress"))
+            .in_progress
+        else if (std.mem.eql(u8, arg.status, "done"))
+            .done
+        else
+            return std.fmt.allocPrint(allocator, "todo_write: invalid status \"{s}\" (use pending|in_progress|done)", .{arg.status});
+        items[idx] = .{ .title = arg.title, .active_form = arg.active_form, .status = status };
+    }
+
+    // In tests `runner` may be null. Use a stack-local table so the
+    // model still gets a structured confirmation; the data just
+    // doesn't survive past the call.
+    var fallback = tool_todo_write.TodoState.init();
+    defer fallback.deinit(allocator);
+    const state: *tool_todo_write.TodoState = if (runner) |r| &r.todo_state else &fallback;
+    const sid: []const u8 = if (session_id.len > 0) session_id else "default";
+
+    state.set(allocator, sid, items) catch |e| switch (e) {
+        error.MultipleInProgress => return std.fmt.allocPrint(
+            allocator,
+            "todo_write: at most one item may be in_progress at a time",
+            .{},
+        ),
+        error.EmptyTitle => return std.fmt.allocPrint(
+            allocator,
+            "todo_write: every item needs a non-empty title",
+            .{},
+        ),
+        error.OversizeTitle => return std.fmt.allocPrint(
+            allocator,
+            "todo_write: title exceeds {d} chars",
+            .{tool_todo_write.MAX_TITLE_BYTES},
+        ),
+        error.TooManyItems => return std.fmt.allocPrint(
+            allocator,
+            "todo_write: max {d} items per list",
+            .{tool_todo_write.MAX_ITEMS},
+        ),
+        else => return e,
+    };
+
+    const stored = state.get(sid);
+    const counts = tool_todo_write.countByStatus(stored);
+    return std.fmt.allocPrint(
+        allocator,
+        "todos updated: {d} items ({d} pending, {d} in_progress, {d} done)",
+        .{ stored.len, counts.pending, counts.in_progress, counts.done },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// grep
+
+/// JSON adapter for `tool_grep`. Returns the runner's already-formatted
+/// `path:lineno:line` output, plus a truncation marker when the cap was
+/// hit.
+fn runGrep(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_root: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
+    const Args = struct {
+        pattern: []const u8,
+        path: ?[]const u8 = null,
+        glob: ?[]const u8 = null,
+        output_mode: ?[]const u8 = null,
+        case_insensitive: bool = false,
+        context_before: u32 = 0,
+        context_after: u32 = 0,
+    };
+    var parsed = std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidArgs;
+    defer parsed.deinit();
+
+    if (parsed.value.pattern.len == 0) return error.InvalidArgs;
+
+    const mode: tool_grep.OutputMode = if (parsed.value.output_mode) |m| blk: {
+        if (std.mem.eql(u8, m, "files_with_matches")) break :blk .files_with_matches;
+        if (std.mem.eql(u8, m, "count")) break :blk .count;
+        break :blk .content;
+    } else .content;
+
+    const result = tool_grep.run(allocator, io, workspace_root, .{
+        .pattern = parsed.value.pattern,
+        .path = parsed.value.path,
+        .glob = parsed.value.glob,
+        .output_mode = mode,
+        .case_insensitive = parsed.value.case_insensitive,
+        .context_before = parsed.value.context_before,
+        .context_after = parsed.value.context_after,
+    }) catch |e| switch (e) {
+        error.InvalidPattern => return std.fmt.allocPrint(allocator, "grep: invalid pattern", .{}),
+        error.OpenFailed => return std.fmt.allocPrint(allocator, "grep: cannot open search root", .{}),
+        else => return e,
+    };
+    defer result.deinit(allocator);
+
+    if (result.match_count == 0) {
+        return std.fmt.allocPrint(allocator, "[no matches]\n", .{});
+    }
+    if (result.truncated) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}[showing {d} matches across {d} files; capped at {d}. Narrow `pattern`, `path`, or `glob`.]\n",
+            .{ result.formatted, result.match_count, result.file_count, tool_grep.MAX_MATCHES },
+        );
+    }
+    return allocator.dupe(u8, result.formatted);
+}
+
+// ---------------------------------------------------------------------------
 // file tools (read_file / write_file / list_files / edit_file)
 //
 // Every file tool resolves its `path` argument inside the agent's
@@ -1115,26 +1950,85 @@ fn openWorkspaceDir(io: std.Io, workspace_root: []const u8) !std.Io.Dir {
     return std.Io.Dir.cwd().openDir(io, workspace_root, .{});
 }
 
+/// Workspace-rooted, line-numbered read with per-session dedup. The
+/// dedup table sits on the runner; in unit tests `runner` is null and
+/// we fall back to a non-deduped read.
 fn runReadFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     workspace_root: []const u8,
+    runner: ?*LiveAgentRunner,
+    session_id: []const u8,
     arguments_json: []const u8,
 ) ![]u8 {
-    const Args = struct { path: []const u8 };
-    var parsed = try std.json.parseFromSlice(Args, allocator, arguments_json, .{
+    const Args = struct {
+        path: []const u8,
+        offset: ?u32 = null,
+        limit: ?u32 = null,
+    };
+    var parsed = std.json.parseFromSlice(Args, allocator, arguments_json, .{
         .ignore_unknown_fields = true,
-    });
+    }) catch return error.InvalidArgs;
     defer parsed.deinit();
 
     const rel = try ensureSafeRelPath(parsed.value.path);
 
-    var root = try openWorkspaceDir(io, workspace_root);
-    defer root.close(io);
+    // Make sure the workspace root itself exists so a fresh runner
+    // doesn't error on a not-yet-created path.
+    _ = openWorkspaceDir(io, workspace_root) catch {};
 
-    return root.readFileAlloc(io, rel, allocator, .limited(64 * 1024)) catch |e| switch (e) {
-        error.FileNotFound => error.FileNotFound,
-        else => error.ReadFailed,
+    // Lazy-allocated fallback table for the runner-less test path so
+    // `read` always has somewhere to record its entries.
+    var fallback_state = tool_read.ReadStateTable.init();
+    defer fallback_state.deinit(allocator);
+    const state: *tool_read.ReadStateTable = if (runner) |r| &r.read_state else &fallback_state;
+    const sid: []const u8 = if (session_id.len > 0) session_id else "default";
+
+    const outcome = tool_read.read(allocator, io, state, sid, workspace_root, .{
+        .path = rel,
+        .offset = parsed.value.offset,
+        .limit = parsed.value.limit,
+    }) catch |e| switch (e) {
+        error.FileNotFound => return std.fmt.allocPrint(
+            allocator,
+            "read_file: {s}: file not found",
+            .{parsed.value.path},
+        ),
+        error.FileTooLarge => return std.fmt.allocPrint(
+            allocator,
+            "read_file: {s}: file is over {d} KB; pass `offset` and `limit` to read in chunks",
+            .{ parsed.value.path, tool_read.MAX_FILE_BYTES / 1024 },
+        ),
+        error.EmptyOffset => return std.fmt.allocPrint(
+            allocator,
+            "read_file: offsets are 1-based; use offset=1 for the first line",
+            .{},
+        ),
+        else => return e,
+    };
+    defer outcome.deinit(allocator);
+
+    return switch (outcome) {
+        .text => |t| if (t.truncated) std.fmt.allocPrint(
+            allocator,
+            "{s}\n[file has {d} more lines; pass offset={d} to continue]",
+            .{ t.content, t.total_lines - t.start_line - t.num_lines + 1, t.start_line + t.num_lines },
+        ) else allocator.dupe(u8, t.content),
+        .unchanged => |u| std.fmt.allocPrint(
+            allocator,
+            "<File {s} unchanged since last read. The earlier read tool_result is still current — refer to it instead of re-reading.>",
+            .{u.path},
+        ),
+        .empty => |e| std.fmt.allocPrint(
+            allocator,
+            "<system-reminder>file `{s}` exists but is empty.</system-reminder>",
+            .{e.path},
+        ),
+        .past_eof => |p| std.fmt.allocPrint(
+            allocator,
+            "<system-reminder>file `{s}` has only {d} lines but offset {d} was requested.</system-reminder>",
+            .{ p.path, p.total_lines, p.requested_offset },
+        ),
     };
 }
 
@@ -1571,7 +2465,7 @@ test "renderCurrentTimeIso8601: fixed timestamp renders canonically" {
 
 test "dispatchBuiltinTool: get_current_time matches renderCurrentTimeIso8601" {
     var fc = clock_mod.FixedClock{ .value_ns = 1_609_556_645 * @as(i128, std.time.ns_per_s) };
-    const out = try dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "", "get_current_time", "{}");
+    const out = try dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "", null, "", "get_current_time", "{}");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("2021-01-02T03:04:05Z", out);
 }
@@ -1580,7 +2474,7 @@ test "dispatchBuiltinTool: unknown name returns UnknownTool" {
     var fc = clock_mod.FixedClock{ .value_ns = 0 };
     try testing.expectError(
         error.UnknownTool,
-        dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "", "no_such_tool", "{}"),
+        dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "", null, "", "no_such_tool", "{}"),
     );
 }
 

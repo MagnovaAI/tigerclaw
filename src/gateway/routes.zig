@@ -323,15 +323,17 @@ fn chunkSink(ctx: ?*anyopaque, fragment: []const u8) void {
 
 fn toolEventSink(
     ctx: ?*anyopaque,
-    phase: harness.agent_runner.ToolEventPhase,
-    id: []const u8,
-    name: []const u8,
-    output: []const u8,
+    event: harness.agent_runner.ToolEvent,
 ) void {
     const self: *StreamCtx = @ptrCast(@alignCast(ctx.?));
-    switch (phase) {
-        .started => writeToolStartFrame(self.body, id, name) catch {},
-        .finished => writeToolDoneFrame(self.body, id, name, output) catch {},
+    switch (event) {
+        .started => |s| writeToolStartFrame(self.body, s.id, s.name) catch {},
+        // SSE consumers don't yet ingest progress chunks -- the
+        // streaming format (text/event-stream) framing for partial
+        // tool output is a separate design conversation. Drop for
+        // now; the final tool_result lands on `.finished`.
+        .progress => {},
+        .finished => |f| writeToolDoneFrame(self.body, f.id, f.name, f.kind.flatText()) catch {},
     }
 }
 
