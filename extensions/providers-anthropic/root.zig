@@ -245,8 +245,29 @@ fn parseStreamInner(
         }
         tool_calls.deinit(allocator);
     }
-    for (tool_builders.items) |*b| {
+    // When the stream stops on `max_tokens`, only the final tool_use
+    // block can be truncated — every earlier block was followed by
+    // additional events, so its `partial_json` is complete by
+    // induction. Drop a tail block whose accumulated JSON doesn't
+    // parse; the runner will re-ask the model, which then resumes
+    // from the cleanly-emitted prefix.
+    const last_idx: ?usize = if (stop == .max_tokens and tool_builders.items.len > 0)
+        tool_builders.items.len - 1
+    else
+        null;
+    for (tool_builders.items, 0..) |*b, i| {
         if (b.id.len == 0 or b.name.len == 0) continue;
+        if (last_idx != null and i == last_idx.? and b.input.items.len > 0) {
+            const probe = std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                b.input.items,
+                .{},
+            ) catch {
+                continue;
+            };
+            probe.deinit();
+        }
         const args = if (b.input.items.len == 0)
             try allocator.dupe(u8, "{}")
         else
@@ -1044,6 +1065,26 @@ test "anthropic: parseStream captures a tool_use block as a ToolCall" {
     try testing.expectEqualStrings("toolu_1", resp.tool_calls[0].id);
     try testing.expectEqualStrings("get_current_time", resp.tool_calls[0].name);
     try testing.expectEqualStrings("{}", resp.tool_calls[0].arguments_json);
+}
+
+test "anthropic: parseStream drops a truncated tail tool_use on max_tokens" {
+    // Two tool_use blocks. The first arrived complete; the second
+    // was cut off mid-JSON when the model hit the output cap. The
+    // parser should keep the clean prefix and drop the broken tail
+    // so the runner can dispatch what's good and re-ask for the rest.
+    const bytes =
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"write_file\"}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.txt\\\",\\\"content\\\":\\\"a\\\"}\"}}\n\n" ++
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_b\",\"name\":\"write_file\"}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"b.txt\\\",\\\"conte\"}}\n\n" ++
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n";
+
+    const resp = try parseStream(testing.allocator, .{ .literal = bytes });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(types.StopReason.max_tokens, resp.stop_reason);
+    try testing.expectEqual(@as(usize, 1), resp.tool_calls.len);
+    try testing.expectEqualStrings("toolu_a", resp.tool_calls[0].id);
 }
 
 const ServerArgs = struct {
