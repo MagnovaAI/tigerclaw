@@ -251,6 +251,8 @@ fn drawCompact(self: *const Header, ctx: vxfw.DrawContext, surface: vxfw.Surface
 }
 
 fn drawDivider(surface: vxfw.Surface, width: u16, row: u16) void {
+    // Guard against out-of-bounds row writes during resize.
+    if (row >= surface.size.height) return;
     const accent_cols: u16 = @min(width, 20);
     var col: u16 = 0;
     while (col < width) : (col += 1) {
@@ -301,6 +303,8 @@ fn writeGraphemesCounted(
     max_col: u16,
 ) u16 {
     if (text.len == 0) return 0;
+    // Guard against out-of-bounds row writes during resize.
+    if (row >= surface.size.height) return 0;
     var col = start_col;
     var iter = ctx.graphemeIterator(text);
     while (iter.next()) |g| {
