@@ -52,7 +52,10 @@ pub const Reporter = struct {
         const gop = try self.by_model.getOrPut(model);
         if (!gop.found_existing) {
             // Hash-map key must outlive the caller's `model` slice.
-            gop.key_ptr.* = try self.allocator.dupe(u8, model);
+            gop.key_ptr.* = self.allocator.dupe(u8, model) catch |err| {
+                _ = self.by_model.remove(model);
+                return err;
+            };
             gop.value_ptr.* = .{ .model = gop.key_ptr.* };
         }
         gop.value_ptr.calls +|= 1;
