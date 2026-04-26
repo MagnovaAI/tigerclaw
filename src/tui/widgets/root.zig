@@ -79,9 +79,12 @@ scroll_offset: u32 = 0,
 command_menu: CommandMenu = .{},
 command_menu_cursor: usize = 0,
 /// User-toggled: when false, tool_start / tool_done UEs do not
-/// add lines to the history. Default off so the chat reads as a
-/// plain conversation; `/tools on` re-enables for debugging.
-tool_output_enabled: bool = false,
+/// add lines to the history. Default on now that tool rows render
+/// as a single collapsed `● Tool(args)\n└ summary` block — the
+/// status bullet teaches the user something at a glance and Ctrl-B
+/// reveals the full body on demand. `/tools off` hides them
+/// entirely for users who want zero clutter.
+tool_output_enabled: bool = true,
 /// Set to true when a slash command requests app shutdown (e.g.
 /// `/quit`). The submit handler can't call `ctx.quit = true`
 /// directly because the Input widget owns the EventContext at
