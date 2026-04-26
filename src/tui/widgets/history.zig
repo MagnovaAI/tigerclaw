@@ -373,7 +373,7 @@ pub fn totalRowsFor(lines: []const tui.Line, width: u16) u32 {
     if (width == 0) return 0;
     var total: u32 = 0;
     var prev_role: ?tui.Line.Role = null;
-    for (lines) |line| {
+    for (lines) |*line| {
         if (line.role == .user) {
             total += 2; // half-block pads above and below the content
         } else if (shouldGapBefore(prev_role, line.role)) {

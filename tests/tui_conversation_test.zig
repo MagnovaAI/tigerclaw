@@ -44,6 +44,7 @@ fn postToolStart(root: *Root, ctx: *vxfw.EventContext, id: []const u8, name: []c
     payload.* = .{
         .id = try root.allocator.dupe(u8, id),
         .name = try root.allocator.dupe(u8, name),
+        .args_summary = try root.allocator.dupe(u8, ""),
     };
     try root.handleUserEvent(ctx, .{ .name = Root.ue_tool_start, .data = payload });
 }
@@ -54,6 +55,7 @@ fn postToolDone(root: *Root, ctx: *vxfw.EventContext, id: []const u8, name: []co
         .id = try root.allocator.dupe(u8, id),
         .name = try root.allocator.dupe(u8, name),
         .output = try root.allocator.dupe(u8, output),
+        .is_error = false,
     };
     try root.handleUserEvent(ctx, .{ .name = Root.ue_tool_done, .data = payload });
 }
@@ -126,7 +128,7 @@ test "tui: tool-done without a matching pending line is a noop" {
     try testing.expectEqual(@as(usize, 0), root.history.items.len);
 }
 
-test "tui: two tool calls in a row each get their own line" {
+test "tui: two tool calls in a row coalesce into one line" {
     var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
     root.tool_output_enabled = true;
     defer root.deinit();
@@ -141,13 +143,12 @@ test "tui: two tool calls in a row each get their own line" {
     try postChunk(&root, &ctx, "done");
     try postDone(&root, &ctx);
 
-    try testing.expectEqual(@as(usize, 3), root.history.items.len);
+    // Consecutive same-name tool calls coalesce into a single row;
+    // the chunk that follows lands as a separate agent line.
+    try testing.expectEqual(@as(usize, 2), root.history.items.len);
     try testing.expectEqual(tigerclaw.tui.Line.Role.tool, root.history.items[0].role);
-    try testing.expect(std.mem.indexOf(u8, root.history.items[0].text.items, "T1") != null);
-    try testing.expectEqual(tigerclaw.tui.Line.Role.tool, root.history.items[1].role);
-    try testing.expect(std.mem.indexOf(u8, root.history.items[1].text.items, "T2") != null);
-    try testing.expectEqual(tigerclaw.tui.Line.Role.agent, root.history.items[2].role);
-    try testing.expectEqualStrings("done", root.history.items[2].text.items);
+    try testing.expectEqual(tigerclaw.tui.Line.Role.agent, root.history.items[1].role);
+    try testing.expectEqualStrings("done", root.history.items[1].text.items);
 }
 
 test "tui: empty turn (done with no chunks and no tools) leaves history empty" {
