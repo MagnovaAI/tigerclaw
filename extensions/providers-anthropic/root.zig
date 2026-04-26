@@ -83,7 +83,7 @@ pub const AnthropicProvider = struct {
     ) anyerror!ChatResponse {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
         switch (self.source) {
-            .literal => |bytes| return parseStream(allocator, .{ .literal = bytes }),
+            .literal => |bytes| return parseStreamInner(allocator, .{ .literal = bytes }, null, null, request.cancel_token),
             .http => |cfg| return runHttp(allocator, cfg, request, null, null),
         }
     }
@@ -102,7 +102,7 @@ pub const AnthropicProvider = struct {
     ) anyerror!ChatResponse {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
         switch (self.source) {
-            .literal => |bytes| return streamTokens(allocator, .{ .literal = bytes }, sink, sink_ctx),
+            .literal => |bytes| return streamTokensCancellable(allocator, .{ .literal = bytes }, sink, sink_ctx, request.cancel_token),
             .http => |cfg| return runHttp(allocator, cfg, request, sink, sink_ctx),
         }
     }
@@ -122,6 +122,33 @@ pub const AnthropicProvider = struct {
     };
 };
 
+/// Per-read timeout applied to the streaming socket. Picked to be
+/// long enough that a slow but live model isn't killed mid-thought,
+/// short enough that a half-open connection after laptop sleep
+/// surfaces in seconds rather than minutes.
+const stream_read_timeout_secs: c_long = 60;
+
+/// Set `SO_RCVTIMEO` and `SO_KEEPALIVE` on the underlying socket so
+/// reads on a stalled stream return `error.Timeout` instead of
+/// blocking forever. Best-effort: any setsockopt failure is ignored
+/// (the request still works, just without the safety net).
+fn applySocketTimeouts(fd: std.posix.fd_t) void {
+    const tv = std.posix.timeval{ .sec = stream_read_timeout_secs, .usec = 0 };
+    std.posix.setsockopt(
+        fd,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&tv),
+    ) catch {};
+    const on: c_int = 1;
+    std.posix.setsockopt(
+        fd,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.KEEPALIVE,
+        std.mem.asBytes(&on),
+    ) catch {};
+}
+
 // ---------------------------------------------------------------------------
 // Stream-driven parsing (shared by literal and http paths)
 
@@ -140,7 +167,7 @@ pub const StreamInput = union(enum) {
 pub const TokenSink = *const fn (ctx: ?*anyopaque, token: []const u8) void;
 
 fn parseStream(allocator: std.mem.Allocator, input: StreamInput) !ChatResponse {
-    return parseStreamInner(allocator, input, null, null);
+    return parseStreamInner(allocator, input, null, null, null);
 }
 
 /// Same as the internal `parseStream` but invokes `sink(ctx, token)` for
@@ -155,7 +182,25 @@ pub fn streamTokens(
     sink: TokenSink,
     sink_ctx: ?*anyopaque,
 ) !ChatResponse {
-    return parseStreamInner(allocator, input, sink, sink_ctx);
+    return parseStreamInner(allocator, input, sink, sink_ctx, null);
+}
+
+/// Streaming entry point with cooperative cancellation. The `cancel`
+/// flag is polled between byte reads and between SSE events; on
+/// `true` the call returns the partial response with
+/// `stop_reason = .cancelled`. Tool-use blocks that started but
+/// didn't finish their args land in `tool_calls` only if the
+/// accumulated JSON parses cleanly; the runner pairs every emitted
+/// `tool_use` with a synthetic tool_result to keep the conversation
+/// history well-formed.
+pub fn streamTokensCancellable(
+    allocator: std.mem.Allocator,
+    input: StreamInput,
+    sink: TokenSink,
+    sink_ctx: ?*anyopaque,
+    cancel: ?*std.atomic.Value(bool),
+) !ChatResponse {
+    return parseStreamInner(allocator, input, sink, sink_ctx, cancel);
 }
 
 fn parseStreamInner(
@@ -163,6 +208,7 @@ fn parseStreamInner(
     input: StreamInput,
     sink: ?TokenSink,
     sink_ctx: ?*anyopaque,
+    cancel: ?*std.atomic.Value(bool),
 ) !ChatResponse {
     var parser = transport.sse.Parser.init();
     defer parser.deinit(allocator);
@@ -186,17 +232,26 @@ fn parseStreamInner(
         tool_builders.deinit(allocator);
     }
 
-    switch (input) {
+    var cancelled = false;
+    if (cancel) |c| if (c.load(.acquire)) {
+        cancelled = true;
+    };
+
+    if (!cancelled) switch (input) {
         .literal => |bytes| try parser.feed(allocator, bytes),
         .reader => |r| {
             var buf: [4096]u8 = undefined;
             while (true) {
+                if (cancel) |c| if (c.load(.acquire)) {
+                    cancelled = true;
+                    break;
+                };
                 const n = try r.readSliceShort(&buf);
                 if (n == 0) break;
                 try parser.feed(allocator, buf[0..n]);
             }
         },
-    }
+    };
 
     while (try parser.nextEvent(allocator)) |ev| {
         if (std.mem.eql(u8, ev.name, "content_block_start")) {
@@ -221,7 +276,13 @@ fn parseStreamInner(
             err_text = try absorbError(allocator, ev.data);
         }
         // Unknown events: skip.
+        if (cancel) |c| if (c.load(.acquire)) {
+            cancelled = true;
+            break;
+        };
     }
+
+    if (cancelled) stop = .cancelled;
 
     if (err_text) |e| {
         const owned = try allocator.dupe(u8, e);
@@ -430,6 +491,16 @@ fn runHttp(
     }) catch |err| return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
     defer req.deinit();
 
+    // Half-open connections (laptop sleep, network change, NAT
+    // rebind) leave the socket alive in our process while the peer
+    // is gone. Without timeouts the next read() blocks until the
+    // kernel's TCP retransmit budget runs out — minutes — and the
+    // TUI looks frozen. Set a per-read timeout so a stalled stream
+    // unwinds as `error.Timeout` and the runner can surface a
+    // refusal. Enable TCP keepalive so the kernel detects the
+    // dead peer faster on its own.
+    if (req.connection) |c| applySocketTimeouts(c.stream_reader.stream.socket.handle);
+
     var send_buf: [1024]u8 = undefined;
     req.transfer_encoding = .{ .content_length = body.len };
     var body_writer = req.sendBodyUnflushed(&send_buf) catch |err|
@@ -461,8 +532,8 @@ fn runHttp(
     var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
     const body_reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
     const input: StreamInput = .{ .reader = body_reader };
-    if (sink) |s| return streamTokens(allocator, input, s, sink_ctx);
-    return parseStream(allocator, input);
+    if (sink) |s| return streamTokensCancellable(allocator, input, s, sink_ctx, request.cancel_token);
+    return parseStreamInner(allocator, input, null, null, request.cancel_token);
 }
 
 /// Render the Anthropic-shaped JSON request body. Extracted so tests
@@ -1233,4 +1304,76 @@ test "anthropic: streamTokens does not invoke sink on error events" {
     try testing.expectEqual(types.StopReason.refusal, resp.stop_reason);
     try testing.expect(resp.text != null);
     try testing.expect(std.mem.indexOf(u8, resp.text.?, "slow down") != null);
+}
+
+/// Sink wrapper that flips a cancel flag after observing N fragments.
+/// Used to prove `streamTokensCancellable` honors the flag mid-event.
+const CancellingCollector = struct {
+    base: TokenCollector,
+    cancel: *std.atomic.Value(bool),
+    fire_after: usize,
+
+    fn cb(ctx: ?*anyopaque, fragment: []const u8) void {
+        const self: *CancellingCollector = @ptrCast(@alignCast(ctx.?));
+        TokenCollector.appendCb(@ptrCast(&self.base), fragment);
+        if (self.base.fragments.items.len >= self.fire_after) {
+            self.cancel.store(true, .release);
+        }
+    }
+};
+
+test "anthropic: streamTokensCancellable stops at cancel flag and reports .cancelled" {
+    // Same wire as the happy-path test but split into many small
+    // deltas so the flag has a chance to flip mid-iteration.
+    const stream =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"b\"}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"c\"}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"d\"}}\n\n" ++
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n" ++
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var sink: CancellingCollector = .{
+        .base = .{ .allocator = testing.allocator },
+        .cancel = &cancel,
+        .fire_after = 2,
+    };
+    defer sink.base.deinit();
+
+    const resp = try streamTokensCancellable(
+        testing.allocator,
+        .{ .literal = stream },
+        CancellingCollector.cb,
+        &sink,
+        &cancel,
+    );
+    defer if (resp.text) |t| testing.allocator.free(t);
+
+    try testing.expectEqual(types.StopReason.cancelled, resp.stop_reason);
+    // Got at least the two fragments that triggered the cancel; the
+    // post-cancel deltas (c, d) are not delivered.
+    try testing.expect(sink.base.fragments.items.len >= 2);
+    try testing.expect(sink.base.fragments.items.len < 4);
+}
+
+test "anthropic: streamTokensCancellable returns .cancelled immediately when flag set before start" {
+    const stream = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n";
+
+    var cancel = std.atomic.Value(bool).init(true);
+    var collector: TokenCollector = .{ .allocator = testing.allocator };
+    defer collector.deinit();
+
+    const resp = try streamTokensCancellable(
+        testing.allocator,
+        .{ .literal = stream },
+        TokenCollector.appendCb,
+        &collector,
+        &cancel,
+    );
+    defer if (resp.text) |t| testing.allocator.free(t);
+
+    try testing.expectEqual(types.StopReason.cancelled, resp.stop_reason);
+    try testing.expectEqual(@as(usize, 0), collector.fragments.items.len);
 }

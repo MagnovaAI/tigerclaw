@@ -10,6 +10,11 @@ pub const StopReason = enum {
     tool_use,
     stop_sequence,
     refusal,
+    /// Stream was interrupted cooperatively via the request's
+    /// `cancel_token`. Distinguishes user ESC from natural end-of-turn
+    /// so the runner can pair partial tool_use blocks with synthetic
+    /// `cancelled` tool_results.
+    cancelled,
 
     pub fn jsonStringify(self: StopReason, w: *std.json.Stringify) !void {
         try w.write(@tagName(self));

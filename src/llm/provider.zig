@@ -19,7 +19,16 @@ pub const ChatRequest = struct {
     /// `supportsNativeTools() == false` ignore this — the runner is
     /// expected to gate dispatch on capability.
     tools: []const types.Tool = &.{},
+    /// Cooperative cancellation flag. When non-null, the provider's
+    /// streaming reader checks `cancel_token.load(.acquire)` between
+    /// events; on `true` the call returns the partial response
+    /// accumulated so far with `stop_reason = .cancelled`. Caller
+    /// owns the atomic and must keep it alive for the duration of
+    /// the request. Null means cancellation is not wired (legacy
+    /// callers, tests).
+    cancel_token: ?*std.atomic.Value(bool) = null,
 };
+
 
 pub const ChatResponse = struct {
     text: ?[]const u8 = null,
