@@ -210,9 +210,63 @@ fn parseStreamInner(
         cancelled = true;
     };
 
+    // Drain every event the parser currently has buffered into the
+    // local accumulators. Called both interleaved with reader pulls
+    // (so text deltas reach the sink as soon as bytes arrive) and
+    // once at the end for the literal/EOF case. Returns true when
+    // cancel fires mid-drain.
+    const Drain = struct {
+        fn run(
+            alloc: std.mem.Allocator,
+            p: *transport.sse.Parser,
+            txt: *std.array_list.Aligned(u8, null),
+            tb: *std.ArrayListUnmanaged(ToolBuilder),
+            us: *types.TokenUsage,
+            stp: *types.StopReason,
+            etx: *?[]const u8,
+            sk: ?TokenSink,
+            sk_ctx: ?*anyopaque,
+            cnc: ?*std.atomic.Value(bool),
+            out_cancelled: *bool,
+        ) !void {
+            while (try p.nextEvent(alloc)) |ev| {
+                if (std.mem.eql(u8, ev.name, "content_block_start")) {
+                    try absorbContentBlockStart(alloc, tb, ev.data);
+                } else if (std.mem.eql(u8, ev.name, "content_block_delta")) {
+                    const before = txt.items.len;
+                    try absorbDelta(alloc, txt, ev.data);
+                    if (sk) |s| {
+                        const fragment = txt.items[before..];
+                        if (fragment.len > 0) s(sk_ctx, fragment);
+                    }
+                    try absorbInputJsonDelta(alloc, tb, ev.data);
+                } else if (std.mem.eql(u8, ev.name, "message_delta")) {
+                    try absorbMessageDelta(us, stp, ev.data);
+                } else if (std.mem.eql(u8, ev.name, "message_start")) {
+                    try absorbMessageStart(us, ev.data);
+                } else if (std.mem.eql(u8, ev.name, "error")) {
+                    stp.* = .refusal;
+                    etx.* = try absorbError(alloc, ev.data);
+                }
+                if (cnc) |c| if (c.load(.acquire)) {
+                    out_cancelled.* = true;
+                    return;
+                };
+            }
+        }
+    };
+
     if (!cancelled) switch (input) {
-        .literal => |bytes| try parser.feed(allocator, bytes),
+        .literal => |bytes| {
+            try parser.feed(allocator, bytes);
+            try Drain.run(allocator, &parser, &text, &tool_builders, &usage, &stop, &err_text, sink, sink_ctx, cancel, &cancelled);
+        },
         .reader => |r| {
+            // Streaming path: interleave byte reads with event drains
+            // so each text_delta reaches the sink the moment it
+            // arrives. Without the drain after every feed, the sink
+            // would only fire once the full response had been read,
+            // defeating the streaming UX.
             var buf: [4096]u8 = undefined;
             while (true) {
                 if (cancel) |c| if (c.load(.acquire)) {
@@ -222,38 +276,11 @@ fn parseStreamInner(
                 const n = try r.readSliceShort(&buf);
                 if (n == 0) break;
                 try parser.feed(allocator, buf[0..n]);
+                try Drain.run(allocator, &parser, &text, &tool_builders, &usage, &stop, &err_text, sink, sink_ctx, cancel, &cancelled);
+                if (cancelled) break;
             }
         },
     };
-
-    while (try parser.nextEvent(allocator)) |ev| {
-        if (std.mem.eql(u8, ev.name, "content_block_start")) {
-            try absorbContentBlockStart(allocator, &tool_builders, ev.data);
-        } else if (std.mem.eql(u8, ev.name, "content_block_delta")) {
-            // `content_block_delta` carries either `text_delta` (user
-            // text) or `input_json_delta` (tool-call arguments). The
-            // absorb functions short-circuit on the wrong type.
-            const before = text.items.len;
-            try absorbDelta(allocator, &text, ev.data);
-            if (sink) |s| {
-                const fragment = text.items[before..];
-                if (fragment.len > 0) s(sink_ctx, fragment);
-            }
-            try absorbInputJsonDelta(allocator, &tool_builders, ev.data);
-        } else if (std.mem.eql(u8, ev.name, "message_delta")) {
-            try absorbMessageDelta(&usage, &stop, ev.data);
-        } else if (std.mem.eql(u8, ev.name, "message_start")) {
-            try absorbMessageStart(&usage, ev.data);
-        } else if (std.mem.eql(u8, ev.name, "error")) {
-            stop = .refusal;
-            err_text = try absorbError(allocator, ev.data);
-        }
-        // Unknown events: skip.
-        if (cancel) |c| if (c.load(.acquire)) {
-            cancelled = true;
-            break;
-        };
-    }
 
     if (cancelled) stop = .cancelled;
 
