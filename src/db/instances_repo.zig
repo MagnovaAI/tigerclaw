@@ -278,6 +278,49 @@ pub const Repo = struct {
         try stmt.bindInt(3, @intCast(now_ns));
         _ = try stmt.step();
     }
+
+    /// Soft-evict rows whose heartbeat is more than `grace_ns` old.
+    /// Returns the count of rows transitioned. Idempotent: a row
+    /// already evicted is left alone, so a slow sweeper invocation
+    /// after a fast one is a no-op rather than an over-stamp of the
+    /// eviction timestamp.
+    pub fn evictExpired(self: *Repo, now_ns: i128, grace_ns: i128) !i64 {
+        self.db.lock();
+        defer self.db.unlock();
+
+        var stmt = try self.db.prepare(
+            \\UPDATE instances SET evicted_at_ns = ?
+            \\WHERE evicted_at_ns = 0
+            \\  AND heartbeat_interval_ms > 0
+            \\  AND last_heartbeat_at_ns + ? < ?;
+        );
+        defer stmt.deinit();
+        try stmt.bindInt(1, @intCast(now_ns));
+        try stmt.bindInt(2, @intCast(grace_ns));
+        try stmt.bindInt(3, @intCast(now_ns));
+        _ = try stmt.step();
+        return self.db.changes();
+    }
+
+    /// Hard-delete rows that have been soft-evicted longer than
+    /// `purge_after_ns`. Lets the registry stay bounded under churn
+    /// without needing operator intervention. Returns the count of
+    /// rows removed.
+    pub fn purgeEvicted(self: *Repo, now_ns: i128, purge_after_ns: i128) !i64 {
+        self.db.lock();
+        defer self.db.unlock();
+
+        var stmt = try self.db.prepare(
+            \\DELETE FROM instances
+            \\WHERE evicted_at_ns > 0
+            \\  AND evicted_at_ns + ? < ?;
+        );
+        defer stmt.deinit();
+        try stmt.bindInt(1, @intCast(purge_after_ns));
+        try stmt.bindInt(2, @intCast(now_ns));
+        _ = try stmt.step();
+        return self.db.changes();
+    }
 };
 
 /// Two-pass collection: gather (offset, length) tuples for every

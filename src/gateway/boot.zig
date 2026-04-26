@@ -58,6 +58,7 @@ const hook_bus_mod = @import("../hook_bus.zig");
 const meter_mod = @import("../meter.zig");
 const telemetry_mod = @import("../telemetry.zig");
 const db_mod = @import("../db/root.zig");
+const sweeper_mod = @import("../instances/sweeper.zig");
 
 pub const Options = struct {
     address: std.Io.net.IpAddress,
@@ -107,6 +108,10 @@ pub const Options = struct {
     /// Optional sink for startup log lines (e.g. "telegram: tiger
     /// bound to @tobi374758_bot"). Null silences the messages.
     startup_log: ?*std.Io.Writer = null,
+    /// Tunables for the instance-registry sweeper. Defaults are
+    /// production-shaped (5s tick, 30s grace, 5min purge); tests
+    /// override `tick_interval_ns` to keep the loop quick.
+    sweeper: sweeper_mod.Options = .{},
 };
 
 pub const Boot = struct {
@@ -171,6 +176,10 @@ pub const Boot = struct {
     /// word wide and rebinding-free, so allocating one per call is
     /// cheaper than the cost of stale-self-pointer bugs.
     db: db_mod.Db,
+    /// Background sweeper for instance-row eviction and purge. Constructed
+    /// at init, started in `run`, stopped in `drain` before the DB
+    /// closes so the loop never touches a destroyed handle.
+    sweeper: sweeper_mod.Sweeper,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -200,6 +209,14 @@ pub const Boot = struct {
         };
         errdefer db.close();
         try db_mod.migrations.run(&db);
+
+        // Reconcile rows from a previous process run. Anything stale
+        // is soft-evicted now; the sweeper picks up the purge on its
+        // first tick.
+        var startup_repo = db_mod.InstanceRepo.init(&db);
+        startup_repo.reconcileOnStartup(opts.clock.nowNs(), opts.sweeper.grace_ns) catch |e| {
+            std.debug.print("gateway: instance reconcile failed: {s}\n", .{@errorName(e)});
+        };
 
         const initial_settings = loadSettings(allocator, io, opts.state_root, opts.config_path) orelse
             settings_mod.schema.defaultSettings();
@@ -240,8 +257,12 @@ pub const Boot = struct {
             .telemetry_sink = .{},
             .clock = opts.clock,
             .db = db,
+            .sweeper = undefined,
         };
         boot.manager = manager_mod.Manager.init(allocator, io, &boot.dispatch);
+        // Sweeper borrows `&boot.db`; binding it after the struct
+        // copy is well-defined because the loop is not running yet.
+        boot.sweeper = sweeper_mod.Sweeper.init(&boot.db, opts.clock, io, opts.sweeper);
 
         // Bring live channels online if the caller supplied a registry.
         // On error the outer errdefers handle tearing down dispatch /
@@ -377,8 +398,14 @@ pub const Boot = struct {
         // `boot` value that Zig copied on return. Same for every
         // other self-referential pointer we stored at init time.
         self.manager.dispatch = &self.dispatch;
+        self.sweeper.db = &self.db;
 
         try self.manager.start();
+
+        // Spin up the instance-registry sweeper. It runs for the
+        // life of the daemon; the drain step below stops it before
+        // we close the SQLite handle.
+        try self.sweeper.start();
 
         // Dispatch worker drains inbound → runner → outbox; outbox
         // sender delivers to the channel adapter. Only start when a
@@ -471,6 +498,11 @@ pub const Boot = struct {
         // to quit.
         if (self.dispatch_worker) |*w| w.stop();
         if (self.telegram_sender) |*s| s.stop();
+
+        // Step 5: stop the instance sweeper. Must happen before
+        // `deinit` closes the SQLite handle — the loop holds `&db`
+        // and would crash if the handle vanished mid-tick.
+        self.sweeper.stop();
     }
 };
 
