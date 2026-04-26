@@ -600,8 +600,24 @@ pub const LiveAgentRunner = struct {
             // old `chat` path.
             const resp = blk: {
                 if (req.stream_sink) |s| {
-                    break :blk owned.provider.chatStream(self.allocator, chat_req, s, req.stream_sink_ctx) catch
+                    break :blk owned.provider.chatStream(self.allocator, chat_req, s, req.stream_sink_ctx) catch |err| {
+                        // Surface the actual error name through the
+                        // stream sink so the TUI shows what failed
+                        // (Timeout, ConnectionRefused, etc.) instead
+                        // of a silent freeze. The post-sleep / dead-
+                        // socket case lands here as `error.Timeout`
+                        // once SO_RCVTIMEO fires; a fresh-connect
+                        // failure lands as `error.ConnectionRefused`
+                        // or similar.
+                        var msg_buf: [128]u8 = undefined;
+                        const msg = std.fmt.bufPrint(
+                            &msg_buf,
+                            "[transport error: {s}]",
+                            .{@errorName(err)},
+                        ) catch "[transport error]";
+                        s(req.stream_sink_ctx, msg);
                         return error.InternalError;
+                    };
                 }
                 break :blk owned.provider.chat(self.allocator, chat_req) catch
                     return error.InternalError;
