@@ -1043,6 +1043,37 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
             return;
         }
 
+        // Coalesce consecutive same-tool calls. When the model
+        // calls `edit_file` repeatedly while iterating, show a
+        // single row whose args swap to whatever the current
+        // call is editing (`edit_file(foo.py)` → `edit_file(bar.py)`)
+        // instead of stacking five rows. Match by tool name only;
+        // the args reflect the most recent call. Status flips
+        // back to `.running` so the bullet shows in-flight again.
+        if (self.history.items.len > 0) {
+            const last = &self.history.items[self.history.items.len - 1];
+            if (last.role == .tool and last.tool_name != null and
+                std.mem.eql(u8, last.tool_name.?, name_slice))
+            {
+                last.tool_status = .running;
+                if (last.tool_args) |old| self.allocator.free(old);
+                last.tool_args = try self.allocator.dupe(u8, args_slice);
+                if (last.tool_id) |old| self.allocator.free(old);
+                last.tool_id = try self.allocator.dupe(u8, id_slice);
+                // Drop the prior call's full output and summary —
+                // the row now represents the new call. Ctrl-B
+                // expand will show the new call's body when it
+                // lands.
+                if (last.tool_summary) |s| self.allocator.free(s);
+                if (last.tool_full) |s| self.allocator.free(s);
+                last.tool_summary = null;
+                last.tool_full = null;
+                try renderToolLine(self.allocator, last);
+                ctx.redraw = true;
+                return;
+            }
+        }
+
         // Pending row: render header without summary or
         // continuation glyph. `turn_tool_done` later swaps in the
         // collapsed `<header>\n  └ <summary>` block.
@@ -1418,7 +1449,7 @@ fn summarizeToolOutput(output: []const u8) []const u8 {
 
 /// (Re)render `entry.text` from the tool's structured fields.
 /// Idempotent — call after every state change (done lands,
-/// expand toggles).
+/// expand toggles, args update from a coalesced retry).
 fn renderToolLine(allocator: std.mem.Allocator, entry: *tui.Line) !void {
     const name = entry.tool_name orelse return;
     entry.text.clearRetainingCapacity();
