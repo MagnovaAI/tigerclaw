@@ -1602,6 +1602,27 @@ fn ensurePublicHost(host: []const u8) !void {
         if ((b[0] & 0xFE) == 0xFC) return error.DisallowedAddress;
         // fe80::/10 link-local
         if (b[0] == 0xFE and (b[1] & 0xC0) == 0x80) return error.DisallowedAddress;
+        // IPv4-mapped IPv6 (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d):
+        // re-check the embedded IPv4 against the v4 private/loopback ranges.
+        // Without this, `[::ffff:127.0.0.1]` and `[::ffff:10.x.x.x]` slip past.
+        var v4_prefix_zero = true;
+        for (b[0..10]) |byte| if (byte != 0) {
+            v4_prefix_zero = false;
+            break;
+        };
+        if (v4_prefix_zero) {
+            const mapped = (b[10] == 0xFF and b[11] == 0xFF); // ::ffff:0:0/96
+            const compat = (b[10] == 0 and b[11] == 0); // ::/96 (compat)
+            if (mapped or compat) {
+                const v4 = b[12..16];
+                if (v4[0] == 127) return error.DisallowedAddress;
+                if (v4[0] == 10) return error.DisallowedAddress;
+                if (v4[0] == 172 and (v4[1] & 0xF0) == 0x10) return error.DisallowedAddress;
+                if (v4[0] == 192 and v4[1] == 168) return error.DisallowedAddress;
+                if (v4[0] == 169 and v4[1] == 254) return error.DisallowedAddress;
+                if (v4[0] == 0) return error.DisallowedAddress;
+            }
+        }
         return;
     } else |_| {}
 
