@@ -414,14 +414,18 @@ pub const LiveAgentRunner = struct {
 
     fn liveCancel(ctx: *anyopaque, _: harness.agent_runner.TurnId) void {
         const self: *LiveAgentRunner = @ptrCast(@alignCast(ctx));
-        // Cooperative cancel. Flips the flag the streaming reader
-        // and tool dispatch loop poll. Idempotent — multiple ESC
-        // presses are a no-op.
+        // Cooperative cancel. Flips the flag the streaming reader,
+        // tool dispatch loop, and ask_user wait poll. Idempotent —
+        // multiple ESC presses are a no-op. Intentionally does NOT
+        // call ask_user_bridge.cancel from here: liveCancel runs on
+        // the UI thread (via ESC), and the bridge cancel posts a
+        // UserEvent into the same loop the UI thread is currently
+        // dispatching from — re-entry hazard. The ask_user worker
+        // observes the flag on its own poll and surfaces a
+        // "[cancelled by user]" tool_result, which is enough for
+        // the UI to clear its pending state via the normal turn-
+        // end path.
         self.cancel_flag.store(true, .release);
-        // Also unblock any ask_user wait so the operator isn't
-        // stuck staring at a question prompt that the model can no
-        // longer answer to.
-        if (self.ask_user_bridge) |b| b.cancel(b.ctx);
     }
 
     fn liveRun(

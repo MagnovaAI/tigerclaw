@@ -822,6 +822,21 @@ fn eventHandler(
                 key.matches(vaxis.Key.escape, .{});
             if (esc_pending_turn) {
                 self.runner.?.cancel(0);
+                // If the agent was in an ask_user wait, clear the
+                // UI-side pending flag here (we're already on the
+                // UI thread). The runner's ask_user worker will
+                // observe the cancel flag on its 50ms tick and
+                // return a "[cancelled]" tool_result; in the
+                // meantime the user's next keystroke shouldn't be
+                // captured as a stale reply, so reset the gate.
+                if (self.ask_user_pending.load(.seq_cst)) {
+                    self.ask_user_pending.store(false, .seq_cst);
+                    self.beginPendingReply();
+                    if (self.pending_reply) |slot| self.allocator.free(slot);
+                    self.pending_reply = null;
+                    self.endPendingReply();
+                    self.hint.left = "↑↓ scroll  ·  ctrl-c quit";
+                }
                 ctx.consumeAndRedraw();
                 return;
             }
