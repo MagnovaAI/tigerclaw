@@ -289,8 +289,11 @@ fn dispatchCommand(self: *Root, cmd: []const u8) void {
         self.runConfigCommand() catch {};
         return;
     }
-    if (std.mem.eql(u8, name, "skills")) {
-        self.runSkillsCommand() catch {};
+    if (std.mem.eql(u8, name, "skills") or std.mem.eql(u8, name, "skill")) {
+        // `/skills` lists every skill; `/skills <name>` or
+        // `/skill <name>` zooms in on a single one with its full
+        // description and an `@name` hint.
+        self.runSkillsCommandImpl(args) catch {};
         return;
     }
     if (std.mem.eql(u8, name, "lock")) {
@@ -462,6 +465,16 @@ fn runConfigCommand(self: *Root) !void {
 }
 
 fn runSkillsCommand(self: *Root) !void {
+    return self.runSkillsCommandImpl("");
+}
+
+/// `/skills` lists every installed skill; `/skill <name>` (or
+/// `/skills <name>`) shows just that one. Each skill renders as
+/// its own appendLine row so the user can scroll past long names
+/// without one giant wrapped block. The `@<name>` hint nudges the
+/// user toward the reference syntax — the agent reads the skill's
+/// body when it sees `@<name>` in a user message.
+fn runSkillsCommandImpl(self: *Root, target: []const u8) !void {
     if (self.home_dir.len == 0) {
         try self.appendLine(.system, "skills: HOME unset; cannot scan");
         return;
@@ -483,19 +496,74 @@ fn runSkillsCommand(self: *Root) !void {
         return;
     }
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(self.allocator);
-    try buf.appendSlice(self.allocator, "skills:");
-    for (list.items) |s| {
-        try buf.append(self.allocator, '\n');
-        try buf.appendSlice(self.allocator, "  ");
-        try buf.appendSlice(self.allocator, s.name);
-        if (s.description.len > 0) {
-            try buf.appendSlice(self.allocator, " — ");
-            try buf.appendSlice(self.allocator, s.description);
+    if (target.len > 0) {
+        for (list.items) |s| {
+            if (std.mem.eql(u8, s.name, target)) {
+                try self.renderSkillDetail(s);
+                return;
+            }
         }
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "skill not found: {s}", .{target}) catch "skill not found";
+        try self.appendLine(.system, msg);
+        return;
     }
-    try self.appendLine(.system, buf.items);
+
+    var header_buf: [64]u8 = undefined;
+    const header = std.fmt.bufPrint(
+        &header_buf,
+        "skills ({d}) — reference one with @<name>",
+        .{list.items.len},
+    ) catch "skills";
+    try self.appendLine(.system, header);
+
+    for (list.items) |s| {
+        var line_buf: std.ArrayList(u8) = .empty;
+        defer line_buf.deinit(self.allocator);
+        try line_buf.appendSlice(self.allocator, "  @");
+        try line_buf.appendSlice(self.allocator, s.name);
+        if (s.description.len > 0) {
+            try line_buf.appendSlice(self.allocator, "  —  ");
+            // Cap the description at 100 chars per row so a long
+            // first-line description doesn't push everything else
+            // off the screen on a narrow terminal. The full text
+            // is still available via `/skill <name>`.
+            const max_desc: usize = 100;
+            if (s.description.len <= max_desc) {
+                try line_buf.appendSlice(self.allocator, s.description);
+            } else {
+                try line_buf.appendSlice(self.allocator, s.description[0..max_desc]);
+                try line_buf.appendSlice(self.allocator, "…");
+            }
+        }
+        try self.appendLine(.system, line_buf.items);
+    }
+}
+
+/// Render a single skill's full detail. Used by `/skill <name>`
+/// and the picker's Enter dispatch (future work). Header line
+/// shows the bare name; description follows on its own row;
+/// hint at the bottom reminds the user how to invoke.
+fn renderSkillDetail(self: *Root, s: skills_mod.Skill) !void {
+    var name_buf: [128]u8 = undefined;
+    const name_line = std.fmt.bufPrint(&name_buf, "skill: @{s}", .{s.name}) catch "skill";
+    try self.appendLine(.system, name_line);
+
+    if (s.description.len > 0) {
+        var desc_buf: std.ArrayList(u8) = .empty;
+        defer desc_buf.deinit(self.allocator);
+        try desc_buf.appendSlice(self.allocator, "  ");
+        try desc_buf.appendSlice(self.allocator, s.description);
+        try self.appendLine(.system, desc_buf.items);
+    }
+
+    var hint_buf: [256]u8 = undefined;
+    const hint = std.fmt.bufPrint(
+        &hint_buf,
+        "  reference in a message with @{s} so the agent loads its body.",
+        .{s.name},
+    ) catch "  reference with @<name>";
+    try self.appendLine(.system, hint);
 }
 
 // --- Turn orchestration ----------------------------------------------------
@@ -738,6 +806,23 @@ fn eventHandler(
                 key.matches('q', .{ .ctrl = true }))
             {
                 ctx.quit = true;
+                return;
+            }
+
+            // ESC during a pending turn cooperatively cancels.
+            // Defers to the slash-menu escape handler below when
+            // a slash is being typed (Esc closes the menu first);
+            // otherwise reaches the runner's cancel hook so the
+            // streaming reader and tool dispatch loop pick up the
+            // flag at their next checkpoint.
+            const esc_pending_turn =
+                self.runner != null and
+                self.turn_started_ms != 0 and
+                !(self.input.buf.items.len > 0 and self.input.buf.items[0] == '/') and
+                key.matches(vaxis.Key.escape, .{});
+            if (esc_pending_turn) {
+                self.runner.?.cancel(0);
+                ctx.consumeAndRedraw();
                 return;
             }
 
