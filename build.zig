@@ -129,6 +129,12 @@ pub fn build(b: *std.Build) void {
     tigerclaw_mod.addImport("channels_spec", channels_spec_mod);
     tigerclaw_mod.addImport("memory_spec", memory_spec_mod);
     tigerclaw_mod.addImport("build_options", build_options_mod);
+    // Core SQLite — instances, sessions, and the production
+    // SessionStore all live in the same database. Linked
+    // unconditionally because none of these features are optional
+    // plugs.
+    tigerclaw_mod.link_libc = true;
+    tigerclaw_mod.linkSystemLibrary("sqlite3", .{});
 
     var provider_anthropic_mod: ?*std.Build.Module = null;
     var provider_openai_mod: ?*std.Build.Module = null;
@@ -232,8 +238,10 @@ pub fn build(b: *std.Build) void {
     if (channel_telegram_mod) |m| exe_mod.addImport("channel_telegram", m);
     if (memory_tigerclaw_mod) |m| {
         exe_mod.addImport("memory_tigerclaw", m);
-        exe_mod.linkSystemLibrary("sqlite3", .{});
     }
+    // Core SQLite for the executable; same rationale as the lib
+    // module — sessions / instances / memory all live in one db.
+    exe_mod.linkSystemLibrary("sqlite3", .{});
 
     // Vaxis TUI dependency
     const vaxis_dep = b.dependency("vaxis", .{
@@ -381,8 +389,9 @@ pub fn build(b: *std.Build) void {
     if (channel_telegram_mod) |m| unit_mod.addImport("channel_telegram", m);
     if (memory_tigerclaw_mod) |m| {
         unit_mod.addImport("memory_tigerclaw", m);
-        unit_mod.linkSystemLibrary("sqlite3", .{});
     }
+    // unit_tests reach the core db module via tigerclaw lib.
+    unit_mod.linkSystemLibrary("sqlite3", .{});
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 

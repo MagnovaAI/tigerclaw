@@ -57,10 +57,16 @@ const env_overrides = @import("../settings/env_overrides.zig");
 const hook_bus_mod = @import("../hook_bus.zig");
 const meter_mod = @import("../meter.zig");
 const telemetry_mod = @import("../telemetry.zig");
+const db_mod = @import("../db/root.zig");
 
 pub const Options = struct {
     address: std.Io.net.IpAddress,
     state_root: std.Io.Dir,
+    /// Filesystem path matching `state_root`. SQLite needs a real
+    /// path string for `sqlite3_open`; the Dir handle is for std.Io
+    /// file work. Empty string falls back to `:memory:` so tests that
+    /// don't pin a real state dir still get a working DB.
+    state_root_path: []const u8 = "",
     routes: []const router.Route,
     handlers: dispatcher.HandlerMap,
     /// Clock threaded into the outbox for record timestamps and retry
@@ -157,6 +163,15 @@ pub const Boot = struct {
     telemetry_sink: telemetry_mod.NoopSink,
     clock: clock_mod.Clock,
 
+    /// SQLite handle backing the instance registry (and future
+    /// session/memory persistence). Owned by Boot — opened in init,
+    /// closed in deinit after every subsystem that holds a Repo
+    /// has torn down. Callers grab a typed Repo via `instanceRepo()`
+    /// rather than holding a long-lived pointer; the Repo is one
+    /// word wide and rebinding-free, so allocating one per call is
+    /// cheaper than the cost of stale-self-pointer bugs.
+    db: db_mod.Db,
+
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -170,6 +185,21 @@ pub const Boot = struct {
 
         var outbox = try outbox_mod.Outbox.init(io, opts.state_root, allocator, opts.clock);
         errdefer outbox.deinit();
+
+        // SQLite-backed instance registry. When the caller supplies
+        // a real state directory we open `<state_root_path>/gateway.db`;
+        // otherwise we fall back to `:memory:` so the test rig and the
+        // Boot lifecycle suite don't need a tmp file.
+        var db = blk: {
+            if (opts.state_root_path.len == 0) {
+                break :blk try db_mod.Db.open(allocator, .{ .path = ":memory:" });
+            }
+            const db_path = try std.fs.path.join(allocator, &.{ opts.state_root_path, "gateway.db" });
+            defer allocator.free(db_path);
+            break :blk try db_mod.Db.open(allocator, .{ .path = db_path });
+        };
+        errdefer db.close();
+        try db_mod.migrations.run(&db);
 
         const initial_settings = loadSettings(allocator, io, opts.state_root, opts.config_path) orelse
             settings_mod.schema.defaultSettings();
@@ -209,6 +239,7 @@ pub const Boot = struct {
             .meter_impl = meter_mod.InMemoryMeter.init(&.{}),
             .telemetry_sink = .{},
             .clock = opts.clock,
+            .db = db,
         };
         boot.manager = manager_mod.Manager.init(allocator, io, &boot.dispatch);
 
@@ -288,7 +319,18 @@ pub const Boot = struct {
         self.hook_bus.deinit();
         for (self.snapshots.items) |s| self.allocator.destroy(s);
         self.snapshots.deinit(self.allocator);
+        // DB closes last among the persistent subsystems — every
+        // repo borrows `&self.db`, and we want the handle alive for
+        // the duration of any teardown that still wants to write.
+        self.db.close();
         self.* = undefined;
+    }
+
+    /// Construct a typed instance-registry repo bound to this Boot's
+    /// live SQLite handle. Cheap (one word) — call per request rather
+    /// than caching, so the handle pointer is always current.
+    pub fn instanceRepo(self: *Boot) db_mod.InstanceRepo {
+        return db_mod.InstanceRepo.init(&self.db);
     }
 
     /// Expose the meter vtable for subsystems that hold a `*Boot` and
