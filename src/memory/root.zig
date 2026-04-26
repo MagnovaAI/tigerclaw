@@ -17,11 +17,13 @@ pub const spec = @import("memory_spec");
 pub const provider = @import("provider.zig");
 pub const builtin = @import("builtin.zig");
 pub const manager = @import("manager.zig");
+pub const preference_log = @import("preference_log.zig");
 
 pub const Provider = provider.Provider;
 pub const MemoryError = provider.MemoryError;
 pub const Builtin = builtin.Builtin;
 pub const Manager = manager.Manager;
+pub const PreferenceLog = preference_log.PreferenceLog;
 
 /// Comptime-gated re-export of the SQLite-backed default backend.
 /// Replaced by an empty struct when disabled so callers can `@hasDecl`-

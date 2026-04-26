@@ -39,6 +39,7 @@ const session_mod = @import("session.zig");
 
 const agent_mod = @import("../agent/agent.zig");
 const memory = @import("../memory/root.zig");
+const types = @import("types");
 
 pub const RealRunner = struct {
     allocator: std.mem.Allocator,
@@ -51,8 +52,24 @@ pub const RealRunner = struct {
 
     memory_manager: *memory.Manager,
 
+    /// Optional preference log. When set, a turn-end record is
+    /// appended after each turn. Borrowed from the caller; the
+    /// caller deinits it after the runner.
+    preference_log: ?*memory.PreferenceLog = null,
+
+    /// Stable agent identifier emitted into the preference log so
+    /// the audit table can join across runs. Borrowed.
+    agent_id: []const u8 = "",
+    /// Stable model identifier emitted into the preference log.
+    /// Borrowed; matches the agent's configured model name.
+    model_id: []const u8 = "",
+
     interrupt: interrupt_mod.Interrupt = .{},
     in_flight: agent_runner.InFlightCounter = .{},
+
+    /// Monotonic per-runner turn id. Stamped onto each preference
+    /// record so the audit consumer can order events.
+    next_turn_id: u64 = 1,
 
     /// Currently-loaded session. None until the first turn lands.
     /// Swapped when `req.session_id` differs from `current_id`.
@@ -68,6 +85,9 @@ pub const RealRunner = struct {
         harness: harness_mod.Harness,
         agent: *agent_mod.Agent,
         memory_manager: *memory.Manager,
+        preference_log: ?*memory.PreferenceLog = null,
+        agent_id: []const u8 = "",
+        model_id: []const u8 = "",
     };
 
     pub fn init(opts: Options) RealRunner {
@@ -76,6 +96,9 @@ pub const RealRunner = struct {
             .harness = opts.harness,
             .agent = opts.agent,
             .memory_manager = opts.memory_manager,
+            .preference_log = opts.preference_log,
+            .agent_id = opts.agent_id,
+            .model_id = opts.model_id,
         };
     }
 
@@ -145,6 +168,10 @@ pub const RealRunner = struct {
         self.in_flight.begin();
         defer self.in_flight.end();
 
+        const turn_id = self.next_turn_id;
+        self.next_turn_id += 1;
+        const start_ns = self.harness.clock.nowNs();
+
         // Per-turn lifecycle invariant: clear before any work that
         // could observe the flag. A flip during the previous turn's
         // tail does not bleed into this one.
@@ -202,9 +229,62 @@ pub const RealRunner = struct {
             if (final.len > 0) sink(req.stream_sink_ctx, final);
         }
 
+        // Append the audit record. Failure to write is logged but
+        // does not fail the turn — the substrate is best-effort by
+        // design; an operator who wanted strict audit guarantees
+        // would gate the turn on it via a different surface.
+        self.recordPreference(.{
+            .turn_id = turn_id,
+            .start_ns = start_ns,
+            .input = req.input,
+            .output = final,
+            .completed = out.reason == .model_finished,
+            .usage = out.usage,
+            .session_id = req.session_id,
+        });
+
         return .{
             .output = final,
             .completed = out.reason == .model_finished,
+        };
+    }
+
+    const PreferenceContext = struct {
+        turn_id: u64,
+        start_ns: i128,
+        input: []const u8,
+        output: []const u8,
+        completed: bool,
+        usage: types.TokenUsage,
+        session_id: []const u8,
+    };
+
+    fn recordPreference(self: *RealRunner, p: PreferenceContext) void {
+        const log_handle = self.preference_log orelse return;
+        const end_ns = self.harness.clock.nowNs();
+        const elapsed_ns: i128 = end_ns - p.start_ns;
+        const latency_ms: u64 = if (elapsed_ns <= 0)
+            0
+        else
+            @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
+
+        log_handle.record(.{
+            .turn_id = p.turn_id,
+            .agent_id = self.agent_id,
+            .session_id = p.session_id,
+            .user_input_hash = memory.preference_log.hashBlake3Truncated(p.input),
+            .output_hash = memory.preference_log.hashBlake3Truncated(p.output),
+            .model = self.model_id,
+            .input_tokens = p.usage.input,
+            .output_tokens = p.usage.output,
+            .latency_ms = latency_ms,
+            .completed = p.completed,
+            .ts_ns = end_ns,
+        }) catch |e| {
+            std.log.scoped(.real_runner).warn(
+                "preference log record failed: {s}",
+                .{@errorName(e)},
+            );
         };
     }
 
@@ -299,7 +379,6 @@ pub const RealRunner = struct {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
-const types = @import("types");
 const llm = @import("../llm/root.zig");
 const vtable_mod = @import("../agent/vtable.zig");
 const clock_mod = @import("clock");
@@ -515,4 +594,83 @@ test "RealRunner: cancel before run trips Interrupted on the next turn" {
     rr.runner().cancel(0);
     const ok = try rr.runner().run(.{ .session_id = "s", .input = "second" });
     try testing.expect(ok.completed);
+}
+
+test "RealRunner: emits one preference-log record per turn when wired" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var mc = clock_mod.ManualClock{ .value_ns = 1 };
+    const replies = [_]llm.providers.mock.Reply{
+        .{ .text = "hello back", .stop_reason = .end_turn },
+        .{ .text = "second reply", .stop_reason = .end_turn },
+    };
+    var mock = llm.MockProvider{ .replies = &replies };
+    var deny = vtable_mod.DenyExecutor{};
+
+    const a = try newAgent(testing.allocator, mock.provider(), deny.executor());
+
+    var b = memory.Builtin.init(.{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .state_dir = tmp.dir,
+        .agent_name = "tiger",
+        .clock = mc.clock(),
+    });
+    try b.initialize();
+    var mgr = memory.Manager.init(testing.allocator, b.provider());
+    defer mgr.deinit();
+
+    var pl = try memory.PreferenceLog.init(.{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .state_dir = tmp.dir,
+        .clock = mc.clock(),
+    });
+    defer pl.deinit();
+
+    var rr = RealRunner.init(.{
+        .allocator = testing.allocator,
+        .harness = harness_mod.Harness.init(.{
+            .allocator = testing.allocator,
+            .clock = mc.clock(),
+            .io = testing.io,
+            .state_dir = tmp.dir,
+        }),
+        .agent = a,
+        .memory_manager = &mgr,
+        .preference_log = &pl,
+        .agent_id = "tiger",
+        .model_id = "mock-0",
+    });
+    defer rr.deinit();
+
+    _ = try rr.runner().run(.{ .session_id = "s", .input = "first" });
+    mc.value_ns = 2_000_000; // 2 ms later
+    _ = try rr.runner().run(.{ .session_id = "s", .input = "second" });
+
+    var dir = try tmp.dir.openDir(testing.io, "audit", .{});
+    defer dir.close(testing.io);
+    var buf: [4096]u8 = undefined;
+    const bytes = try dir.readFile(testing.io, "preferences.jsonl", &buf);
+
+    var lines: usize = 0;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |ln| if (ln.len > 0) {
+        lines += 1;
+
+        // Each line must round-trip as JSON with the load-bearing
+        // fields populated.
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            testing.allocator,
+            ln,
+            .{},
+        );
+        defer parsed.deinit();
+        try testing.expectEqualStrings("tiger", parsed.value.object.get("agent_id").?.string);
+        try testing.expectEqualStrings("mock-0", parsed.value.object.get("model").?.string);
+        try testing.expectEqual(true, parsed.value.object.get("completed").?.bool);
+    };
+    try testing.expectEqual(@as(usize, 2), lines);
 }
