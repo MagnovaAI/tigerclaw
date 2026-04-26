@@ -69,6 +69,24 @@ pub const AgentState = struct {
         return self.messages.items;
     }
 
+    /// Replace the entire message list with `new`. Frees every old
+    /// message and the old backing array. The caller hands over
+    /// ownership of `new` (and every `Message` inside it) — both
+    /// must have been allocated with `self.allocator`. Used by
+    /// context-engine compaction: the engine returns a freshly-
+    /// owned slice, and the agent swaps it into the state in one
+    /// step so no slice in the old array escapes.
+    pub fn replaceMessages(
+        self: *AgentState,
+        new: []types.Message,
+    ) !void {
+        for (self.messages.items) |m| m.freeOwned(self.allocator);
+        self.messages.deinit(self.allocator);
+        self.messages = .empty;
+        try self.messages.appendSlice(self.allocator, new);
+        self.allocator.free(new);
+    }
+
     pub fn len(self: *const AgentState) usize {
         return self.messages.items.len;
     }
@@ -114,6 +132,22 @@ test "AgentState: pushed strings are independent copies" {
     buf[0] = 'X'; // mutate the caller's buffer
 
     try testing.expectEqualStrings("abc", s.history()[0].flatText());
+}
+
+test "AgentState: replaceMessages frees old and adopts new" {
+    var s = AgentState.init(testing.allocator);
+    defer s.deinit();
+
+    _ = try s.pushUser("old1");
+    _ = try s.pushAssistant("old2");
+
+    const new = try testing.allocator.alloc(types.Message, 1);
+    new[0] = try types.Message.allocText(testing.allocator, .user, "fresh");
+
+    try s.replaceMessages(new);
+
+    try testing.expectEqual(@as(usize, 1), s.len());
+    try testing.expectEqualStrings("fresh", s.history()[0].flatText());
 }
 
 test "AgentState: iteration counter bumps and resets" {

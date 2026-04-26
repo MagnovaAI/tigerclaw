@@ -43,6 +43,21 @@ pub const Engine = struct {
         return .{ .opts = opts };
     }
 
+    /// Predicate the runner queries to decide whether to compact
+    /// before sending a turn. Returns true when the current history
+    /// would land in `pressure` or `overflow`. `prepareForSend`
+    /// gates on the same condition; this method is exposed so the
+    /// runner can early-out without paying the copy cost when no
+    /// compaction is due.
+    pub fn shouldCompress(
+        self: *const Engine,
+        history: []const types.Message,
+    ) bool {
+        const tokens = self.opts.window.estimateMessages(history);
+        const status = self.opts.window.classify(tokens);
+        return status == .pressure or status == .overflow;
+    }
+
     /// Decide whether to compact, perform it if so, record the
     /// feedback, and return the prepared messages.
     pub fn prepareForSend(
@@ -124,6 +139,28 @@ test "Engine: ok status keeps history intact" {
     try testing.expectEqual(@as(usize, 2), prep.messages.len);
     try testing.expectEqual(@as(usize, 0), prep.hint.len);
     try testing.expectEqual(@as(u32, 0), prep.feedback.hints_added);
+}
+
+test "Engine.shouldCompress: false at ok/warm, true at pressure/overflow" {
+    // Budget = 40 tokens. Estimator is ceil(bytes/4), so we need
+    // 36+ tokens (>=90%) of message content to trip pressure.
+    var e = Engine.init(.{
+        .allocator = testing.allocator,
+        .window = .{ .capacity_tokens = 40, .reserve_output_tokens = 0 },
+        .policy = .{ .keep_head = 1, .keep_tail = 1 },
+    });
+
+    const small = [_]types.Message{types.Message.literal(.user, "hi")};
+    try testing.expectEqual(false, e.shouldCompress(&small));
+
+    // 4 messages × 40 bytes ≈ 40 tokens → overflow.
+    const big = [_]types.Message{
+        types.Message.literal(.user, "a" ** 40),
+        types.Message.literal(.assistant, "b" ** 40),
+        types.Message.literal(.user, "c" ** 40),
+        types.Message.literal(.assistant, "d" ** 40),
+    };
+    try testing.expectEqual(true, e.shouldCompress(&big));
 }
 
 test "Engine: pressure triggers compaction" {
