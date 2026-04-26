@@ -25,9 +25,25 @@ pub const Stream = struct {
     /// bytes from the underlying reader as needed. Event slices are
     /// invalidated by the next call.
     pub fn next(self: *Stream, allocator: std.mem.Allocator) !?sse.Event {
+        return self.nextCancellable(allocator, null);
+    }
+
+    /// Same as `next` but polls `cancel` between byte reads. When the
+    /// flag is set, returns `error.Cancelled` so the caller can surface
+    /// a partial response with the appropriate stop reason. Provider
+    /// adapters thread their `ChatRequest.cancel_token` here so cancel
+    /// works the same way for every SSE-based backend (Anthropic,
+    /// OpenAI, OpenRouter, ...).
+    pub fn nextCancellable(
+        self: *Stream,
+        allocator: std.mem.Allocator,
+        cancel: ?*std.atomic.Value(bool),
+    ) !?sse.Event {
         while (true) {
             if (try self.parser.nextEvent(allocator)) |ev| return ev;
             if (self.eof) return null;
+
+            if (cancel) |c| if (c.load(.acquire)) return error.Cancelled;
 
             const n = try self.reader.readSliceShort(&self.chunk);
             if (n == 0) {
@@ -38,6 +54,8 @@ pub const Stream = struct {
         }
     }
 };
+
+pub const StreamError = error{Cancelled};
 
 // --- tests -----------------------------------------------------------------
 
@@ -69,4 +87,41 @@ test "Stream: partial buffering across reads still yields a single event" {
 
     const ev = try s.next(testing.allocator) orelse return error.TestExpectedEqual;
     try testing.expectEqualStrings("combined-payload", ev.data);
+}
+
+test "Stream.nextCancellable: returns Cancelled when flag is set before next read" {
+    const bytes = "data: a\n\ndata: b\n\n";
+    var r: std.Io.Reader = .fixed(bytes);
+
+    var s = Stream.init(&r);
+    defer s.deinit(testing.allocator);
+
+    // Consume the first event so we know the parser still has buffered
+    // events ready, then flip cancel; nextCancellable must observe it
+    // before the next byte read and short-circuit.
+    var cancel = std.atomic.Value(bool).init(false);
+    const first = try s.nextCancellable(testing.allocator, &cancel) orelse
+        return error.TestExpectedEqual;
+    try testing.expectEqualStrings("a", first.data);
+
+    // Drain the second buffered event (already in the parser) — flag
+    // is checked between reads, not between events the parser has
+    // already produced. Both behaviours are correct: the runner
+    // rechecks after each event regardless.
+    const second = try s.nextCancellable(testing.allocator, &cancel) orelse
+        return error.TestExpectedEqual;
+    try testing.expectEqualStrings("b", second.data);
+
+    // Now the buffer is empty and EOF hasn't been seen; with a fresh
+    // reader holding more bytes, nextCancellable would block on read.
+    // Flip cancel and prove the read never happens.
+    cancel.store(true, .release);
+    var more = "data: c\n\n".*;
+    var r2: std.Io.Reader = .fixed(&more);
+    var s2 = Stream.init(&r2);
+    defer s2.deinit(testing.allocator);
+    try testing.expectError(
+        error.Cancelled,
+        s2.nextCancellable(testing.allocator, &cancel),
+    );
 }

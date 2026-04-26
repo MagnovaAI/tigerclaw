@@ -122,33 +122,6 @@ pub const AnthropicProvider = struct {
     };
 };
 
-/// Per-read timeout applied to the streaming socket. Picked to be
-/// long enough that a slow but live model isn't killed mid-thought,
-/// short enough that a half-open connection after laptop sleep
-/// surfaces in seconds rather than minutes.
-const stream_read_timeout_secs: c_long = 60;
-
-/// Set `SO_RCVTIMEO` and `SO_KEEPALIVE` on the underlying socket so
-/// reads on a stalled stream return `error.Timeout` instead of
-/// blocking forever. Best-effort: any setsockopt failure is ignored
-/// (the request still works, just without the safety net).
-fn applySocketTimeouts(fd: std.posix.fd_t) void {
-    const tv = std.posix.timeval{ .sec = stream_read_timeout_secs, .usec = 0 };
-    std.posix.setsockopt(
-        fd,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        std.mem.asBytes(&tv),
-    ) catch {};
-    const on: c_int = 1;
-    std.posix.setsockopt(
-        fd,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.KEEPALIVE,
-        std.mem.asBytes(&on),
-    ) catch {};
-}
-
 // ---------------------------------------------------------------------------
 // Stream-driven parsing (shared by literal and http paths)
 
@@ -499,7 +472,7 @@ fn runHttp(
     // unwinds as `error.Timeout` and the runner can surface a
     // refusal. Enable TCP keepalive so the kernel detects the
     // dead peer faster on its own.
-    if (req.connection) |c| applySocketTimeouts(c.stream_reader.stream.socket.handle);
+    if (req.connection) |c| transport.applyDefaultSocketTimeouts(c.stream_reader.stream.socket.handle);
 
     var send_buf: [1024]u8 = undefined;
     req.transfer_encoding = .{ .content_length = body.len };
