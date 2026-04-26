@@ -27,6 +27,12 @@ pub const Skill = struct {
     /// Absolute path to the SKILL.md so the agent can read full
     /// content on demand.
     path: []u8,
+    /// Body of the skill, post-frontmatter. Owned. Inlined into
+    /// the system prompt so the agent has the instructions
+    /// available without needing a separate read_file call —
+    /// `read_file` is sandboxed to the agent's workspace and
+    /// can't traverse to ~/.tigerclaw/skills anyway.
+    body: []u8,
 };
 
 pub const List = struct {
@@ -38,6 +44,7 @@ pub const List = struct {
             self.allocator.free(s.name);
             self.allocator.free(s.description);
             self.allocator.free(s.path);
+            self.allocator.free(s.body);
         }
         self.allocator.free(self.items);
         self.* = undefined;
@@ -53,6 +60,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, home: []const u8) !List {
             allocator.free(s.name);
             allocator.free(s.description);
             allocator.free(s.path);
+            allocator.free(s.body);
         }
         collected.deinit(allocator);
     }
@@ -93,11 +101,14 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, home: []const u8) !List {
         errdefer allocator.free(name);
         const description = try allocator.dupe(u8, meta.description);
         errdefer allocator.free(description);
+        const body = try allocator.dupe(u8, meta.body);
+        errdefer allocator.free(body);
 
         try collected.append(allocator, .{
             .name = name,
             .description = description,
             .path = skill_md,
+            .body = body,
         });
     }
 
@@ -108,14 +119,24 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, home: []const u8) !List {
 const Frontmatter = struct {
     name: []const u8 = "",
     description: []const u8 = "",
+    /// Everything after the closing `---` fence. Empty when the
+    /// file has no frontmatter (in which case the whole file
+    /// counts as body and gets returned unchanged).
+    body: []const u8 = "",
 };
 
 /// Tiny ad-hoc YAML reader: only handles `key: value` lines inside
 /// a leading `---` / `---` fence. Anything else is ignored. Good
-/// enough for skill metadata; not a general YAML parser.
+/// enough for skill metadata; not a general YAML parser. Also
+/// returns the post-fence body so the caller can ship the full
+/// skill text to the model.
 fn parseFrontmatter(bytes: []const u8) Frontmatter {
     var meta: Frontmatter = .{};
-    if (!std.mem.startsWith(u8, bytes, "---")) return meta;
+    if (!std.mem.startsWith(u8, bytes, "---")) {
+        // No frontmatter at all — treat the whole file as body.
+        meta.body = bytes;
+        return meta;
+    }
 
     // Skip the opening fence line.
     var rest = bytes[3..];
@@ -135,10 +156,17 @@ fn parseFrontmatter(bytes: []const u8) Frontmatter {
         if (std.mem.eql(u8, key, "name")) meta.name = value;
         if (std.mem.eql(u8, key, "description")) meta.description = value;
     }
+
+    // Body starts after the closing fence's newline.
+    const after_fence = rest[end_marker + 4 ..]; // skip "\n---"
+    // Skip the rest of the fence line (e.g. "---\n" or "---  \n").
+    const body_start = if (std.mem.indexOfScalar(u8, after_fence, '\n')) |nl| nl + 1 else after_fence.len;
+    meta.body = std.mem.trim(u8, after_fence[body_start..], " \t\r\n");
+
     return meta;
 }
 
-test "parseFrontmatter: basic name + description" {
+test "parseFrontmatter: basic name + description + body" {
     const src =
         \\---
         \\name: hello
@@ -150,10 +178,27 @@ test "parseFrontmatter: basic name + description" {
     const meta = parseFrontmatter(src);
     try std.testing.expectEqualStrings("hello", meta.name);
     try std.testing.expectEqualStrings("a friendly greeting", meta.description);
+    try std.testing.expectEqualStrings("body", meta.body);
 }
 
-test "parseFrontmatter: missing fence returns empty" {
+test "parseFrontmatter: missing fence returns the whole file as body" {
     const meta = parseFrontmatter("name: nope\n");
     try std.testing.expectEqualStrings("", meta.name);
     try std.testing.expectEqualStrings("", meta.description);
+    try std.testing.expectEqualStrings("name: nope\n", meta.body);
+}
+
+test "parseFrontmatter: multi-paragraph body preserved" {
+    const src =
+        \\---
+        \\name: x
+        \\description: y
+        \\---
+        \\
+        \\First paragraph.
+        \\
+        \\Second paragraph.
+    ;
+    const meta = parseFrontmatter(src);
+    try std.testing.expectEqualStrings("First paragraph.\n\nSecond paragraph.", meta.body);
 }

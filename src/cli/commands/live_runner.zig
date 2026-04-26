@@ -351,22 +351,33 @@ pub const LiveAgentRunner = struct {
                 \\
                 \\# Available skills
                 \\
-                \\Each skill is a Markdown file under ~/.tigerclaw/skills/<name>/SKILL.md.
-                \\When the user references a skill by name, read the file with `read_file`
-                \\and follow the instructions inside before doing the task.
+                \\Each skill below is a self-contained set of instructions for a
+                \\specific task. When the user invokes a skill by name (e.g.
+                \\"@code-review", "review my code", "use the git-commit skill"),
+                \\follow the body of the matching skill before answering. Skills
+                \\override your defaults for the duration of the task — if a
+                \\skill says "do X first", do X first.
+                \\
+                \\Match user intent to skill name loosely: "review this" → the
+                \\code-review skill, "make a commit" → git-commit, etc. When in
+                \\doubt, pick the closest match and proceed; if there is no
+                \\reasonable match, answer normally without invoking a skill.
                 \\
             );
             for (skills) |s| {
-                try buf.append(allocator, '-');
-                try buf.append(allocator, ' ');
-                try buf.append(allocator, '`');
+                try buf.appendSlice(allocator, "\n## skill: ");
                 try buf.appendSlice(allocator, s.name);
-                try buf.append(allocator, '`');
-                if (s.description.len > 0) {
-                    try buf.appendSlice(allocator, " — ");
-                    try buf.appendSlice(allocator, s.description);
-                }
                 try buf.append(allocator, '\n');
+                if (s.description.len > 0) {
+                    try buf.appendSlice(allocator, "\n_");
+                    try buf.appendSlice(allocator, s.description);
+                    try buf.appendSlice(allocator, "_\n");
+                }
+                if (s.body.len > 0) {
+                    try buf.append(allocator, '\n');
+                    try buf.appendSlice(allocator, s.body);
+                    try buf.append(allocator, '\n');
+                }
             }
         }
 
