@@ -60,6 +60,15 @@ pub fn logFn(
     // floor and debug only fires under `--verbose`.
     if (level == .debug and !verbose_enabled.load(.acquire)) return;
 
+    // Suppress vaxis's `.info` chatter ("kitty keyboard capability
+    // detected", etc.). It writes to stderr before the alt-screen
+    // takes over, so the user sees a wall of capability lines
+    // every TUI launch. Warnings and errors from vaxis still
+    // surface — those usually indicate something the user should
+    // see (resize panic, render failure). Errors and warns from
+    // any scope continue to log at all levels.
+    if (scope == .vaxis and level == .info) return;
+
     // Build the line into a stack buffer. We avoid heap allocation
     // in the log path so logging stays usable under OOM.
     var buf: [4096]u8 = undefined;
