@@ -127,6 +127,7 @@ pub const routes = [_]router.Route{
     .{ .method = .POST, .pattern = "/sessions/:id/messages", .tag = "sessions.message" },
     .{ .method = .POST, .pattern = "/sessions/:id/turns", .tag = "sessions.turn" },
     .{ .method = .DELETE, .pattern = "/sessions/:id/turns/current", .tag = "sessions.turn.cancel" },
+    .{ .method = .GET, .pattern = "/instances", .tag = "instances.list" },
     .{ .method = .POST, .pattern = "/instances/register", .tag = "instances.register" },
     .{ .method = .POST, .pattern = "/instances/:id/heartbeat", .tag = "instances.heartbeat" },
     .{ .method = .DELETE, .pattern = "/instances/:id", .tag = "instances.delete" },
@@ -142,6 +143,7 @@ pub const handlers = [_]dispatcher.HandlerEntry{
     .{ .tag = "sessions.message", .handler = sessionsMessageHandler },
     .{ .tag = "sessions.turn", .handler = sessionsTurnHandler },
     .{ .tag = "sessions.turn.cancel", .handler = sessionsTurnCancelHandler },
+    .{ .tag = "instances.list", .handler = instancesListHandler },
     .{ .tag = "instances.register", .handler = instancesRegisterHandler },
     .{ .tag = "instances.heartbeat", .handler = instancesHeartbeatHandler },
     .{ .tag = "instances.delete", .handler = instancesDeleteHandler },
@@ -475,6 +477,54 @@ fn renderJsonFromOutput(output: []const u8) http.Response {
 }
 
 // --- /instances/* ---------------------------------------------------------
+
+/// GET /instances — list every live (non-evicted) row in the
+/// registry. Operators read this to see what TUIs/CLIs are
+/// connected; the rendered shape mirrors the Record fields except
+/// `token_hash`, which never leaves the database. Body shape:
+///   {"instances":[{"id":"tui-...","kind":"tui","name":"alice",
+///                  "agent_id":"tiger","session_id":"...",
+///                  "heartbeat_interval_ms":30000,
+///                  "connected_at_ns":..,"last_heartbeat_at_ns":..}]}
+fn instancesListHandler(
+    _: http.Request,
+    _: []const router.Param,
+    _: ?[]const u8,
+    _: dispatcher.StreamHook,
+) dispatcher.HandlerError!http.Response {
+    const ctx = try contextOrInternal();
+    const db = ctx.db orelse return dbUnavailable();
+
+    var repo = db_mod.InstanceRepo.init(db);
+    var list = repo.listLive(std.heap.page_allocator) catch return error.InternalServerError;
+    defer list.deinit();
+
+    var w = std.Io.Writer.fixed(&render_body_buf);
+    w.writeAll("{\"instances\":[") catch return error.InternalServerError;
+    for (list.items, 0..) |rec, i| {
+        if (i > 0) w.writeAll(",") catch return error.InternalServerError;
+        renderInstance(&w, rec) catch return error.InternalServerError;
+    }
+    w.writeAll("]}") catch return error.InternalServerError;
+    return http.Response.jsonOk(w.buffered());
+}
+
+fn renderInstance(w: *std.Io.Writer, rec: db_mod.InstanceRecord) !void {
+    try w.writeAll("{\"id\":");
+    try std.json.Stringify.encodeJsonString(rec.id, .{}, w);
+    try w.writeAll(",\"kind\":\"");
+    try w.writeAll(rec.kind.toString());
+    try w.writeAll("\",\"name\":");
+    try std.json.Stringify.encodeJsonString(rec.name, .{}, w);
+    try w.writeAll(",\"agent_id\":");
+    try std.json.Stringify.encodeJsonString(rec.agent_id, .{}, w);
+    try w.writeAll(",\"session_id\":");
+    try std.json.Stringify.encodeJsonString(rec.session_id, .{}, w);
+    try w.print(
+        ",\"heartbeat_interval_ms\":{d},\"connected_at_ns\":{d},\"last_heartbeat_at_ns\":{d}}}",
+        .{ rec.heartbeat_interval_ms, @as(i64, @intCast(rec.connected_at_ns)), @as(i64, @intCast(rec.last_heartbeat_at_ns)) },
+    );
+}
 
 /// POST /instances/register — record a new client (TUI/CLI/web) in
 /// the instances table and return its bearer token. The token is
@@ -1295,6 +1345,57 @@ test "DELETE /instances/:id: rejects no-Authorization on a tokened row" {
     // Row still present.
     var repo = db_mod.InstanceRepo.init(&rig.db);
     try testing.expect(try repo.exists(r.id));
+}
+
+test "GET /instances: empty registry returns an empty array" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    const req: http.Request = .{ .method = .GET, .target = "/instances", .headers = &.{} };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.ok, resp.status);
+    try testing.expectEqualStrings("{\"instances\":[]}", resp.body);
+}
+
+test "GET /instances: lists registered rows, omits the token hash" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    const r = try registerOverHttp(testing.allocator);
+    defer testing.allocator.free(r.id);
+    defer testing.allocator.free(r.token);
+
+    const req: http.Request = .{ .method = .GET, .target = "/instances", .headers = &.{} };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.ok, resp.status);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.object.get("instances").?.array;
+    try testing.expectEqual(@as(usize, 1), arr.items.len);
+
+    const item = arr.items[0].object;
+    try testing.expectEqualStrings(r.id, item.get("id").?.string);
+    try testing.expectEqualStrings("tui", item.get("kind").?.string);
+    try testing.expectEqual(@as(i128, 1234), @as(i128, item.get("connected_at_ns").?.integer));
+    // The token / token_hash never leak into the listing response.
+    try testing.expect(item.get("token") == null);
+    try testing.expect(item.get("token_hash") == null);
+    // Body string itself contains no hex stretch matching the token.
+    try testing.expect(std.mem.indexOf(u8, resp.body, r.token) == null);
+}
+
+test "GET /instances: 503 when db is not wired" {
+    var mock = harness.MockAgentRunner.init();
+    var ctx: Context = .{ .runner = mock.runner() };
+    setContext(&ctx);
+    defer clearContext();
+
+    const req: http.Request = .{ .method = .GET, .target = "/instances", .headers = &.{} };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.service_unavailable, resp.status);
 }
 
 test "DELETE /instances/:id: matching token deletes the row" {
