@@ -660,6 +660,14 @@ pub const LiveAgentRunner = struct {
                     // ended on their request, not a model failure.
                     // The model gets a fresh prompt next turn; no
                     // follow-up roundtrip is needed.
+                    //
+                    // Push the marker through the stream sink too —
+                    // the TUI builds its agent line from streamed
+                    // chunks, and ignores the runner's `final_text`.
+                    // Without this push the cancellation ends the
+                    // turn but the transcript shows nothing.
+                    const marker: []const u8 = if (text.len > 0) "\n[cancelled]" else "[cancelled]";
+                    if (req.stream_sink) |s| s(req.stream_sink_ctx, marker);
                     final_text = if (text.len > 0)
                         try std.fmt.allocPrint(self.allocator, "{s}\n[cancelled]", .{text})
                     else
