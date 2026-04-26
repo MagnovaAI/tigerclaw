@@ -535,9 +535,10 @@ fn instancesRegisterHandler(
 /// clear any soft eviction. Returns 204 on success or 404 when the
 /// id is unknown (the TUI re-registers on 404; that contract is
 /// load-bearing for the sweeper's "soft eviction can be revived"
-/// semantics).
+/// semantics). When the row carries a token hash, the request must
+/// present a matching `Authorization: Bearer <token>` header.
 fn instancesHeartbeatHandler(
-    _: http.Request,
+    req: http.Request,
     params: []const router.Param,
     _: ?[]const u8,
     _: dispatcher.StreamHook,
@@ -549,6 +550,10 @@ fn instancesHeartbeatHandler(
     const id = findParam(params, "id") orelse return error.BadRequest;
 
     var repo = db_mod.InstanceRepo.init(db);
+    switch (try resolveInstanceAuth(&repo, req, id)) {
+        .ok => {},
+        .response => |r| return r,
+    }
     const ok = repo.heartbeat(id, clock.nowNs()) catch return error.InternalServerError;
     if (!ok) return http.Response.notFound();
     return .{ .status = .no_content };
@@ -558,9 +563,10 @@ fn instancesHeartbeatHandler(
 /// Hard-deletes the row so the slot is reusable immediately rather
 /// than waiting for the eviction sweeper. Idempotent: 204 either
 /// way; we don't surface "already gone" because the client's intent
-/// is "be gone", and the row is.
+/// is "be gone", and the row is. Auth-protected the same way as
+/// heartbeat.
 fn instancesDeleteHandler(
-    _: http.Request,
+    req: http.Request,
     params: []const router.Param,
     _: ?[]const u8,
     _: dispatcher.StreamHook,
@@ -570,9 +576,56 @@ fn instancesDeleteHandler(
     const id = findParam(params, "id") orelse return error.BadRequest;
 
     var repo = db_mod.InstanceRepo.init(db);
+    switch (try resolveInstanceAuth(&repo, req, id)) {
+        .ok => {},
+        .response => |r| return r,
+    }
     repo.delete(id) catch return error.InternalServerError;
     return .{ .status = .no_content };
 }
+
+const AuthDecision = union(enum) {
+    /// The request is authorized to act on this instance row.
+    ok,
+    /// Short-circuit response: 401 (token mismatch / missing) or
+    /// 404 (the row does not exist; we surface the same 404 here
+    /// that the underlying op would emit, so the client doesn't
+    /// have to distinguish "auth failed" from "row gone").
+    response: http.Response,
+};
+
+/// Look up the row, then run the bearer check against its stored
+/// hash. Returns `.ok` for matched-or-open access, otherwise the
+/// 401/404 response the handler should return verbatim.
+fn resolveInstanceAuth(
+    repo: *db_mod.InstanceRepo,
+    req: http.Request,
+    id: []const u8,
+) dispatcher.HandlerError!AuthDecision {
+    const stored = repo.tokenHashFor(std.heap.page_allocator, id) catch
+        return error.InternalServerError;
+    const stored_hash = stored orelse return .{ .response = http.Response.notFound() };
+    defer std.heap.page_allocator.free(stored_hash);
+
+    const auth_header = req.getHeader("authorization");
+    return switch (instance_auth.checkBearer(auth_header, stored_hash)) {
+        .open, .match => .ok,
+        .mismatch, .missing => .{ .response = unauthorized() },
+    };
+}
+
+fn unauthorized() http.Response {
+    return .{
+        .status = .unauthorized,
+        .headers = &unauthorized_headers,
+        .body = "{\"error\":\"unauthorized\"}",
+    };
+}
+
+const unauthorized_headers = [_]http.Header{
+    .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+    .{ .name = "www-authenticate", .value = "Bearer" },
+};
 
 const RegisterBody = struct {
     kind: db_mod.InstanceKind,
@@ -1089,7 +1142,7 @@ test "POST /instances/:id/heartbeat: 404 on unknown id" {
     try testing.expectEqual(http.Status.not_found, resp.status);
 }
 
-test "DELETE /instances/:id: removes the row, 204 even when row was already gone" {
+test "DELETE /instances/:id: removes the row; 404 on subsequent delete" {
     var rig = try InstanceTestRig.init();
     defer rig.deinit();
     rig.install();
@@ -1111,9 +1164,9 @@ test "DELETE /instances/:id: removes the row, 204 even when row was already gone
     try testing.expectEqual(http.Status.no_content, resp.status);
     try testing.expect(!(try repo.exists("cli-cafebabe")));
 
-    // Idempotent: deleting again still returns 204.
+    // Re-delete: row is gone, the auth resolver reports 404.
     const resp2 = try dispatcher.dispatch(&routes, &handlers, req, null);
-    try testing.expectEqual(http.Status.no_content, resp2.status);
+    try testing.expectEqual(http.Status.not_found, resp2.status);
 }
 
 /// Local helper to free the strings dup'd by `Repo.get`. Mirrors
@@ -1124,4 +1177,146 @@ fn freeRecord(allocator: std.mem.Allocator, rec: *db_mod.InstanceRecord) void {
     allocator.free(rec.name);
     allocator.free(rec.agent_id);
     allocator.free(rec.session_id);
+}
+
+/// Register an instance via the HTTP route, returning (id, token).
+/// Used by the auth-gating tests to land a real token-stamped row
+/// the way production would. Caller frees both slices.
+fn registerOverHttp(allocator: std.mem.Allocator) !struct { id: []u8, token: []u8 } {
+    const body =
+        \\{"kind":"tui"}
+    ;
+    const headers = [_]http.Header{.{ .name = "content-type", .value = "application/json" }};
+    const req: http.Request = .{
+        .method = .POST,
+        .target = "/instances/register",
+        .headers = &headers,
+        .body = body,
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{});
+    defer parsed.deinit();
+    return .{
+        .id = try allocator.dupe(u8, parsed.value.object.get("id").?.string),
+        .token = try allocator.dupe(u8, parsed.value.object.get("token").?.string),
+    };
+}
+
+test "POST /instances/:id/heartbeat: rejects requests with no Authorization on a tokened row" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    const r = try registerOverHttp(testing.allocator);
+    defer testing.allocator.free(r.id);
+    defer testing.allocator.free(r.token);
+
+    var target_buf: [128]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "/instances/{s}/heartbeat", .{r.id});
+
+    const req: http.Request = .{
+        .method = .POST,
+        .target = target,
+        .headers = &.{},
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.unauthorized, resp.status);
+}
+
+test "POST /instances/:id/heartbeat: rejects a wrong token" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    const r = try registerOverHttp(testing.allocator);
+    defer testing.allocator.free(r.id);
+    defer testing.allocator.free(r.token);
+
+    var target_buf: [128]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "/instances/{s}/heartbeat", .{r.id});
+
+    // Same-length but-different token.
+    var bad_token: [64]u8 = undefined;
+    @memset(&bad_token, 'x');
+    var auth_buf: [80]u8 = undefined;
+    const auth_value = try std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{bad_token});
+    const headers = [_]http.Header{.{ .name = "authorization", .value = auth_value }};
+
+    const req: http.Request = .{
+        .method = .POST,
+        .target = target,
+        .headers = &headers,
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.unauthorized, resp.status);
+}
+
+test "POST /instances/:id/heartbeat: matching token is accepted" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    const r = try registerOverHttp(testing.allocator);
+    defer testing.allocator.free(r.id);
+    defer testing.allocator.free(r.token);
+
+    var target_buf: [128]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "/instances/{s}/heartbeat", .{r.id});
+
+    var auth_buf: [80]u8 = undefined;
+    const auth_value = try std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{r.token});
+    const headers = [_]http.Header{.{ .name = "authorization", .value = auth_value }};
+
+    const req: http.Request = .{
+        .method = .POST,
+        .target = target,
+        .headers = &headers,
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.no_content, resp.status);
+}
+
+test "DELETE /instances/:id: rejects no-Authorization on a tokened row" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    const r = try registerOverHttp(testing.allocator);
+    defer testing.allocator.free(r.id);
+    defer testing.allocator.free(r.token);
+
+    var target_buf: [128]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "/instances/{s}", .{r.id});
+
+    const req: http.Request = .{ .method = .DELETE, .target = target, .headers = &.{} };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.unauthorized, resp.status);
+
+    // Row still present.
+    var repo = db_mod.InstanceRepo.init(&rig.db);
+    try testing.expect(try repo.exists(r.id));
+}
+
+test "DELETE /instances/:id: matching token deletes the row" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    const r = try registerOverHttp(testing.allocator);
+    defer testing.allocator.free(r.id);
+    defer testing.allocator.free(r.token);
+
+    var target_buf: [128]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "/instances/{s}", .{r.id});
+
+    var auth_buf: [80]u8 = undefined;
+    const auth_value = try std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{r.token});
+    const headers = [_]http.Header{.{ .name = "authorization", .value = auth_value }};
+
+    const req: http.Request = .{ .method = .DELETE, .target = target, .headers = &headers };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.no_content, resp.status);
+
+    var repo = db_mod.InstanceRepo.init(&rig.db);
+    try testing.expect(!(try repo.exists(r.id)));
 }

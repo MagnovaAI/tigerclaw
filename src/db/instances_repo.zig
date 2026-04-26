@@ -118,6 +118,27 @@ pub const Repo = struct {
         return self.db.changes() > 0;
     }
 
+    /// Look up the stored token hash for `id`. Returns null when
+    /// there is no row, an empty slice when the row exists but has
+    /// no token (pre-auth registration), or the 64-char hex digest.
+    /// The returned slice is duped onto `allocator`; caller frees.
+    pub fn tokenHashFor(
+        self: *Repo,
+        allocator: std.mem.Allocator,
+        id: []const u8,
+    ) !?[]u8 {
+        self.db.lock();
+        defer self.db.unlock();
+
+        var stmt = try self.db.prepare(
+            \\SELECT token_hash FROM instances WHERE id = ?;
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, id);
+        if (!try stmt.step()) return null;
+        return try allocator.dupe(u8, stmt.columnText(0));
+    }
+
     /// Bump the heartbeat timestamp. Returns `false` when the id is
     /// unknown (caller treats that as 404 — TUI re-registers).
     pub fn heartbeat(self: *Repo, id: []const u8, now_ns: i128) !bool {

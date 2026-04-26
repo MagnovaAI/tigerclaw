@@ -84,6 +84,39 @@ pub fn constantTimeEql(a: []const u8, b: []const u8) bool {
     return diff == 0;
 }
 
+/// Outcome of `checkBearer` against a stored token hash.
+pub const CheckOutcome = enum {
+    /// No token enforcement: the row has no stored hash. Pre-auth
+    /// rows allow unauthenticated access — once a row is created
+    /// with a token, that token is required forever after.
+    open,
+    /// The presented token matches the stored hash.
+    match,
+    /// A token was presented but does not match (or the header was
+    /// malformed). Routes must surface this as 401.
+    mismatch,
+    /// The row requires auth but no token was presented.
+    missing,
+};
+
+/// Validate the request's `Authorization` header against the stored
+/// token hash for an instance row. Pure function — does not touch
+/// the database; the caller resolves `stored_hash` first.
+pub fn checkBearer(auth_header: ?[]const u8, stored_hash: []const u8) CheckOutcome {
+    if (stored_hash.len == 0) return .open;
+
+    const header = auth_header orelse return .missing;
+
+    const prefix = "Bearer ";
+    if (!std.mem.startsWith(u8, header, prefix)) return .mismatch;
+    const presented = header[prefix.len..];
+    if (presented.len != token_hex_len) return .mismatch;
+
+    const presented_hash = hash(presented);
+    if (constantTimeEql(&presented_hash, stored_hash)) return .match;
+    return .mismatch;
+}
+
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
@@ -153,4 +186,42 @@ test "genInstanceId: distinct calls produce distinct ids" {
     const a = try genInstanceId(testing.io, &b1, "cli");
     const b = try genInstanceId(testing.io, &b2, "cli");
     try testing.expect(!std.mem.eql(u8, a, b));
+}
+
+test "checkBearer: empty stored hash means open access" {
+    try testing.expectEqual(CheckOutcome.open, checkBearer(null, ""));
+    try testing.expectEqual(CheckOutcome.open, checkBearer("Bearer abc", ""));
+}
+
+test "checkBearer: stored hash present but no header → missing" {
+    const stored = hash("token");
+    try testing.expectEqual(CheckOutcome.missing, checkBearer(null, &stored));
+}
+
+test "checkBearer: wrong scheme → mismatch" {
+    const stored = hash("token");
+    try testing.expectEqual(CheckOutcome.mismatch, checkBearer("Basic abc", &stored));
+}
+
+test "checkBearer: token of wrong length → mismatch" {
+    const stored = hash("real");
+    try testing.expectEqual(CheckOutcome.mismatch, checkBearer("Bearer too-short", &stored));
+}
+
+test "checkBearer: matching token returns .match" {
+    const token: [token_hex_len]u8 = [_]u8{'a'} ** token_hex_len;
+    const stored = hash(&token);
+
+    var hdr: [token_hex_len + 7]u8 = undefined;
+    @memcpy(hdr[0..7], "Bearer ");
+    @memcpy(hdr[7..], &token);
+    try testing.expectEqual(CheckOutcome.match, checkBearer(&hdr, &stored));
+}
+
+test "checkBearer: non-matching token returns .mismatch" {
+    const stored = hash("expected");
+    var hdr: [token_hex_len + 7]u8 = undefined;
+    @memcpy(hdr[0..7], "Bearer ");
+    @memset(hdr[7..], 'b');
+    try testing.expectEqual(CheckOutcome.mismatch, checkBearer(&hdr, &stored));
 }
