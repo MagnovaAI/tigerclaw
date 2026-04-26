@@ -32,14 +32,36 @@ const dispatch_mod = @import("dispatch.zig");
 const outbox_mod = @import("outbox.zig");
 const spec = @import("channels_spec");
 const agent_runner = @import("../harness/agent_runner.zig");
+const runtime_mod = @import("../harness/runtime.zig");
 
 const log = std.log.scoped(.dispatch_worker);
+
+/// Worker can be wired to either a single runner (legacy / mock /
+/// CLI single-agent path) or a runtime registry (production
+/// multi-agent path). The choice is made at construction time and
+/// stable for the worker's lifetime; per-message routing reads
+/// `agent_name` from the envelope and looks the runner up against
+/// whichever source is wired.
+pub const RunnerSource = union(enum) {
+    single: agent_runner.AgentRunner,
+    runtime: *runtime_mod.Runtime,
+
+    /// Resolve the runner for a given agent name. Returns null when
+    /// the runtime has no registration for the name (callers log and
+    /// drop the message).
+    pub fn resolve(self: RunnerSource, agent_name: []const u8) ?agent_runner.AgentRunner {
+        return switch (self) {
+            .single => |r| r,
+            .runtime => |rt| rt.resolveRunner(agent_name),
+        };
+    }
+};
 
 pub const Worker = struct {
     allocator: std.mem.Allocator,
     dispatch: *dispatch_mod.Dispatch,
     outbox: *outbox_mod.Outbox,
-    runner: agent_runner.AgentRunner,
+    source: RunnerSource,
     cancel: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
@@ -53,7 +75,24 @@ pub const Worker = struct {
             .allocator = allocator,
             .dispatch = dispatch,
             .outbox = outbox,
-            .runner = runner,
+            .source = .{ .single = runner },
+        };
+    }
+
+    /// Construct a worker that routes per-message via a Runtime
+    /// registry. The worker borrows the runtime for its lifetime;
+    /// caller deinits the runtime *after* the worker stops.
+    pub fn initWithRuntime(
+        allocator: std.mem.Allocator,
+        dispatch: *dispatch_mod.Dispatch,
+        outbox: *outbox_mod.Outbox,
+        rt: *runtime_mod.Runtime,
+    ) Worker {
+        return .{
+            .allocator = allocator,
+            .dispatch = dispatch,
+            .outbox = outbox,
+            .source = .{ .runtime = rt },
         };
     }
 
@@ -91,15 +130,21 @@ fn loop(self: *Worker) void {
 const TurnError = anyerror;
 
 fn processOne(self: *Worker, msg: spec.InboundMessage) TurnError!void {
-    // Route to the runner keyed by agent name. `AgentRegistry` uses
-    // session_id as the routing field in v0.1.0; we pass agent_name
-    // there so the registry can look the right loaded agent up.
+    // Route to the runner keyed by agent name. With a Runtime
+    // source, a missing registration is a deny — log and drop, do
+    // not crash the worker so one misconfigured agent_name in the
+    // queue does not poison every message behind it.
+    const runner = self.source.resolve(msg.agent_name) orelse {
+        log.warn("dispatch: no runner registered for agent={s}; dropping", .{msg.agent_name});
+        return;
+    };
+
     const req: agent_runner.TurnRequest = .{
         .session_id = msg.agent_name,
         .input = msg.text,
     };
 
-    const result = self.runner.run(req) catch |err| {
+    const result = runner.run(req) catch |err| {
         // Turn errors are terminal for this message. Log and drop;
         // the outbox stays clean so a retry won't double-send.
         return err;
@@ -212,6 +257,70 @@ test "worker: inbound message → runner call → outbox append" {
         std.Io.sleep(testing.io, std.Io.Duration.fromNanoseconds(5_000_000), .awake) catch {};
     }
     return error.TestOutboxNeverPopulated;
+}
+
+test "worker: unknown agent_name with a Runtime source drops without crashing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dispatch = try dispatch_mod.Dispatch.init(testing.allocator, 8);
+    defer dispatch.deinit();
+    var manual: clock_mod.ManualClock = .{ .value_ns = 1_700_000_000 * std.time.ns_per_s };
+    var outbox = try outbox_mod.Outbox.init(testing.io, tmp.dir, testing.allocator, manual.clock());
+    defer outbox.deinit();
+
+    // Build a stubbed Manager + empty Runtime — no runners, so any
+    // agent_name resolves to null and the worker should drop.
+    const memory = @import("../memory/root.zig");
+    const RuntimeStub = struct {
+        fn provider(self: *@This()) memory.Provider {
+            return .{ .ptr = self, .vtable = &vt, .kind = .builtin, .name = "stub" };
+        }
+        fn initFn(_: *anyopaque) memory.MemoryError!void {}
+        fn sysFn(_: *anyopaque) memory.MemoryError![]const u8 {
+            return "";
+        }
+        fn prefetchFn(_: *anyopaque, _: []const u8) memory.MemoryError!memory.provider.Prefetch {
+            return .{ .text = "" };
+        }
+        fn syncFn(_: *anyopaque, _: memory.provider.TurnPair) memory.MemoryError!void {}
+        fn shutdownFn(_: *anyopaque) void {}
+        const vt: memory.provider.VTable = .{
+            .initialize = initFn,
+            .system_prompt_block = sysFn,
+            .prefetch = prefetchFn,
+            .sync_turn = syncFn,
+            .shutdown = shutdownFn,
+        };
+    };
+    var stub: RuntimeStub = .{};
+    var mgr = memory.Manager.init(testing.allocator, stub.provider());
+    defer mgr.deinit();
+    var rt = runtime_mod.Runtime.init(testing.allocator, &mgr, "");
+    defer rt.deinit();
+
+    var worker = Worker.initWithRuntime(testing.allocator, &dispatch, &outbox, &rt);
+    try worker.start();
+    defer worker.stop();
+
+    _ = dispatch.enqueue(.{
+        .upstream_id = 1,
+        .channel_id = .telegram,
+        .agent_name = "ghost",
+        .conversation_key = "c",
+        .sender_id = "u",
+        .text = "hi",
+    });
+
+    // The worker logs and drops; outbox stays empty. Wait briefly
+    // for the dispatch round-trip to complete.
+    var waited_ns: u64 = 0;
+    while (waited_ns < 500_000_000) : (waited_ns += 5_000_000) {
+        std.Io.sleep(testing.io, std.Io.Duration.fromNanoseconds(5_000_000), .awake) catch {};
+    }
+    var cur = try outbox.cursor(.telegram);
+    defer cur.deinit();
+    try testing.expect(try cur.next() == null);
 }
 
 test "worker: runner error drops the message and keeps going" {

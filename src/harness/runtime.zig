@@ -91,6 +91,34 @@ pub const Runtime = struct {
         return self.runners.count();
     }
 
+    /// Sum of in-flight turn counts across every registered runner.
+    /// Used by `/health --probe` to report drain progress without
+    /// allocating a counters slice.
+    pub fn totalInFlight(self: *const Runtime) u32 {
+        var sum: u32 = 0;
+        var it = self.runners.iterator();
+        while (it.next()) |kv| sum +|= kv.value_ptr.*.in_flight.current();
+        return sum;
+    }
+
+    /// Allocate a borrowed slice of counter pointers suitable for
+    /// `MultiCounter.init`. The caller frees the slice via
+    /// `allocator.free`; the counters themselves stay owned by the
+    /// runners. Used by the daemon drain so it can wait for every
+    /// runner's in-flight to hit zero through a single predicate.
+    pub fn collectCounters(
+        self: *const Runtime,
+        allocator: std.mem.Allocator,
+    ) std.mem.Allocator.Error![]*agent_runner.InFlightCounter {
+        const out = try allocator.alloc(*agent_runner.InFlightCounter, self.runners.count());
+        var i: usize = 0;
+        var it = self.runners.iterator();
+        while (it.next()) |kv| : (i += 1) {
+            out[i] = &kv.value_ptr.*.in_flight;
+        }
+        return out;
+    }
+
     /// Returns the runner registered under `name`, or null when
     /// unknown.
     pub fn find(self: *const Runtime, name: []const u8) ?*real_runner_mod.RealRunner {
@@ -273,6 +301,48 @@ test "Runtime: register rejects a duplicate name" {
         testing.allocator.destroy(r2);
     }
     try testing.expectError(RegisterError.DuplicateName, rt.register("x", r2));
+}
+
+test "Runtime: collectCounters yields a MultiCounter that observes every runner" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var mc = clock_mod.ManualClock{ .value_ns = 1 };
+    var mock = llm.MockProvider{ .replies = &.{} };
+    var deny = vtable_mod.DenyExecutor{};
+
+    var b = memory.Builtin.init(.{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .state_dir = tmp.dir,
+        .agent_name = "x",
+        .clock = mc.clock(),
+    });
+    try b.initialize();
+    var mgr = memory.Manager.init(testing.allocator, b.provider());
+    defer mgr.deinit();
+
+    var rt = Runtime.init(testing.allocator, &mgr, "");
+    defer rt.deinit();
+
+    const r1 = try newRunner(testing.allocator, tmp.dir, mc.clock(), mock.provider(), deny.executor(), &mgr);
+    const r2 = try newRunner(testing.allocator, tmp.dir, mc.clock(), mock.provider(), deny.executor(), &mgr);
+    try rt.register("r1", r1);
+    try rt.register("r2", r2);
+
+    const counters = try rt.collectCounters(testing.allocator);
+    defer testing.allocator.free(counters);
+    const multi = agent_runner.MultiCounter.init(counters);
+
+    try testing.expect(multi.allZero());
+    try testing.expectEqual(@as(u32, 0), multi.total());
+    try testing.expectEqual(@as(u32, 0), rt.totalInFlight());
+
+    r1.in_flight.begin();
+    try testing.expect(!multi.allZero());
+    try testing.expectEqual(@as(u32, 1), multi.total());
+    try testing.expectEqual(@as(u32, 1), rt.totalInFlight());
+    r1.in_flight.end();
 }
 
 test "Runtime: deinit tears down every registered runner" {

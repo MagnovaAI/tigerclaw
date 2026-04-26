@@ -19,6 +19,13 @@ const settings = @import("../settings/root.zig");
 
 pub const Context = struct {
     runner: harness.AgentRunner,
+    /// Optional runtime registry. When set, `/health` reports the
+    /// runner count and the sum of in-flight turns across every
+    /// runner — useful for ops watching drain across a multi-agent
+    /// daemon. The single-runner `runner` field above stays the
+    /// default route target so handlers that don't care about
+    /// multi-agent routing keep working.
+    runtime: ?*harness.Runtime = null,
     /// Optional per-session budget consulted before each turn. When
     /// populated, the turn handler rejects requests with 429 as soon
     /// as any axis (turns / input_tokens / output_tokens / cost_micros)
@@ -124,8 +131,18 @@ fn healthHandler(
     _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     const ctx = try contextOrInternal();
-    // Surface the in-flight turn count so ops can watch drain.
-    _ = ctx;
+    // When a Runtime is wired, surface the runner count and the sum
+    // of in-flight turns so ops can script drain progress against
+    // /health. Without a Runtime we keep the legacy minimal body so
+    // existing clients keep parsing.
+    if (ctx.runtime) |rt| {
+        var w = std.Io.Writer.fixed(&render_body_buf);
+        w.print(
+            "{{\"status\":\"ok\",\"runners\":{d},\"in_flight\":{d}}}",
+            .{ rt.count(), rt.totalInFlight() },
+        ) catch return error.InternalServerError;
+        return http.Response.jsonOk(w.buffered());
+    }
     return http.Response.jsonOk("{\"status\":\"ok\"}");
 }
 
@@ -489,6 +506,53 @@ fn runHealth(_: *harness.MockAgentRunner) anyerror!void {
 test "routes: GET /health returns 200" {
     try withMockContext(runHealth);
 }
+
+/// Provider stub for /health probe — only `kind` is read by the
+/// Manager; everything else is unused on this path.
+const HealthStubProvider = struct {
+    fn provider(self: *HealthStubProvider) memory_test_mod.Provider {
+        return .{ .ptr = self, .vtable = &vt, .kind = .builtin, .name = "stub" };
+    }
+    fn initFn(_: *anyopaque) memory_test_mod.MemoryError!void {}
+    fn sysFn(_: *anyopaque) memory_test_mod.MemoryError![]const u8 {
+        return "";
+    }
+    fn prefetchFn(_: *anyopaque, _: []const u8) memory_test_mod.MemoryError!memory_test_mod.provider.Prefetch {
+        return .{ .text = "" };
+    }
+    fn syncFn(_: *anyopaque, _: memory_test_mod.provider.TurnPair) memory_test_mod.MemoryError!void {}
+    fn shutdownFn(_: *anyopaque) void {}
+    const vt: memory_test_mod.provider.VTable = .{
+        .initialize = initFn,
+        .system_prompt_block = sysFn,
+        .prefetch = prefetchFn,
+        .sync_turn = syncFn,
+        .shutdown = shutdownFn,
+    };
+};
+
+test "routes: GET /health surfaces runner count and in-flight when a Runtime is wired" {
+    var mock = harness.MockAgentRunner.init();
+
+    var stub: HealthStubProvider = .{};
+    var mgr = memory_test_mod.Manager.init(testing.allocator, stub.provider());
+    defer mgr.deinit();
+
+    var rt = harness.Runtime.init(testing.allocator, &mgr, "");
+    defer rt.deinit();
+
+    var ctx: Context = .{ .runner = mock.runner(), .runtime = &rt };
+    setContext(&ctx);
+    defer clearContext();
+
+    const req: http.Request = .{ .method = .GET, .target = "/health", .headers = &.{} };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.ok, resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"runners\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"in_flight\":0") != null);
+}
+
+const memory_test_mod = @import("../memory/root.zig");
 
 fn runList(_: *harness.MockAgentRunner) anyerror!void {
     const req: http.Request = .{ .method = .GET, .target = "/sessions", .headers = &.{} };

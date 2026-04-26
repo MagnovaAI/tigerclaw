@@ -50,6 +50,39 @@ pub const InFlightCounter = struct {
 // Drain loop (poll `counter.isZero()` with bounded timeout) lives in
 // the daemon commit so this module has no dependency on `Io`.
 
+// --- multi counter --------------------------------------------------------
+
+/// Predicate-shaped view over multiple `InFlightCounter`s — used by
+/// the daemon drain when more than one runner can be in flight at a
+/// time (one per agent in a Runtime registry). The drain helper only
+/// needs to ask "is everything zero?"; this struct answers it without
+/// touching the counters' internal storage.
+///
+/// Borrowed slice; no allocations. Caller keeps the array alive for
+/// the lifetime of the drain.
+pub const MultiCounter = struct {
+    counters: []const *InFlightCounter,
+
+    pub fn init(counters: []const *InFlightCounter) MultiCounter {
+        return .{ .counters = counters };
+    }
+
+    pub fn allZero(self: *const MultiCounter) bool {
+        for (self.counters) |c| if (!c.isZero()) return false;
+        return true;
+    }
+
+    /// Sum of in-flight turns across every member. Saturating at u32
+    /// max because the gateway reports this as a flat count and a
+    /// trillion-turn process is a different problem than overflow
+    /// semantics.
+    pub fn total(self: *const MultiCounter) u32 {
+        var sum: u32 = 0;
+        for (self.counters) |c| sum +|= c.current();
+        return sum;
+    }
+};
+
 // --- AgentRunner vtable ----------------------------------------------------
 
 /// Incremental-delta callback surfaced on every text fragment the
@@ -384,4 +417,24 @@ test "AgentRunner vtable: cancel is a no-op on the mock" {
     const r = mock.runner();
     r.cancel(42);
     try testing.expectEqual(@as(u32, 0), r.counter().current());
+}
+
+test "MultiCounter: allZero reports true only when every member is zero" {
+    var c1 = InFlightCounter.init();
+    var c2 = InFlightCounter.init();
+    const counters = [_]*InFlightCounter{ &c1, &c2 };
+    const m = MultiCounter.init(&counters);
+
+    try testing.expect(m.allZero());
+
+    c1.begin();
+    try testing.expect(!m.allZero());
+    try testing.expectEqual(@as(u32, 1), m.total());
+
+    c2.begin();
+    try testing.expectEqual(@as(u32, 2), m.total());
+
+    c1.end();
+    c2.end();
+    try testing.expect(m.allZero());
 }
