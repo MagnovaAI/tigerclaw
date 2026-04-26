@@ -104,7 +104,7 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
         }
         prev_role = line.role;
 
-        const prefix_cols = measureCols(prefixFor(line.role));
+        const prefix_cols = measureCols(prefixFor(&line));
         const avail: usize = if (width > prefix_cols) width - prefix_cols else 1;
 
         // Per-line cap mirrors the old renderer: a runaway tool
@@ -256,14 +256,17 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
         }
 
         const base_style = styleFor(line.role);
-        const prefix = prefixFor(line.role);
+        const prefix = prefixFor(line);
+        const prefix_style = prefixStyleFor(line);
         const prefix_cols = measureCols(prefix);
 
         // First physical row of the line gets the speaker glyph.
         // Continuation rows indent under it so wrapped text aligns
-        // visually with the body of the first row.
+        // visually with the body of the first row. The prefix gets
+        // its own style so tool rows can paint a status bullet
+        // (green/red/white) without dragging the body color along.
         if (r.is_first) {
-            writeGraphemes(ctx, surface, 0, screen_row, prefix, base_style);
+            writeGraphemes(ctx, surface, 0, screen_row, prefix, prefix_style);
         }
 
         const body = line.text.items[r.bytes_offset..][0..r.bytes_len];
@@ -378,7 +381,7 @@ pub fn totalRowsFor(lines: []const tui.Line, width: u16) u32 {
         }
         prev_role = line.role;
 
-        const prefix = prefixFor(line.role);
+        const prefix = prefixFor(line);
         const prefix_cols = measureCols(prefix);
         const avail: usize = if (width > prefix_cols) width - prefix_cols else 1;
 
@@ -427,16 +430,19 @@ fn writeGraphemes(
     }
 }
 
-fn prefixFor(role: tui.Line.Role) []const u8 {
+fn prefixFor(line: *const tui.Line) []const u8 {
     // Single-cell ASCII-adjacent glyphs only -- no wide emoji,
     // no braille spinners inline. The `›` for user mirrors the
     // input box's prompt so a sent message visually echoes the
-    // panel it was typed into.
-    return switch (role) {
+    // panel it was typed into. Tool rows that came through the
+    // structured pipeline (tool_name set) get a status bullet —
+    // the legacy `⎿ ` continuation glyph is reserved for plain
+    // tool result lines that don't carry their own header.
+    return switch (line.role) {
         .user => "› ",
         .agent => "⏺ ",
         .system => "∙ ",
-        .tool => "⎿ ",
+        .tool => if (line.tool_name != null) "● " else "⎿ ",
     };
 }
 
@@ -450,6 +456,20 @@ fn styleFor(role: tui.Line.Role) vaxis.Style {
         .system => tui.palette.system,
         .tool => tui.palette.tool,
     };
+}
+
+/// Style for the leading prefix glyph. Tool rows pick a status
+/// color so the user can see at a glance which calls succeeded.
+/// Other roles reuse the body style.
+fn prefixStyleFor(line: *const tui.Line) vaxis.Style {
+    if (line.role == .tool and line.tool_name != null) {
+        return switch (line.tool_status) {
+            .running => tui.palette.tool_bullet_running,
+            .ok => tui.palette.tool_bullet_ok,
+            .err => tui.palette.tool_bullet_err,
+        };
+    }
+    return styleFor(line.role);
 }
 
 /// Pick the style for byte `abs` in the full line: innermost

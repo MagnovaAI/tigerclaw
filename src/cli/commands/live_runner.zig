@@ -858,6 +858,7 @@ pub const LiveAgentRunner = struct {
                         .id = tc.id,
                         .name = tc.name,
                         .kind = classifyFinishedKind(tc.name, result_text),
+                        .is_error = tool_failed,
                     } });
                 }
 

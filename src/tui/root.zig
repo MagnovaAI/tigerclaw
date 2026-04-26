@@ -139,6 +139,14 @@ pub const Line = struct {
     /// True when the user has expanded this row (Ctrl-B). Default
     /// false — collapsed by default to keep the chat readable.
     tool_expanded: bool = false,
+    /// Status bullet color. `.running` paints white while the tool
+    /// is in flight, `.ok` green on a clean finish, `.err` red on
+    /// dispatch failure. Cancelled tools stay `.ok` — the cancel
+    /// is the user's action, not a tool failure, and we already
+    /// surface "[cancelled by user]" as the summary.
+    tool_status: ToolStatus = .running,
+
+    pub const ToolStatus = enum { running, ok, err };
 
     pub fn deinitSpans(self: *Line, allocator: std.mem.Allocator) void {
         if (self.spans) |s| {
@@ -232,6 +240,16 @@ pub const palette = struct {
     /// Tool-call trace lines. Plain dim grey — clearly subordinate
     /// to the conversation but readable. No green, no italic.
     pub const tool: vaxis.Style = .{ .fg = dim };
+
+    /// Status-bullet colors for `● Tool(args)` headers. White
+    /// while running, green on success, red on dispatch failure.
+    /// Bold so the dot pops against the dim body text. RGB
+    /// constants picked to read well on both light and dark
+    /// terminals — the green leans toward emerald, the red
+    /// toward terracotta to keep the tiger palette warm.
+    pub const tool_bullet_running: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xE0, 0xE0, 0xE0 } }, .bold = true };
+    pub const tool_bullet_ok: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x4A, 0xC8, 0x76 } }, .bold = true };
+    pub const tool_bullet_err: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xD9, 0x4F, 0x4F } }, .bold = true };
     pub const prompt: vaxis.Style = .{ .fg = orange, .bold = true };
     pub const hint: vaxis.Style = .{ .fg = smoke };
     /// Input box: cream foreground on the lifted panel background.

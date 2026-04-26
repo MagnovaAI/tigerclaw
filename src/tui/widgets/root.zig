@@ -592,7 +592,7 @@ pub const ue_ask_user_cancel = "tui.ask_user_cancel";
 pub const ChunkPayload = struct { text: []u8 };
 pub const AskUserPayload = struct { question: []u8 };
 pub const ToolStartPayload = struct { id: []u8, name: []u8, args_summary: []u8 };
-pub const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8 };
+pub const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8, is_error: bool };
 pub const ErrorPayload = struct { message: []u8 };
 
 /// Context the worker thread carries. Allocated on heap;
@@ -751,6 +751,7 @@ fn toolEventSink(
                     return;
                 },
                 .output = preview,
+                .is_error = f.is_error,
             };
             postUserEvent(ctx, ue_tool_done, payload);
         },
@@ -1089,6 +1090,7 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
                     if (entry.tool_full) |s| self.allocator.free(s);
                     entry.tool_summary = try self.allocator.dupe(u8, summarizeToolOutput(p.output));
                     entry.tool_full = try self.allocator.dupe(u8, p.output);
+                    entry.tool_status = if (p.is_error) .err else .ok;
                     if (entry.tool_name == null) {
                         entry.tool_name = try self.allocator.dupe(u8, p.name);
                     }

@@ -92,6 +92,10 @@ pub const ToolFinishedPayload = struct {
     id: []const u8,
     name: []const u8,
     kind: ToolFinishedKind,
+    /// True when the tool dispatch threw or returned a tool_result
+    /// block flagged is_error. Lets the TUI paint the bullet red
+    /// without having to pattern-match on rendered text.
+    is_error: bool = false,
 };
 
 /// Tagged union of per-tool result shapes. Every variant carries a
