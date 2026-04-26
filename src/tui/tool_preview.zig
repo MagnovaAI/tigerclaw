@@ -39,6 +39,7 @@ pub fn render(
         .web_search => |w| renderWebSearch(allocator, w),
         .todo_write => |t| renderTodo(allocator, t),
         .text => |t| renderGeneric(allocator, name, t),
+        .cancelled => |t| allocator.dupe(u8, t),
     };
 }
 

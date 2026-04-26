@@ -101,6 +101,12 @@ pub const ToolFinishedKind = union(enum) {
     /// Generic / unknown tool. The `text` slice is the rendered
     /// tool_result body verbatim.
     text: []const u8,
+    /// Tool was skipped or aborted because the user pressed ESC.
+    /// `text` is the marker we surfaced to the model as the
+    /// synthetic tool_result; the TUI renders it dimmed so the
+    /// row visually distinguishes "tool cancelled" from "tool
+    /// completed".
+    cancelled: []const u8,
     bash: BashFinished,
     read: ReadFinished,
     glob: GlobFinished,
@@ -113,6 +119,7 @@ pub const ToolFinishedKind = union(enum) {
     pub fn flatText(self: ToolFinishedKind) []const u8 {
         return switch (self) {
             .text => |t| t,
+            .cancelled => |t| t,
             .bash => |b| b.text,
             .read => |r| r.text,
             .glob => |g| g.text,

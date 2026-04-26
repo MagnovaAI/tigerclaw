@@ -94,7 +94,7 @@ const Event = union(enum) {
     tick,
 };
 
-const ToolStartPayload = struct { id: []u8, name: []u8 };
+const ToolStartPayload = struct { id: []u8, name: []u8, args_summary: []u8 };
 const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8 };
 
 /// Re-export of the widget namespace. Tests drive widgets like
@@ -610,15 +610,27 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
             .turn_tool_start => |ts| {
                 // Append a dim "pending" line before the next chunk
                 // lands. The line's `tool_id` is held so
-                // `turn_tool_done` can promote it in place.
+                // `turn_tool_done` can promote it in place. When
+                // the runner provides an `args_summary` (e.g.
+                // `npm test` for bash, `/path/file.zig` for
+                // read_file), render `Bash(npm test) (pending)`
+                // instead of bare `bash (pending)` so the user can
+                // see what's running at a glance.
                 defer allocator.free(ts.name);
+                defer allocator.free(ts.args_summary);
                 errdefer allocator.free(ts.id);
 
                 var text: std.ArrayList(u8) = .empty;
                 errdefer text.deinit(allocator);
-                // Role prefix (`↻ `) is added by drawHistory; the
-                // payload only carries the tool name + status.
                 try text.appendSlice(allocator, ts.name);
+                if (ts.args_summary.len > 0) {
+                    try text.append(allocator, '(');
+                    const max_summary: usize = 80;
+                    const summary_taken = takeCols(ts.args_summary, max_summary);
+                    try text.appendSlice(allocator, ts.args_summary[0..summary_taken.bytes]);
+                    if (summary_taken.bytes < ts.args_summary.len) try text.appendSlice(allocator, "\u{2026}");
+                    try text.append(allocator, ')');
+                }
                 try text.appendSlice(allocator, "   (pending)");
 
                 try history.append(allocator, .{
@@ -1615,7 +1627,17 @@ fn toolEventSink(
             const id_owned = ctx.allocator.dupe(u8, s.id) catch return;
             errdefer ctx.allocator.free(id_owned);
             const name_owned = ctx.allocator.dupe(u8, s.name) catch return;
-            ctx.loop.postEvent(.{ .turn_tool_start = .{ .id = id_owned, .name = name_owned } });
+            errdefer ctx.allocator.free(name_owned);
+            // Dupe even when empty so the consumer can free
+            // unconditionally; allocator.dupe of "" returns a
+            // zero-length slice from the allocator and freeing it
+            // is a no-op on most allocators but well-defined.
+            const summary_owned = ctx.allocator.dupe(u8, s.args_summary) catch return;
+            ctx.loop.postEvent(.{ .turn_tool_start = .{
+                .id = id_owned,
+                .name = name_owned,
+                .args_summary = summary_owned,
+            } });
         },
         .progress => {
             // Phase 9 hook. Today the streamed bash chunks are

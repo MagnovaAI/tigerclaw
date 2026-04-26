@@ -745,7 +745,7 @@ pub const LiveAgentRunner = struct {
                         s(req.tool_event_sink_ctx, .{ .finished = .{
                             .id = tc.id,
                             .name = tc.name,
-                            .kind = classifyFinishedKind(tc.name, synth),
+                            .kind = .{ .cancelled = synth },
                         } });
                     }
 
