@@ -27,6 +27,7 @@ pub const bench_guards = @import("bench_guards.zig");
 pub const shared_ledger = @import("shared_ledger.zig");
 pub const agent_runner = @import("agent_runner.zig");
 pub const agent_registry = @import("agent_registry.zig");
+pub const real_runner = @import("real_runner.zig");
 
 pub const State = state.State;
 pub const Turn = turn.Turn;
@@ -47,6 +48,7 @@ pub const HeldReservation = shared_ledger.Held;
 pub const AgentRunner = agent_runner.AgentRunner;
 pub const InFlightCounter = agent_runner.InFlightCounter;
 pub const MockAgentRunner = agent_runner.MockAgentRunner;
+pub const RealRunner = real_runner.RealRunner;
 pub const AgentRegistry = agent_registry.Registry;
 
 test {
@@ -62,4 +64,5 @@ test {
     std.testing.refAllDecls(@import("shared_ledger.zig"));
     std.testing.refAllDecls(@import("agent_runner.zig"));
     std.testing.refAllDecls(@import("agent_registry.zig"));
+    std.testing.refAllDecls(@import("real_runner.zig"));
 }
