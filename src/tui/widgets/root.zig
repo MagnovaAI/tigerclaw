@@ -1043,32 +1043,35 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
             return;
         }
 
-        // Coalesce consecutive same-tool calls. When the model
-        // calls `edit_file` repeatedly while iterating, show a
-        // single row whose args swap to whatever the current
-        // call is editing (`edit_file(foo.py)` → `edit_file(bar.py)`)
-        // instead of stacking five rows. Match by tool name only;
-        // the args reflect the most recent call. Status flips
-        // back to `.running` so the bullet shows in-flight again.
+        // Coalesce same-tool calls within the current turn. When
+        // the model calls `edit_file` repeatedly while iterating,
+        // show a single row whose args swap to whatever the
+        // current call is editing instead of stacking N rows.
+        // Walk back through the most recent entries skipping
+        // agent prose (model commentary between calls); stop on
+        // any user line so prior turns don't accidentally
+        // collapse with the new one. Match by tool name only;
+        // the args reflect the most recent call.
         if (self.history.items.len > 0) {
-            const last = &self.history.items[self.history.items.len - 1];
-            if (last.role == .tool and last.tool_name != null and
-                std.mem.eql(u8, last.tool_name.?, name_slice))
-            {
-                last.tool_status = .running;
-                if (last.tool_args) |old| self.allocator.free(old);
-                last.tool_args = try self.allocator.dupe(u8, args_slice);
-                if (last.tool_id) |old| self.allocator.free(old);
-                last.tool_id = try self.allocator.dupe(u8, id_slice);
-                // Drop the prior call's full output and summary —
-                // the row now represents the new call. Ctrl-B
-                // expand will show the new call's body when it
-                // lands.
-                if (last.tool_summary) |s| self.allocator.free(s);
-                if (last.tool_full) |s| self.allocator.free(s);
-                last.tool_summary = null;
-                last.tool_full = null;
-                try renderToolLine(self.allocator, last);
+            var i: usize = self.history.items.len;
+            while (i > 0) {
+                i -= 1;
+                const entry = &self.history.items[i];
+                if (entry.role == .user) break;
+                if (entry.role != .tool) continue;
+                if (entry.tool_name == null) continue;
+                if (!std.mem.eql(u8, entry.tool_name.?, name_slice)) break;
+                // Match — take it over.
+                entry.tool_status = .running;
+                if (entry.tool_args) |old| self.allocator.free(old);
+                entry.tool_args = try self.allocator.dupe(u8, args_slice);
+                if (entry.tool_id) |old| self.allocator.free(old);
+                entry.tool_id = try self.allocator.dupe(u8, id_slice);
+                if (entry.tool_summary) |s| self.allocator.free(s);
+                if (entry.tool_full) |s| self.allocator.free(s);
+                entry.tool_summary = null;
+                entry.tool_full = null;
+                try renderToolLine(self.allocator, entry);
                 ctx.redraw = true;
                 return;
             }
@@ -1366,15 +1369,20 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
 /// silent: the line keeps its raw text and renders unstyled, which is
 /// strictly less helpful but never wrong.
 fn renderAgentMarkdown(self: *Root) !void {
+    // Walk back through the current turn re-rendering every agent
+    // line we find. A turn can contain multiple agent prose blocks
+    // separated by tool rows (the model talks → calls a tool →
+    // talks more → calls another tool → ...); each prose block
+    // streams in raw and needs the markdown pass on ue_done.
+    // Stop at the first user line — that's the previous turn's
+    // boundary, and lines above it already had markdown baked in
+    // by an earlier ue_done.
     var i: usize = self.history.items.len;
     while (i > 0) {
         i -= 1;
         const line = &self.history.items[i];
-        // Stop scanning once we cross a non-agent line: earlier
-        // agent lines from prior turns already had their markdown
-        // baked in on a previous ue_done. This keeps the loop O(N)
-        // in lines added _this_ turn, not total history.
-        if (line.role != .agent) break;
+        if (line.role == .user) break;
+        if (line.role != .agent) continue;
         if (line.spans != null) continue;
         if (line.text.items.len == 0) continue;
 
