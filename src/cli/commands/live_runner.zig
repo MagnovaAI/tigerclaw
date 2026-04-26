@@ -363,6 +363,11 @@ pub const LiveAgentRunner = struct {
                 \\doubt, pick the closest match and proceed; if there is no
                 \\reasonable match, answer normally without invoking a skill.
                 \\
+                \\IMPORTANT: when you decide to follow a skill, call the
+                \\`use_skill` tool FIRST with the skill's name. This surfaces
+                \\a row in the chat so the user can see which skill is active.
+                \\Then proceed with the work the skill describes.
+                \\
             );
             for (skills) |s| {
                 try buf.appendSlice(allocator, "\n## skill: ");
@@ -1074,6 +1079,11 @@ const builtin_tools = [_]types.Tool{
         .description = "Pause the turn and ask the user a clarifying question. Use sparingly: only when you cannot reasonably proceed without an answer (e.g. truly ambiguous instruction, missing critical info). The tool returns the user's reply as a plain string. If the user is unavailable (autonomous mode), the tool returns immediately with a 'user unavailable' marker; do not retry — make the best decision yourself and explain it.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"question\":{\"type\":\"string\",\"minLength\":1}},\"required\":[\"question\"]}",
     },
+    .{
+        .name = "use_skill",
+        .description = "Announce that you are following one of the installed skills. Call this BEFORE doing the skill's work, with `name` set to the skill's name (the value after `## skill:` in the system prompt's skills section, also the form the user uses with `@<name>`). The tool just acknowledges — it surfaces a row in the chat so the user can see which skill is active. Match user intent loosely: 'review my code' → use_skill('code-review'), 'commit this' → use_skill('git-commit'), etc. Skip when no skill matches; not every task has a skill.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"minLength\":1}},\"required\":[\"name\"]}",
+    },
 };
 
 /// One-line preview of the tool's argument JSON, surfaced on the
@@ -1098,6 +1108,8 @@ fn summarizeArgs(name: []const u8, arguments_json: []const u8) []const u8 {
         "query"
     else if (std.mem.eql(u8, name, "fetch_url"))
         "url"
+    else if (std.mem.eql(u8, name, "use_skill"))
+        "name"
     else
         return "";
     return extractStringField(arguments_json, field);
@@ -1280,7 +1292,34 @@ fn dispatchBuiltinTool(
     if (std.mem.eql(u8, name, "ask_user")) {
         return runAskUser(allocator, runner, arguments_json);
     }
+    if (std.mem.eql(u8, name, "use_skill")) {
+        return runUseSkill(allocator, arguments_json);
+    }
     return error.UnknownTool;
+}
+
+/// `use_skill` is a UI marker, not a real action. The tool just
+/// acknowledges so a structured row appears in the chat. The
+/// model's actual skill-following work happens in normal text +
+/// tool calls afterward, guided by the inlined skill body in the
+/// system prompt.
+fn runUseSkill(
+    allocator: std.mem.Allocator,
+    arguments_json: []const u8,
+) ![]u8 {
+    const Args = struct { name: []const u8 = "" };
+    var parsed = std.json.parseFromSlice(Args, allocator, arguments_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidArgs;
+    defer parsed.deinit();
+    if (parsed.value.name.len == 0) {
+        return allocator.dupe(u8, "use_skill: missing `name`");
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "Following the `{s}` skill — its instructions from the system prompt apply for this task.",
+        .{parsed.value.name},
+    );
 }
 
 fn runAskUser(

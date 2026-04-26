@@ -1428,7 +1428,10 @@ fn renderToolHeader(
     name: []const u8,
     args_summary: []const u8,
 ) !void {
-    try text.appendSlice(allocator, name);
+    // Cosmetic: `use_skill` is the wire name the model sees; the
+    // user wants to read it as "Skill(code-review)" in the chat.
+    const display_name: []const u8 = if (std.mem.eql(u8, name, "use_skill")) "Skill" else name;
+    try text.appendSlice(allocator, display_name);
     if (args_summary.len > 0) {
         try text.append(allocator, '(');
         if (args_summary.len <= tool_args_max_chars) {
