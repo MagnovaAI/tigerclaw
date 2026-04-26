@@ -442,12 +442,14 @@ fn prefixFor(line: *const tui.Line) []const u8 {
         .user => "› ",
         .agent => "⏺ ",
         .system => "∙ ",
-        // Smaller bullet operator `•` (U+2022) for structured
-        // tool rows so they don't compete with the agent's
-        // heavier `⏺` glyph at a glance. Same cell width, less
-        // visual weight — the eye reads "subordinate detail"
-        // instead of "another speaker".
-        .tool => if (line.tool_name != null) "• " else "⎿ ",
+        // Tiny middle dot `·` (U+00B7) for structured tool rows
+        // so they read as subordinate detail, not another speaker.
+        // The bullet operator `•` (U+2022) renders fat in many
+        // monospace fonts — practically the same size as the
+        // agent's `⏺` — which defeated the visual hierarchy.
+        // The middle dot is reliably small across iTerm2,
+        // Terminal.app, Ghostty, kitty, and Alacritty.
+        .tool => if (line.tool_name != null) "· " else "⎿ ",
     };
 }
 
