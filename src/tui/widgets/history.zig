@@ -442,7 +442,12 @@ fn prefixFor(line: *const tui.Line) []const u8 {
         .user => "› ",
         .agent => "⏺ ",
         .system => "∙ ",
-        .tool => if (line.tool_name != null) "● " else "⎿ ",
+        // Smaller bullet operator `•` (U+2022) for structured
+        // tool rows so they don't compete with the agent's
+        // heavier `⏺` glyph at a glance. Same cell width, less
+        // visual weight — the eye reads "subordinate detail"
+        // instead of "another speaker".
+        .tool => if (line.tool_name != null) "• " else "⎿ ",
     };
 }
 
