@@ -96,6 +96,12 @@ pub const RealRunner = struct {
             self.allocator.free(id);
             self.current_id = null;
         }
+        // The agent was handed off to the runner via `Options.agent`
+        // and lives for the runner's full lifetime — its state is
+        // the conversational context that persists across turns.
+        // Tear it down here so the caller has a single deinit point.
+        self.agent.deinit();
+        self.allocator.destroy(self.agent);
         self.* = undefined;
     }
 
@@ -326,10 +332,6 @@ test "RealRunner: empty session_id returns SessionMissing" {
     var mock = llm.MockProvider{ .replies = &.{} };
 
     const a = try newAgent(testing.allocator, mock.provider(), deny.executor());
-    defer {
-        a.deinit();
-        testing.allocator.destroy(a);
-    }
 
     var b = memory.Builtin.init(.{
         .allocator = testing.allocator,
@@ -374,10 +376,6 @@ test "RealRunner: end-to-end turn echoes through the runner and persists session
     var deny = vtable_mod.DenyExecutor{};
 
     const a = try newAgent(testing.allocator, mock.provider(), deny.executor());
-    defer {
-        a.deinit();
-        testing.allocator.destroy(a);
-    }
 
     var b = memory.Builtin.init(.{
         .allocator = testing.allocator,
@@ -438,10 +436,6 @@ test "RealRunner: iteration_cap reports completed=false" {
         .model = .{ .provider = "mock", .model = "0" },
         .loop = .{ .max_iterations = 2 },
     });
-    defer {
-        a.deinit();
-        testing.allocator.destroy(a);
-    }
 
     var b = memory.Builtin.init(.{
         .allocator = testing.allocator,
@@ -487,10 +481,6 @@ test "RealRunner: cancel before run trips Interrupted on the next turn" {
     var deny = vtable_mod.DenyExecutor{};
 
     const a = try newAgent(testing.allocator, mock.provider(), deny.executor());
-    defer {
-        a.deinit();
-        testing.allocator.destroy(a);
-    }
 
     var b = memory.Builtin.init(.{
         .allocator = testing.allocator,
