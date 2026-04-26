@@ -81,6 +81,19 @@ pub const all_migrations = [_]Migration{
         \\CREATE INDEX idx_instances_live ON instances(evicted_at_ns) WHERE evicted_at_ns = 0;
         ,
     },
+    .{
+        .name = "0004_instance_tokens",
+        // Per-instance bearer tokens. The wire form is a 64-char hex
+        // string; the column stores the Blake3 hash of that string so a
+        // disclosed database row cannot impersonate the instance. The
+        // column is UNIQUE so token-prefix collisions surface during
+        // generation rather than as a silent duplicate.
+        .sql =
+        \\ALTER TABLE instances ADD COLUMN token_hash TEXT NOT NULL DEFAULT '';
+        \\CREATE UNIQUE INDEX idx_instances_token_hash
+        \\  ON instances(token_hash) WHERE token_hash <> '';
+        ,
+    },
 };
 
 pub fn run(db: *sqlite.Db) !void {

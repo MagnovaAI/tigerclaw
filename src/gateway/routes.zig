@@ -16,6 +16,9 @@ const http = @import("http.zig");
 const dispatcher = @import("dispatcher.zig");
 const harness = @import("../harness/root.zig");
 const settings = @import("../settings/root.zig");
+const db_mod = @import("../db/root.zig");
+const clock_mod = @import("clock");
+const instance_auth = @import("../instances/auth.zig");
 
 pub const Context = struct {
     runner: harness.AgentRunner,
@@ -38,6 +41,22 @@ pub const Context = struct {
     /// tests that don't care about the reload side-effect.
     reload_callback: ?*const fn (userdata: ?*anyopaque) void = null,
     reload_userdata: ?*anyopaque = null,
+    /// SQLite handle backing the instance registry. When null, the
+    /// `/instances/*` routes return 503 — the daemon was constructed
+    /// without persistence (legacy paths, some test configurations).
+    /// The pointer is stable for the lifetime of the gateway.
+    db: ?*db_mod.Db = null,
+    /// Clock used by `/instances/*` handlers to stamp registration
+    /// and heartbeat timestamps. Tests install a `FixedClock` so the
+    /// recorded `connected_at_ns` and `last_heartbeat_at_ns` columns
+    /// are deterministic across runs. When `db` is set, this must
+    /// also be set; the route layer ANDs them at the entry point.
+    clock: ?clock_mod.Clock = null,
+    /// Io handle used to source secure entropy for the registration
+    /// route's token generator. Threaded through the same way `db`
+    /// and `clock` are: production wires the gateway's threaded Io,
+    /// tests wire `std.testing.io`.
+    io: ?std.Io = null,
 };
 
 /// Immutable bundle of the settings the runtime was started with plus
@@ -108,6 +127,9 @@ pub const routes = [_]router.Route{
     .{ .method = .POST, .pattern = "/sessions/:id/messages", .tag = "sessions.message" },
     .{ .method = .POST, .pattern = "/sessions/:id/turns", .tag = "sessions.turn" },
     .{ .method = .DELETE, .pattern = "/sessions/:id/turns/current", .tag = "sessions.turn.cancel" },
+    .{ .method = .POST, .pattern = "/instances/register", .tag = "instances.register" },
+    .{ .method = .POST, .pattern = "/instances/:id/heartbeat", .tag = "instances.heartbeat" },
+    .{ .method = .DELETE, .pattern = "/instances/:id", .tag = "instances.delete" },
 };
 
 pub const handlers = [_]dispatcher.HandlerEntry{
@@ -120,6 +142,9 @@ pub const handlers = [_]dispatcher.HandlerEntry{
     .{ .tag = "sessions.message", .handler = sessionsMessageHandler },
     .{ .tag = "sessions.turn", .handler = sessionsTurnHandler },
     .{ .tag = "sessions.turn.cancel", .handler = sessionsTurnCancelHandler },
+    .{ .tag = "instances.register", .handler = instancesRegisterHandler },
+    .{ .tag = "instances.heartbeat", .handler = instancesHeartbeatHandler },
+    .{ .tag = "instances.delete", .handler = instancesDeleteHandler },
 };
 
 // --- handlers --------------------------------------------------------------
@@ -449,6 +474,163 @@ fn renderJsonFromOutput(output: []const u8) http.Response {
     return http.Response.jsonOk(w.buffered());
 }
 
+// --- /instances/* ---------------------------------------------------------
+
+/// POST /instances/register — record a new client (TUI/CLI/web) in
+/// the instances table and return its bearer token. The token is
+/// shown to the client exactly once; the gateway only ever stores
+/// its Blake3 hash. Body shape:
+///     {"kind":"tui","name":"alice","agent_id":"tiger",
+///      "session_id":"...","heartbeat_interval_ms":30000}
+/// Only `kind` is required. Returns 201 with `{id, token}` or 503
+/// when the gateway was started without a database (legacy mode).
+fn instancesRegisterHandler(
+    req: http.Request,
+    _: []const router.Param,
+    _: ?[]const u8,
+    _: dispatcher.StreamHook,
+) dispatcher.HandlerError!http.Response {
+    const ctx = try contextOrInternal();
+    const db = ctx.db orelse return dbUnavailable();
+    const clock = ctx.clock orelse return dbUnavailable();
+    const io = ctx.io orelse return dbUnavailable();
+
+    const args = parseRegisterBody(req.body) catch return error.BadRequest;
+
+    var id_buf: [16]u8 = undefined;
+    const id = instance_auth.genInstanceId(io, &id_buf, args.kind.toString()) catch
+        return error.InternalServerError;
+    const token = instance_auth.generate(io) catch return error.InternalServerError;
+    const token_hash = instance_auth.hash(&token);
+
+    const now = clock.nowNs();
+    var repo = db_mod.InstanceRepo.init(db);
+    repo.insert(.{
+        .id = id,
+        .kind = args.kind,
+        .name = args.name,
+        .agent_id = args.agent_id,
+        .session_id = args.session_id,
+        .heartbeat_interval_ms = args.heartbeat_interval_ms,
+        .connected_at_ns = now,
+        .last_heartbeat_at_ns = now,
+    }) catch return error.InternalServerError;
+    _ = repo.setTokenHash(id, &token_hash) catch return error.InternalServerError;
+
+    var w = std.Io.Writer.fixed(&render_body_buf);
+    w.writeAll("{\"id\":\"") catch return error.InternalServerError;
+    w.writeAll(id) catch return error.InternalServerError;
+    w.writeAll("\",\"token\":\"") catch return error.InternalServerError;
+    w.writeAll(&token) catch return error.InternalServerError;
+    w.writeAll("\"}") catch return error.InternalServerError;
+
+    return .{
+        .status = .created,
+        .headers = &json_headers,
+        .body = w.buffered(),
+    };
+}
+
+/// POST /instances/:id/heartbeat — bump `last_heartbeat_at_ns` and
+/// clear any soft eviction. Returns 204 on success or 404 when the
+/// id is unknown (the TUI re-registers on 404; that contract is
+/// load-bearing for the sweeper's "soft eviction can be revived"
+/// semantics).
+fn instancesHeartbeatHandler(
+    _: http.Request,
+    params: []const router.Param,
+    _: ?[]const u8,
+    _: dispatcher.StreamHook,
+) dispatcher.HandlerError!http.Response {
+    const ctx = try contextOrInternal();
+    const db = ctx.db orelse return dbUnavailable();
+    const clock = ctx.clock orelse return dbUnavailable();
+
+    const id = findParam(params, "id") orelse return error.BadRequest;
+
+    var repo = db_mod.InstanceRepo.init(db);
+    const ok = repo.heartbeat(id, clock.nowNs()) catch return error.InternalServerError;
+    if (!ok) return http.Response.notFound();
+    return .{ .status = .no_content };
+}
+
+/// DELETE /instances/:id — graceful shutdown signal from the client.
+/// Hard-deletes the row so the slot is reusable immediately rather
+/// than waiting for the eviction sweeper. Idempotent: 204 either
+/// way; we don't surface "already gone" because the client's intent
+/// is "be gone", and the row is.
+fn instancesDeleteHandler(
+    _: http.Request,
+    params: []const router.Param,
+    _: ?[]const u8,
+    _: dispatcher.StreamHook,
+) dispatcher.HandlerError!http.Response {
+    const ctx = try contextOrInternal();
+    const db = ctx.db orelse return dbUnavailable();
+    const id = findParam(params, "id") orelse return error.BadRequest;
+
+    var repo = db_mod.InstanceRepo.init(db);
+    repo.delete(id) catch return error.InternalServerError;
+    return .{ .status = .no_content };
+}
+
+const RegisterBody = struct {
+    kind: db_mod.InstanceKind,
+    name: []const u8 = "",
+    agent_id: []const u8 = "",
+    session_id: []const u8 = "",
+    heartbeat_interval_ms: u32 = 0,
+};
+
+/// Parse the registration body. The slices in the returned struct
+/// alias the original `body` bytes — `parseFromSlice` would build a
+/// short-lived arena, so we pull each field out by re-finding it in
+/// `body`, the same trick `extractMessage` uses above. Caller frees
+/// `body` after the handler returns.
+fn parseRegisterBody(body: []const u8) !RegisterBody {
+    if (body.len == 0) return error.BadRequest;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadRequest;
+    const obj = parsed.value.object;
+
+    const kind_v = obj.get("kind") orelse return error.BadRequest;
+    if (kind_v != .string) return error.BadRequest;
+    const kind = db_mod.InstanceKind.fromString(kind_v.string) orelse return error.BadRequest;
+
+    var out: RegisterBody = .{ .kind = kind };
+    out.name = sliceField(body, obj.get("name")) orelse "";
+    out.agent_id = sliceField(body, obj.get("agent_id")) orelse "";
+    out.session_id = sliceField(body, obj.get("session_id")) orelse "";
+
+    if (obj.get("heartbeat_interval_ms")) |hb| {
+        if (hb == .integer and hb.integer >= 0 and hb.integer <= std.math.maxInt(u32)) {
+            out.heartbeat_interval_ms = @intCast(hb.integer);
+        } else return error.BadRequest;
+    }
+    return out;
+}
+
+/// Re-anchor a parsed JSON string into the original request body so
+/// the slice outlives the local parse arena. Returns null when the
+/// JSON value is missing or not a string.
+fn sliceField(body: []const u8, value: ?std.json.Value) ?[]const u8 {
+    const v = value orelse return null;
+    if (v != .string) return null;
+    const needle = v.string;
+    if (needle.len == 0) return "";
+    const start = std.mem.indexOf(u8, body, needle) orelse return null;
+    return body[start .. start + needle.len];
+}
+
+fn dbUnavailable() http.Response {
+    return .{
+        .status = .service_unavailable,
+        .headers = &json_headers,
+        .body = "{\"error\":\"db_unavailable\"}",
+    };
+}
+
 /// DELETE /sessions/:id/turns/current — cancel the in-flight turn for
 /// `id`. Idempotent: returns 204 even when no turn is in flight, so the
 /// CLI's Ctrl-C handler can fire without having to track turn state.
@@ -730,4 +912,216 @@ test "routes: POST /config/reload fires the context's reload_callback per reques
     _ = try dispatcher.dispatch(&routes, &handlers, req, null);
 
     try testing.expectEqual(@as(u32, 2), reload_cb_counter);
+}
+
+// --- /instances/* tests ---------------------------------------------------
+
+const InstanceTestRig = struct {
+    db: db_mod.Db,
+    fixed_clock: clock_mod.FixedClock,
+    mock: harness.MockAgentRunner,
+    ctx: Context,
+
+    fn init() !InstanceTestRig {
+        var db = try db_mod.Db.open(testing.allocator, .{ .path = ":memory:" });
+        try db_mod.migrations.run(&db);
+        return .{
+            .db = db,
+            .fixed_clock = .{ .value_ns = 1234 },
+            .mock = harness.MockAgentRunner.init(),
+            .ctx = undefined,
+        };
+    }
+
+    fn install(self: *InstanceTestRig) void {
+        self.ctx = .{
+            .runner = self.mock.runner(),
+            .db = &self.db,
+            .clock = self.fixed_clock.clock(),
+            .io = testing.io,
+        };
+        setContext(&self.ctx);
+    }
+
+    fn deinit(self: *InstanceTestRig) void {
+        clearContext();
+        self.db.close();
+    }
+};
+
+test "POST /instances/register: creates a row, returns id+token, hashes the token" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    const body =
+        \\{"kind":"tui","name":"alice","heartbeat_interval_ms":5000}
+    ;
+    const headers = [_]http.Header{.{ .name = "content-type", .value = "application/json" }};
+    const req: http.Request = .{
+        .method = .POST,
+        .target = "/instances/register",
+        .headers = &headers,
+        .body = body,
+    };
+
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.created, resp.status);
+
+    // Parse the response — check the id starts with "tui-" and the
+    // token is 64 lowercase hex chars.
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const id = obj.get("id").?.string;
+    const token = obj.get("token").?.string;
+    try testing.expect(std.mem.startsWith(u8, id, "tui-"));
+    try testing.expectEqual(@as(usize, 64), token.len);
+
+    // Row exists, has the right fields, stores the hash (not the token).
+    var repo = db_mod.InstanceRepo.init(&rig.db);
+    const rec = (try repo.get(testing.allocator, id)) orelse return error.TestUnexpectedNull;
+    var rec_mut = rec;
+    defer freeRecord(testing.allocator, &rec_mut);
+    try testing.expectEqual(db_mod.InstanceKind.tui, rec.kind);
+    try testing.expectEqualStrings("alice", rec.name);
+    try testing.expectEqual(@as(u32, 5000), rec.heartbeat_interval_ms);
+    try testing.expectEqual(@as(i128, 1234), rec.connected_at_ns);
+    try testing.expectEqual(@as(i128, 1234), rec.last_heartbeat_at_ns);
+}
+
+test "POST /instances/register: rejects missing body" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    const headers = [_]http.Header{.{ .name = "content-type", .value = "application/json" }};
+    const req: http.Request = .{
+        .method = .POST,
+        .target = "/instances/register",
+        .headers = &headers,
+        .body = "",
+    };
+    try testing.expectError(error.BadRequest, dispatcher.dispatch(&routes, &handlers, req, null));
+}
+
+test "POST /instances/register: rejects unknown kind" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    const body =
+        \\{"kind":"martian"}
+    ;
+    const headers = [_]http.Header{.{ .name = "content-type", .value = "application/json" }};
+    const req: http.Request = .{
+        .method = .POST,
+        .target = "/instances/register",
+        .headers = &headers,
+        .body = body,
+    };
+    try testing.expectError(error.BadRequest, dispatcher.dispatch(&routes, &handlers, req, null));
+}
+
+test "POST /instances/register: 503 when db is not wired" {
+    var mock = harness.MockAgentRunner.init();
+    var ctx: Context = .{ .runner = mock.runner() };
+    setContext(&ctx);
+    defer clearContext();
+
+    const body =
+        \\{"kind":"tui"}
+    ;
+    const headers = [_]http.Header{.{ .name = "content-type", .value = "application/json" }};
+    const req: http.Request = .{
+        .method = .POST,
+        .target = "/instances/register",
+        .headers = &headers,
+        .body = body,
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.service_unavailable, resp.status);
+}
+
+test "POST /instances/:id/heartbeat: bumps timestamp and revives evicted record" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    var repo = db_mod.InstanceRepo.init(&rig.db);
+    try repo.insert(.{
+        .id = "tui-deadbeef",
+        .kind = .tui,
+        .name = "test",
+        .heartbeat_interval_ms = 1000,
+        .connected_at_ns = 0,
+        .last_heartbeat_at_ns = 0,
+        .evicted_at_ns = 999, // soft-evicted
+    });
+
+    rig.fixed_clock.value_ns = 5000;
+    const req: http.Request = .{
+        .method = .POST,
+        .target = "/instances/tui-deadbeef/heartbeat",
+        .headers = &.{},
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.no_content, resp.status);
+
+    const rec = (try repo.get(testing.allocator, "tui-deadbeef")) orelse return error.TestUnexpectedNull;
+    var rec_mut = rec;
+    defer freeRecord(testing.allocator, &rec_mut);
+    try testing.expectEqual(@as(i128, 5000), rec.last_heartbeat_at_ns);
+    try testing.expectEqual(@as(i128, 0), rec.evicted_at_ns);
+}
+
+test "POST /instances/:id/heartbeat: 404 on unknown id" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    const req: http.Request = .{
+        .method = .POST,
+        .target = "/instances/ghost-12345678/heartbeat",
+        .headers = &.{},
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.not_found, resp.status);
+}
+
+test "DELETE /instances/:id: removes the row, 204 even when row was already gone" {
+    var rig = try InstanceTestRig.init();
+    defer rig.deinit();
+    rig.install();
+
+    var repo = db_mod.InstanceRepo.init(&rig.db);
+    try repo.insert(.{
+        .id = "cli-cafebabe",
+        .kind = .cli,
+        .connected_at_ns = 0,
+        .last_heartbeat_at_ns = 0,
+    });
+
+    const req: http.Request = .{
+        .method = .DELETE,
+        .target = "/instances/cli-cafebabe",
+        .headers = &.{},
+    };
+    const resp = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.no_content, resp.status);
+    try testing.expect(!(try repo.exists("cli-cafebabe")));
+
+    // Idempotent: deleting again still returns 204.
+    const resp2 = try dispatcher.dispatch(&routes, &handlers, req, null);
+    try testing.expectEqual(http.Status.no_content, resp2.status);
+}
+
+/// Local helper to free the strings dup'd by `Repo.get`. Mirrors
+/// what `freeRecord` would look like if instances_repo exposed one;
+/// inlined here to keep the test self-contained.
+fn freeRecord(allocator: std.mem.Allocator, rec: *db_mod.InstanceRecord) void {
+    allocator.free(rec.id);
+    allocator.free(rec.name);
+    allocator.free(rec.agent_id);
+    allocator.free(rec.session_id);
 }

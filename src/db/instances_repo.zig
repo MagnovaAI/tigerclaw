@@ -100,6 +100,24 @@ pub const Repo = struct {
         _ = try stmt.step();
     }
 
+    /// Stamp the token hash for an existing instance. Called once at
+    /// registration time, after `insert`, with the Blake3 hash of the
+    /// freshly-generated bearer token. Returns false if the id is
+    /// unknown (caller treats as a registration failure).
+    pub fn setTokenHash(self: *Repo, id: []const u8, token_hash: []const u8) !bool {
+        self.db.lock();
+        defer self.db.unlock();
+
+        var stmt = try self.db.prepare(
+            \\UPDATE instances SET token_hash = ? WHERE id = ?;
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, token_hash);
+        try stmt.bindText(2, id);
+        _ = try stmt.step();
+        return self.db.changes() > 0;
+    }
+
     /// Bump the heartbeat timestamp. Returns `false` when the id is
     /// unknown (caller treats that as 404 — TUI re-registers).
     pub fn heartbeat(self: *Repo, id: []const u8, now_ns: i128) !bool {

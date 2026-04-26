@@ -507,6 +507,7 @@ pub fn runGateway(
     var boot = gateway_root.boot.Boot.init(allocator, io, .{
         .address = opts.address,
         .state_root = state_dir,
+        .state_root_path = opts.state_dir_path,
         .routes = &gateway_root.routes.routes,
         .handlers = &gateway_root.routes.handlers,
         .clock = clock_cb.clock(),
@@ -530,7 +531,12 @@ pub fn runGateway(
             load_err = e;
         };
     }
-    var ctx: gateway_root.routes.Context = .{ .runner = registry.runner() };
+    var ctx: gateway_root.routes.Context = .{
+        .runner = registry.runner(),
+        .db = &boot.db,
+        .clock = clock_cb.clock(),
+        .io = io,
+    };
 
     // Build the agent-name list for the banner without allocating
     // in the banner path. The registry owns these slices for the
