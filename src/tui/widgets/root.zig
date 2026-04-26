@@ -45,7 +45,7 @@ thinking: Thinking = .{},
 /// Hint strip above the input. Texts are short borrowed slices
 /// — owned by the widget when literal, owned by the Root when
 /// dynamic.
-hint: Hint = .{ .left = "↑↓ scroll  ·  ctrl-c quit", .right = "" },
+hint: Hint = .{ .left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit", .right = "" },
 /// Status bar below the input. Values reset to sensible defaults;
 /// the agent name lives in the model line so the workspace and
 /// sandbox columns stay focused on environment context.
@@ -180,6 +180,7 @@ pub fn deinit(self: *Root) void {
         l.text.deinit(self.allocator);
         l.deinitSpans(self.allocator);
         l.deinitToolId(self.allocator);
+        l.deinitToolFields(self.allocator);
     }
     self.history.deinit(self.allocator);
     self.input.deinit();
@@ -209,7 +210,7 @@ fn onSubmit(ctx: ?*anyopaque, text: []const u8) void {
         self.endPendingReply();
         self.appendLine(.user, text) catch {};
         self.ask_user_pending.store(false, .seq_cst);
-        self.hint.left = "↑↓ scroll  ·  ctrl-c quit";
+        self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
         return;
     }
 
@@ -590,7 +591,7 @@ pub const ue_ask_user_cancel = "tui.ask_user_cancel";
 
 pub const ChunkPayload = struct { text: []u8 };
 pub const AskUserPayload = struct { question: []u8 };
-pub const ToolStartPayload = struct { id: []u8, name: []u8 };
+pub const ToolStartPayload = struct { id: []u8, name: []u8, args_summary: []u8 };
 pub const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8 };
 pub const ErrorPayload = struct { message: []u8 };
 
@@ -718,6 +719,14 @@ fn toolEventSink(
                     ctx.allocator.destroy(payload);
                     return;
                 },
+                // Dupe even when empty so the consumer can free
+                // unconditionally without branching on length.
+                .args_summary = ctx.allocator.dupe(u8, s.args_summary) catch {
+                    ctx.allocator.free(payload.id);
+                    ctx.allocator.free(payload.name);
+                    ctx.allocator.destroy(payload);
+                    return;
+                },
             };
             postUserEvent(ctx, ue_tool_start, payload);
         },
@@ -835,7 +844,7 @@ fn eventHandler(
                     if (self.pending_reply) |slot| self.allocator.free(slot);
                     self.pending_reply = null;
                     self.endPendingReply();
-                    self.hint.left = "↑↓ scroll  ·  ctrl-c quit";
+                    self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
                 }
                 ctx.consumeAndRedraw();
                 return;
@@ -872,6 +881,17 @@ fn eventHandler(
             if (key.matches(vaxis.Key.end, .{}) or key.matches('g', .{ .ctrl = true })) {
                 self.scroll_offset = 0;
                 ctx.redraw = true;
+                return;
+            }
+
+            // Ctrl-B: toggle expand/collapse on every tool row in
+            // history. Tool output is collapsed by default to keep
+            // the chat readable; this lets the user see full
+            // results without retyping the prompt. Idempotent —
+            // pressing it again restores the collapsed view.
+            if (key.matches('b', .{ .ctrl = true })) {
+                _ = toggleAllToolExpand(self) catch return;
+                ctx.consumeAndRedraw();
                 return;
             }
 
@@ -1002,45 +1022,43 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_tool_start)) {
         const p: *const ToolStartPayload = @ptrCast(@alignCast(ue.data.?));
-        // Capture slices before scheduling the destroy defer so
-        // the pointer is still valid when the free defers fire.
         const id_slice = p.id;
         const name_slice = p.name;
+        const args_slice = p.args_summary;
         defer self.allocator.destroy(@as(*ToolStartPayload, @constCast(p)));
         defer self.allocator.free(id_slice);
         defer self.allocator.free(name_slice);
+        defer self.allocator.free(args_slice);
 
         // Tool call breaks the current agent-line accumulator.
         // Subsequent chunks (post-tool) create a fresh agent
         // line below the tool entry.
         self.pending_agent_line = null;
-
-        // Tool-output suppression: when the user has hidden tool
-        // lines (default), skip the history append so the chat
-        // reads as plain conversation. We still null out
-        // `pending_agent_line` above because the runner-side
-        // turn flow is unchanged either way.
         if (!self.tool_output_enabled) {
             ctx.redraw = true;
             return;
         }
 
-        // Append a pending tool line. Just the tool name —
-        // when the tool completes, \`tool_done\` promotes this
-        // line with " → <output preview>". The thinking row
-        // above the input already signals "busy"; no need for
-        // a "(pending)" suffix here.
+        // Pending row: render header without summary or
+        // continuation glyph. `turn_tool_done` later swaps in the
+        // collapsed `<header>\n  └ <summary>` block.
         var text: std.ArrayList(u8) = .empty;
         errdefer text.deinit(self.allocator);
-        try text.appendSlice(self.allocator, p.name);
+        try renderToolHeader(self.allocator, &text, name_slice, args_slice);
 
         const id_owned = try self.allocator.dupe(u8, p.id);
         errdefer self.allocator.free(id_owned);
+        const name_owned = try self.allocator.dupe(u8, p.name);
+        errdefer self.allocator.free(name_owned);
+        const args_owned = try self.allocator.dupe(u8, p.args_summary);
+        errdefer self.allocator.free(args_owned);
 
         try self.history.append(self.allocator, .{
             .role = .tool,
             .text = text,
             .tool_id = id_owned,
+            .tool_name = name_owned,
+            .tool_args = args_owned,
         });
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_tool_done)) {
@@ -1053,8 +1071,6 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         defer self.allocator.free(name_slice);
         defer self.allocator.free(output_slice);
 
-        // Walk history backwards, find the matching pending line
-        // (by tool_id), promote it with the output preview.
         var i: usize = self.history.items.len;
         while (i > 0) {
             i -= 1;
@@ -1062,25 +1078,21 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
             if (entry.role != .tool) continue;
             if (entry.tool_id) |id| {
                 if (std.mem.eql(u8, id, p.id)) {
-                    entry.text.clearRetainingCapacity();
-                    // First line: tool name as the header.
-                    try entry.text.appendSlice(self.allocator, p.name);
-                    // Subsequent lines: each line of the preview
-                    // indented with `│ ` so the block reads as one
-                    // structured unit and the eye can pick out tool
-                    // results from prose at a glance.
-                    const trimmed = std.mem.trimEnd(u8, p.output, "\n");
-                    if (trimmed.len > 0) {
-                        try entry.text.append(self.allocator, '\n');
-                        var line_iter = std.mem.splitScalar(u8, trimmed, '\n');
-                        var first = true;
-                        while (line_iter.next()) |body_line| {
-                            if (!first) try entry.text.append(self.allocator, '\n');
-                            first = false;
-                            try entry.text.appendSlice(self.allocator, "  │ ");
-                            try entry.text.appendSlice(self.allocator, body_line);
-                        }
+                    // Stash the full output and a summary so the
+                    // user can toggle expand/collapse later. Free
+                    // the prior args/name only if we somehow got
+                    // here without going through ue_tool_start
+                    // (defensive — the entry is normally already
+                    // populated). Then re-render based on the
+                    // current expanded flag.
+                    if (entry.tool_summary) |s| self.allocator.free(s);
+                    if (entry.tool_full) |s| self.allocator.free(s);
+                    entry.tool_summary = try self.allocator.dupe(u8, summarizeToolOutput(p.output));
+                    entry.tool_full = try self.allocator.dupe(u8, p.output);
+                    if (entry.tool_name == null) {
+                        entry.tool_name = try self.allocator.dupe(u8, p.name);
                     }
+                    try renderToolLine(self.allocator, entry);
                     entry.deinitToolId(self.allocator);
                     break;
                 }
@@ -1111,7 +1123,7 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         if (self.pending_reply) |slot| self.allocator.free(slot);
         self.pending_reply = null;
         self.endPendingReply();
-        self.hint.left = "↑↓ scroll  ·  ctrl-c quit";
+        self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_error)) {
         const p: *const ErrorPayload = @ptrCast(@alignCast(ue.data.?));
@@ -1349,4 +1361,102 @@ fn renderAgentMarkdown(self: *Root) !void {
         // to free here.
         self.allocator.free(rendered.text);
     }
+}
+
+// --- Tool row rendering ----------------------------------------------------
+//
+// Tool rows render in three states. Pending: just the header, no
+// continuation glyph. Collapsed (default after done): header plus
+// one `└ <summary>` line. Expanded (Ctrl-B): header plus full
+// output, each line prefixed with the continuation glyph so the
+// block reads as one structured unit. Re-renders go through
+// `renderToolLine` so toggling expand/collapse paints from the
+// stored `tool_full` slice without losing data.
+
+const tool_summary_max_chars: usize = 80;
+const tool_args_max_chars: usize = 60;
+
+/// Append the row header `Tool(args)` to `text`. Used by the
+/// pending state and as the first line of the done state.
+fn renderToolHeader(
+    allocator: std.mem.Allocator,
+    text: *std.ArrayList(u8),
+    name: []const u8,
+    args_summary: []const u8,
+) !void {
+    try text.appendSlice(allocator, name);
+    if (args_summary.len > 0) {
+        try text.append(allocator, '(');
+        if (args_summary.len <= tool_args_max_chars) {
+            try text.appendSlice(allocator, args_summary);
+        } else {
+            try text.appendSlice(allocator, args_summary[0..tool_args_max_chars]);
+            try text.appendSlice(allocator, "\u{2026}");
+        }
+        try text.append(allocator, ')');
+    }
+}
+
+/// One-line preview drawn from the tool's output. First non-empty
+/// line, trimmed and capped. Falls back to a "(no output)" marker
+/// when the tool wrote nothing.
+fn summarizeToolOutput(output: []const u8) []const u8 {
+    var iter = std.mem.splitScalar(u8, output, '\n');
+    while (iter.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (line.len <= tool_summary_max_chars) return line;
+        return line[0..tool_summary_max_chars];
+    }
+    return "(no output)";
+}
+
+/// (Re)render `entry.text` from the tool's structured fields.
+/// Idempotent — call after every state change (done lands,
+/// expand toggles).
+fn renderToolLine(allocator: std.mem.Allocator, entry: *tui.Line) !void {
+    const name = entry.tool_name orelse return;
+    entry.text.clearRetainingCapacity();
+    try renderToolHeader(allocator, &entry.text, name, entry.tool_args orelse "");
+
+    const has_full = if (entry.tool_full) |f| f.len > 0 else false;
+    if (!has_full) return;
+
+    if (entry.tool_expanded) {
+        // Expanded: every output line gets the `└` continuation.
+        const trimmed = std.mem.trimEnd(u8, entry.tool_full.?, "\n");
+        if (trimmed.len == 0) return;
+        try entry.text.append(allocator, '\n');
+        var iter = std.mem.splitScalar(u8, trimmed, '\n');
+        var first = true;
+        while (iter.next()) |body_line| {
+            if (!first) try entry.text.append(allocator, '\n');
+            first = false;
+            try entry.text.appendSlice(allocator, "  \u{2514} ");
+            try entry.text.appendSlice(allocator, body_line);
+        }
+    } else if (entry.tool_summary) |s| {
+        // Collapsed: one line, the summary.
+        if (s.len == 0) return;
+        try entry.text.append(allocator, '\n');
+        try entry.text.appendSlice(allocator, "  \u{2514} ");
+        try entry.text.appendSlice(allocator, s);
+    }
+}
+
+/// Toggle expand state on every tool row in the history. Called
+/// from the Ctrl-B handler. Returns the number of rows touched
+/// so the handler can decide whether to bother redrawing.
+pub fn toggleAllToolExpand(self: *Root) !usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < self.history.items.len) : (i += 1) {
+        const entry = &self.history.items[i];
+        if (entry.role != .tool) continue;
+        if (entry.tool_name == null) continue;
+        entry.tool_expanded = !entry.tool_expanded;
+        try renderToolLine(self.allocator, entry);
+        n += 1;
+    }
+    return n;
 }

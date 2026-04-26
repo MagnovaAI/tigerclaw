@@ -123,6 +123,22 @@ pub const Line = struct {
     /// matching pending line and promote it to the done state
     /// without having to pattern-match on rendered text.
     tool_id: ?[]u8 = null,
+    /// Tool-call display fields. Set on `tool` lines after
+    /// `turn_tool_done` lands; used when re-rendering on
+    /// expand/collapse toggles. Owned heap slices.
+    tool_name: ?[]u8 = null,
+    /// One-line `args_summary` from the runner (e.g. `npm test`,
+    /// `/path/to/file.zig`). Empty when the tool takes no args.
+    tool_args: ?[]u8 = null,
+    /// First-line preview shown when the row is collapsed.
+    tool_summary: ?[]u8 = null,
+    /// Full body shown when the row is expanded. Lines are
+    /// joined with `\n`; the renderer prefixes each with the
+    /// `└` continuation glyph.
+    tool_full: ?[]u8 = null,
+    /// True when the user has expanded this row (Ctrl-B). Default
+    /// false — collapsed by default to keep the chat readable.
+    tool_expanded: bool = false,
 
     pub fn deinitSpans(self: *Line, allocator: std.mem.Allocator) void {
         if (self.spans) |s| {
@@ -136,6 +152,17 @@ pub const Line = struct {
             allocator.free(id);
             self.tool_id = null;
         }
+    }
+
+    pub fn deinitToolFields(self: *Line, allocator: std.mem.Allocator) void {
+        if (self.tool_name) |s| allocator.free(s);
+        if (self.tool_args) |s| allocator.free(s);
+        if (self.tool_summary) |s| allocator.free(s);
+        if (self.tool_full) |s| allocator.free(s);
+        self.tool_name = null;
+        self.tool_args = null;
+        self.tool_summary = null;
+        self.tool_full = null;
     }
 
     pub const Role = enum { user, agent, system, tool };
@@ -420,6 +447,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
             l.text.deinit(allocator);
             l.deinitSpans(allocator);
             l.deinitToolId(allocator);
+            l.deinitToolFields(allocator);
         }
         history.deinit(allocator);
     }
