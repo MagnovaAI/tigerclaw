@@ -481,6 +481,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                     return;
                 }
 
+                // ESC during a pending turn cooperatively cancels.
+                // The runner's vtable.cancel flips the internal
+                // cancel_flag; the streaming reader and tool
+                // dispatch loop pick it up at their next checkpoint
+                // and unwind the turn with a "[cancelled]" marker.
+                // Idle ESC is a no-op (no in-flight work to abort).
+                if (key.matches(vaxis.Key.escape, .{}) and pending and !picker_open) {
+                    agent_runner.cancel(0);
+                    continue;
+                }
+
                 if (picker_open) {
                     const before = selected;
                     handlePickerKey(key, &picker_open, &picker_cursor, &selected, agents.items());

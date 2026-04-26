@@ -113,6 +113,29 @@ pub const LiveAgentRunner = struct {
     /// runs (where the gate is also expected to be off).
     ask_user_bridge: ?AskUserBridge = null,
 
+    /// Cooperative cancellation for the in-flight turn. The TUI
+    /// flips this true on ESC; the runner reads it at three
+    /// checkpoints:
+    ///
+    ///   - Provider streaming reader (via ChatRequest.cancel_token)
+    ///     so the model stops emitting deltas mid-stream.
+    ///   - Tool dispatch loop, between calls — a tool that already
+    ///     started runs to completion, but the next never starts
+    ///     and gets a synthetic "cancelled by user" tool_result.
+    ///   - Long-running tools (`ask_user`, `bash`, `fetch_url`)
+    ///     check the flag in their wait loops and bail early.
+    ///
+    /// Reset to false at the start of every turn so a stale ESC
+    /// from a previous turn doesn't poison the next one.
+    cancel_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// True iff a tool call is currently executing for this runner
+    /// (set on tool_use dispatch, cleared after the result lands).
+    /// The TUI reads this to decide whether ESC should cancel the
+    /// running tool (returning the model to streaming) or kill the
+    /// whole turn. See `liveCancel`.
+    tool_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     pub const SandboxMode = enum(u8) { unlocked = 0, locked = 1, plan = 2 };
 
     pub const AskUserBridge = struct {
@@ -389,11 +412,16 @@ pub const LiveAgentRunner = struct {
         return &self.in_flight;
     }
 
-    fn liveCancel(_: *anyopaque, _: harness.agent_runner.TurnId) void {
-        // v0.1.0 has no in-process cancellation hook through the
-        // provider; the next run after the cancel just doesn't get
-        // sent. Real cooperative cancel lands with the streaming
-        // dispatcher in v0.2.0.
+    fn liveCancel(ctx: *anyopaque, _: harness.agent_runner.TurnId) void {
+        const self: *LiveAgentRunner = @ptrCast(@alignCast(ctx));
+        // Cooperative cancel. Flips the flag the streaming reader
+        // and tool dispatch loop poll. Idempotent — multiple ESC
+        // presses are a no-op.
+        self.cancel_flag.store(true, .release);
+        // Also unblock any ask_user wait so the operator isn't
+        // stuck staring at a question prompt that the model can no
+        // longer answer to.
+        if (self.ask_user_bridge) |b| b.cancel(b.ctx);
     }
 
     fn liveRun(
@@ -405,6 +433,13 @@ pub const LiveAgentRunner = struct {
         defer self.in_flight.end();
 
         if (req.session_id.len == 0) return error.SessionMissing;
+
+        // Fresh turn — clear any stale cancel flag from a prior
+        // ESC that didn't get observed because the previous turn
+        // already finished. Without this reset, a second user
+        // message after a cancelled turn would itself be cancelled
+        // before it ever reached the model.
+        self.cancel_flag.store(false, .release);
 
         // Rotate the output buffer. The handler that consumed the
         // previous result has long since written it to the wire by
@@ -539,6 +574,7 @@ pub const LiveAgentRunner = struct {
                 // currently-supported Haiku/Sonnet/GPT model.
                 .max_output_tokens = 8192,
                 .tools = &builtin_tools,
+                .cancel_token = &self.cancel_flag,
             };
 
             // Route every provider call through `chatStream` so the
@@ -618,7 +654,19 @@ pub const LiveAgentRunner = struct {
             // what it has and hasn't run.
             if (resp.tool_calls.len == 0) {
                 self.allocator.free(final_text);
-                final_text = try self.allocator.dupe(u8, text);
+                if (resp.stop_reason == .cancelled) {
+                    // ESC mid-stream with no tool queued — surface a
+                    // visible marker so the operator sees the turn
+                    // ended on their request, not a model failure.
+                    // The model gets a fresh prompt next turn; no
+                    // follow-up roundtrip is needed.
+                    final_text = if (text.len > 0)
+                        try std.fmt.allocPrint(self.allocator, "{s}\n[cancelled]", .{text})
+                    else
+                        try self.allocator.dupe(u8, "[cancelled]");
+                } else {
+                    final_text = try self.allocator.dupe(u8, text);
+                }
                 break;
             }
 
@@ -668,7 +716,66 @@ pub const LiveAgentRunner = struct {
             const result_blocks = try self.allocator.alloc(types.ContentBlock, resp.tool_calls.len);
             errdefer self.allocator.free(result_blocks);
 
+            // Track whether any tool observed a cancel. If yes, we
+            // clear `cancel_flag` after the loop so the next chat
+            // call (which delivers the cancellation results to the
+            // model) starts with a fresh stream — otherwise the
+            // very-just-set flag would cancel the new stream
+            // immediately and the model never gets to react.
+            var any_tool_cancelled = false;
+
             for (resp.tool_calls, 0..) |tc, idx| {
+                // Cancel-before-tool path: short-circuit with a
+                // synthetic result so every tool_use block keeps a
+                // matching tool_result. Skipping the dispatch is the
+                // whole point — the user pressed ESC, they don't
+                // want the side effect.
+                const pre_cancelled = self.cancel_flag.load(.acquire);
+                if (pre_cancelled) {
+                    any_tool_cancelled = true;
+                    if (req.tool_event_sink) |s| {
+                        s(req.tool_event_sink_ctx, .{ .started = .{
+                            .id = tc.id,
+                            .name = tc.name,
+                            .args_summary = summarizeArgs(tc.name, tc.arguments_json),
+                        } });
+                    }
+                    const synth = try self.allocator.dupe(u8, "[cancelled by user]");
+                    if (req.tool_event_sink) |s| {
+                        s(req.tool_event_sink_ctx, .{ .finished = .{
+                            .id = tc.id,
+                            .name = tc.name,
+                            .kind = classifyFinishedKind(tc.name, synth),
+                        } });
+                    }
+
+                    const tool_msg_id = try self.nextMessageId();
+                    defer self.allocator.free(tool_msg_id);
+                    const ingest_tr_blocks = [_]types.ContentBlock{.{ .tool_result = .{
+                        .tool_use_id = tc.id,
+                        .content = synth,
+                        .is_error = false,
+                    } }};
+                    _ = self.context_engine.engine().vtable.ingest(
+                        &context_bundle,
+                        self.context_engine.engine().ptr,
+                        .{
+                            .session_id = req.session_id,
+                            .message_id = tool_msg_id,
+                            .role = .tool,
+                            .content = synth,
+                            .blocks = &ingest_tr_blocks,
+                        },
+                    ) catch return error.InternalError;
+
+                    result_blocks[idx] = .{ .tool_result = .{
+                        .tool_use_id = try self.allocator.dupe(u8, tc.id),
+                        .content = synth,
+                        .is_error = false,
+                    } };
+                    continue;
+                }
+
                 // Fire a `.started` event before dispatch so the TUI
                 // can render a pending tool line. The runner never
                 // sees the sink output; it's a side channel for the
@@ -680,6 +787,7 @@ pub const LiveAgentRunner = struct {
                         .args_summary = summarizeArgs(tc.name, tc.arguments_json),
                     } });
                 }
+                self.tool_running.store(true, .release);
                 var tool_failed = false;
                 const result_text = dispatchBuiltinTool(
                     self.allocator,
@@ -698,6 +806,14 @@ pub const LiveAgentRunner = struct {
                         .{ tc.name, @errorName(e) },
                     ) catch return error.OutOfMemory;
                 };
+                self.tool_running.store(false, .release);
+                // Tool finished. If ESC fired *during* the tool, the
+                // tool either honored it (long-running tools poll
+                // the flag) or completed naturally before the press
+                // landed. Either way, we mark it as cancelled here
+                // so the loop knows to reset the flag before the
+                // next provider call.
+                if (self.cancel_flag.load(.acquire)) any_tool_cancelled = true;
                 if (req.tool_event_sink) |s| {
                     s(req.tool_event_sink_ctx, .{ .finished = .{
                         .id = tc.id,
@@ -746,6 +862,14 @@ pub const LiveAgentRunner = struct {
                 .role = .user,
                 .content = result_blocks,
             });
+
+            // Tool ran (or was cancelled mid-tool). Per spec: cancel
+            // *during* a tool kills the tool but lets the model keep
+            // streaming its response. Clear the flag so the next
+            // chat call isn't immediately cancelled by the same
+            // press; the user can re-press ESC to kill the
+            // follow-up stream.
+            if (any_tool_cancelled) self.cancel_flag.store(false, .release);
         }
 
         // The loop exited via the no-tool-calls break, but the
@@ -1153,6 +1277,15 @@ fn runAskUser(
         if (!r.isAskUserGateOpen()) {
             bridge.cancel(bridge.ctx);
             return allocator.dupe(u8, "user unavailable: ask_user gate flipped off mid-wait. Decide on your own and explain.");
+        }
+        if (r.cancel_flag.load(.acquire)) {
+            // ESC pressed while we were waiting. Drop the pending
+            // question from the UI and return a cancellation
+            // marker; the runner pairs this with the tool_use_id
+            // and clears the flag so the model gets a chance to
+            // respond.
+            bridge.cancel(bridge.ctx);
+            return allocator.dupe(u8, "[cancelled by user]");
         }
         if (try bridge.take(bridge.ctx, allocator)) |reply| {
             return reply;
