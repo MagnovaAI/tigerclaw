@@ -1,6 +1,6 @@
 # extensions/
 
-Optional, build-flag-gated provider implementations. Each `extensions/<category>-<name>/root.zig`
+Optional, build-flag-gated provider implementations. Each `extensions/<plug-id>/root.zig`
 is wired up as its own named Zig module in `build.zig` and is included in the binary
 only when its name appears in the `-Dextensions=` selector.
 
@@ -20,7 +20,7 @@ an extension also strips it from `tigerclaw.llm.providers`.
 
 ## Amendment A import allowlist
 
-Code under `extensions/<category>-<name>/` MAY import only:
+Code under `extensions/<plug-id>/` MAY import only:
 
 - `std`
 - `types` — the public type surface (`src/types/root.zig`)
@@ -29,7 +29,7 @@ Code under `extensions/<category>-<name>/` MAY import only:
 - `build_options` — comptime feature flags
 
 It MAY NOT import any other named module, MAY NOT use relative `@import` paths
-that escape its own `extensions/<category>-<name>/` directory, and MAY NOT depend on
+that escape its own `extensions/<plug-id>/` directory, and MAY NOT depend on
 another extension.
 
 **This is enforced by the build system.** Each extension is a separate Zig
@@ -39,7 +39,7 @@ Anything outside that allowlist fails at compile time with
 
 ## Adding a new extension
 
-1. Drop `extensions/<category>-<name>/root.zig` exporting a provider type.
+1. Drop `extensions/<plug-id>/root.zig` exporting a provider type.
 2. In `build.zig`: add an `enable_<name>` (the bare extension name, no category prefix) build option, create `<category>_<name>` (e.g. `provider_anthropic`)
    module with the allowlisted `addImport` chain, and `tigerclaw_mod.addImport`
    it inside the `if (enable_<name>)` block.

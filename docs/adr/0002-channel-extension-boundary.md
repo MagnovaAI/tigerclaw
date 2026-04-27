@@ -28,7 +28,7 @@ does not resolve.
 
 ## Decision
 
-Extensions live under `extensions/<category>-<name>/root.zig` and are
+Extensions live under `extensions/<plug-id>/root.zig` and are
 registered as their own named Zig modules in `build.zig`. Each is
 gated by a `-Dextensions=` build token. The shim in
 `src/channels/root.zig` (and the equivalent for providers) pulls each

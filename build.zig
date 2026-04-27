@@ -29,15 +29,19 @@ pub fn build(b: *std.Build) void {
     const enable_telegram = hasToken(extensions_spec, "telegram");
     const enable_memory = hasToken(extensions_spec, "memory");
 
-    // CalVer — YYYY.M.D. Release pipelines override with
-    // `-Dversion=2026.4.11`; local dev builds derive it from the
+    // CalVer — YYYY.MM.DD. Release pipelines override with
+    // `-Dversion=2026.04.11`; local dev builds derive it from the
     // current date so `tigerclaw gateway` shows something useful.
-    const default_version = calverToday(b.allocator) catch "dev";
-    const app_version = b.option(
+    const default_version = calverToday(b.allocator) catch @panic("failed to derive CalVer version");
+    const requested_version = b.option(
         []const u8,
         "version",
-        "CalVer version string embedded in the binary (default: today)",
+        "Zero-padded CalVer version string embedded in the binary (default: today)",
     ) orelse default_version;
+    if (!isCalVer(requested_version)) {
+        @panic("-Dversion must use zero-padded CalVer YYYY.MM.DD");
+    }
+    const app_version = requested_version;
 
     // Short git SHA for the working tree. Release pipelines pass
     // `-Dcommit=769908e`; local dev builds read `.git/HEAD` directly
@@ -144,7 +148,7 @@ pub fn build(b: *std.Build) void {
     var memory_tigerclaw_mod: ?*std.Build.Module = null;
     if (enable_anthropic) {
         const ext = b.addModule("provider_anthropic", .{
-            .root_source_file = b.path("extensions/providers-anthropic/root.zig"),
+            .root_source_file = b.path("extensions/provider-anthropic/root.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -156,7 +160,7 @@ pub fn build(b: *std.Build) void {
     }
     if (enable_openai) {
         const ext = b.addModule("provider_openai", .{
-            .root_source_file = b.path("extensions/providers-openai/root.zig"),
+            .root_source_file = b.path("extensions/provider-openai/root.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -168,7 +172,7 @@ pub fn build(b: *std.Build) void {
     }
     if (enable_bedrock) {
         const ext = b.addModule("provider_bedrock", .{
-            .root_source_file = b.path("extensions/providers-bedrock/root.zig"),
+            .root_source_file = b.path("extensions/provider-bedrock/root.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -179,7 +183,7 @@ pub fn build(b: *std.Build) void {
     }
     if (enable_openrouter) {
         const ext = b.addModule("provider_openrouter", .{
-            .root_source_file = b.path("extensions/providers-openrouter/root.zig"),
+            .root_source_file = b.path("extensions/provider-openrouter/root.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -275,13 +279,13 @@ pub fn build(b: *std.Build) void {
             "-DHAVE_CONFIG_H",
         },
         .files = &.{
-            "pcre_byte_order.c",     "pcre_chartables.c",   "pcre_compile.c",
-            "pcre_config.c",         "pcre_dfa_exec.c",     "pcre_exec.c",
-            "pcre_fullinfo.c",       "pcre_get.c",          "pcre_globals.c",
-            "pcre_jit_compile.c",    "pcre_maketables.c",   "pcre_newline.c",
-            "pcre_ord2utf8.c",       "pcre_refcount.c",     "pcre_string_utils.c",
-            "pcre_study.c",          "pcre_tables.c",       "pcre_ucd.c",
-            "pcre_valid_utf8.c",     "pcre_version.c",      "pcre_xclass.c",
+            "pcre_byte_order.c",  "pcre_chartables.c", "pcre_compile.c",
+            "pcre_config.c",      "pcre_dfa_exec.c",   "pcre_exec.c",
+            "pcre_fullinfo.c",    "pcre_get.c",        "pcre_globals.c",
+            "pcre_jit_compile.c", "pcre_maketables.c", "pcre_newline.c",
+            "pcre_ord2utf8.c",    "pcre_refcount.c",   "pcre_string_utils.c",
+            "pcre_study.c",       "pcre_tables.c",     "pcre_ucd.c",
+            "pcre_valid_utf8.c",  "pcre_version.c",    "pcre_xclass.c",
         },
     });
 
@@ -705,7 +709,7 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-/// Derive a CalVer string `YYYY.M.D` from the current wall clock.
+/// Derive a CalVer string `YYYY.MM.DD` from the current wall clock.
 /// Used as the default for `-Dversion`. Returns a slice allocated
 /// on the build graph arena so the string outlives the build step.
 fn calverToday(allocator: std.mem.Allocator) ![]const u8 {
@@ -730,7 +734,41 @@ fn calverToday(allocator: std.mem.Allocator) ![]const u8 {
     const m: u64 = if (mp < 10) mp + 3 else mp - 9;
     const year: i64 = if (m <= 2) y + 1 else y;
 
-    return std.fmt.allocPrint(allocator, "{d}.{d}.{d}", .{ year, m, d });
+    const year_u: u64 = @intCast(@max(@as(i64, 0), year));
+    return std.fmt.allocPrint(allocator, "{c}{c}{c}{c}.{c}{c}.{c}{c}", .{
+        decimalDigit((year_u / 1000) % 10),
+        decimalDigit((year_u / 100) % 10),
+        decimalDigit((year_u / 10) % 10),
+        decimalDigit(year_u % 10),
+        decimalDigit(m / 10),
+        decimalDigit(m % 10),
+        decimalDigit(d / 10),
+        decimalDigit(d % 10),
+    });
+}
+
+fn isCalVer(value: []const u8) bool {
+    if (value.len != "YYYY.MM.DD".len) return false;
+    for (value, 0..) |ch, i| {
+        switch (i) {
+            4, 7 => if (ch != '.') return false,
+            else => if (!std.ascii.isDigit(ch)) return false,
+        }
+    }
+
+    const month = decimal2(value[5..7]);
+    const day = decimal2(value[8..10]);
+    return month >= 1 and month <= 12 and day >= 1 and day <= 31;
+}
+
+fn decimal2(value: []const u8) u8 {
+    std.debug.assert(value.len == 2);
+    return (value[0] - '0') * 10 + (value[1] - '0');
+}
+
+fn decimalDigit(value: u64) u8 {
+    std.debug.assert(value < 10);
+    return @as(u8, '0') + @as(u8, @intCast(value));
 }
 
 /// Read the short (7-char) git SHA of the working-tree `HEAD` by

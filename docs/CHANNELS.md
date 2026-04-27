@@ -72,7 +72,7 @@ message — meaning either:
   `receive`.
 
 The Telegram adapter takes the first approach; see
-[`extensions/channels-telegram/channel.zig`](../extensions/channels-telegram/channel.zig)
+[`extensions/channel-telegram/channel.zig`](../extensions/channel-telegram/channel.zig)
 for the canonical pattern. The free helper is invoked by the channel
 manager once the message clears the FIFO.
 
@@ -106,13 +106,13 @@ Suppose you are adding `slack`. Steps:
 1. **Create the extension directory.**
 
    ```
-   extensions/channels-slack/
+   extensions/channel-slack/
      api.zig       # raw HTTP client for the upstream API
      channel.zig   # implements the Channel vtable on top of api.zig
      root.zig      # public surface; re-exports init / deinit
    ```
 
-   Naming is locked: `extensions/channels-<name>/`. Underscores in
+   Naming is locked: `extensions/channel-<name>/`. Underscores in
    module ids mirror the directory name.
 
 2. **Register the named module in `build.zig`.**
@@ -137,11 +137,11 @@ Suppose you are adding `slack`. Steps:
    purpose.
 
 6. **Implement the four vtable methods** in
-   `extensions/channels-slack/channel.zig`. Keep `send` synchronous;
+   `extensions/channel-slack/channel.zig`. Keep `send` synchronous;
    keep `receive` blocked on the poll loop with explicit `.acquire`
    reads of the cancel flag.
 
-7. **Tests.** Mirror `extensions/channels-telegram/`'s test style:
+7. **Tests.** Mirror `extensions/channel-telegram/`'s test style:
    unit tests on the API client with a fake HTTP server (use
    `std.http.Server.receiveHead + request.respond`, never hand-rolled
    bytes), and contract tests on the vtable using the fake channel
@@ -149,7 +149,7 @@ Suppose you are adding `slack`. Steps:
 
 ## Reference adapter
 
-`extensions/channels-telegram/` is the smallest working example.
+`extensions/channel-telegram/` is the smallest working example.
 Read it end-to-end before writing a new adapter — the patterns it
 establishes (token-bucket rate limiting, JSONL outbox cursor, freeing
 inbound strings after dispatch) are the patterns the runtime expects.
