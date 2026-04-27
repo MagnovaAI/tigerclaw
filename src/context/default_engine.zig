@@ -5,7 +5,11 @@ const engine_mod = @import("ctx_engine");
 const assemble = @import("ctx_assemble");
 const compact = @import("ctx_compact");
 const context_mod = @import("context");
+const PlugError = @import("errors").PlugError;
 const Context = context_mod.Context;
+
+const keep_recent_messages: usize = 2;
+const max_summary_content_bytes: usize = 160;
 
 /// A stored message entry. All string fields are owned (duped).
 /// `blocks`, when non-null, owns its outer slice and every inner
@@ -17,6 +21,7 @@ const StoredMsg = struct {
     role: t.Role,
     content: []const u8,
     blocks: ?[]wire_types.ContentBlock = null,
+    is_heartbeat: bool = false,
 };
 
 /// Free everything a `StoredMsg.blocks` owns. Mirrors
@@ -123,11 +128,11 @@ pub const DefaultEngine = struct {
         return @ptrCast(@alignCast(p));
     }
 
-    fn bootstrap(_: *const Context, _: *anyopaque, _: t.BootstrapParams) anyerror!t.BootstrapResult {
+    fn bootstrap(_: *const Context, _: *anyopaque, _: t.BootstrapParams) PlugError!t.BootstrapResult {
         return .{ .bootstrapped = true };
     }
 
-    fn ingest(_: *const Context, p: *anyopaque, params: t.IngestParams) anyerror!t.IngestResult {
+    fn ingest(_: *const Context, p: *anyopaque, params: t.IngestParams) PlugError!t.IngestResult {
         const self = castSelf(p);
         // Idempotent: skip if (session_id, message_id) already stored.
         for (self.messages.items) |m| {
@@ -137,30 +142,31 @@ pub const DefaultEngine = struct {
                 return .{ .ingested = false };
             }
         }
-        const sid = try self.allocator.dupe(u8, params.session_id);
+        const sid = self.allocator.dupe(u8, params.session_id) catch return error.Internal;
         errdefer self.allocator.free(sid);
-        const mid = try self.allocator.dupe(u8, params.message_id);
+        const mid = self.allocator.dupe(u8, params.message_id) catch return error.Internal;
         errdefer self.allocator.free(mid);
-        const cnt = try self.allocator.dupe(u8, params.content);
+        const cnt = self.allocator.dupe(u8, params.content) catch return error.Internal;
         errdefer self.allocator.free(cnt);
         // Deep-copy structured blocks if the caller provided any —
         // the engine owns them through `dispose`.
         const owned_blocks: ?[]wire_types.ContentBlock = if (params.blocks) |bs|
-            try dupeBlocks(self.allocator, bs)
+            dupeBlocks(self.allocator, bs) catch return error.Internal
         else
             null;
         errdefer if (owned_blocks) |bs| freeStoredBlocks(self.allocator, bs);
-        try self.messages.append(self.allocator, .{
+        self.messages.append(self.allocator, .{
             .session_id = sid,
             .message_id = mid,
             .role = params.role,
             .content = cnt,
             .blocks = owned_blocks,
-        });
+            .is_heartbeat = params.is_heartbeat,
+        }) catch return error.Internal;
         return .{ .ingested = true };
     }
 
-    fn assemble_fn(_: *const Context, p: *anyopaque, params: t.AssembleParams) anyerror!t.AssembleResult {
+    fn assemble_fn(_: *const Context, p: *anyopaque, params: t.AssembleParams) PlugError!t.AssembleResult {
         const self = castSelf(p);
         var sections: std.ArrayListUnmanaged(t.Section) = .{ .items = &.{}, .capacity = 0 };
         defer sections.deinit(self.allocator);
@@ -174,8 +180,8 @@ pub const DefaultEngine = struct {
         // the assemble result before the engine deallocates.
         for (self.messages.items) |m| {
             if (!std.mem.eql(u8, m.session_id, params.session_id)) continue;
-            if (self.markers.covers(m.message_id)) continue;
-            try sections.append(self.allocator, .{
+            if (self.markers.coversSession(params.session_id, m.message_id)) continue;
+            sections.append(self.allocator, .{
                 .kind = .history_turn,
                 .role = m.role,
                 .content = m.content,
@@ -185,12 +191,13 @@ pub const DefaultEngine = struct {
                 .tags = &.{},
                 .pinned = false,
                 .origin = "default-engine/history",
-            });
+            }) catch return error.Internal;
         }
 
         // Emit one compaction_summary section per marker.
         for (self.markers.all()) |mk| {
-            try sections.append(self.allocator, .{
+            if (!std.mem.eql(u8, mk.session_id, params.session_id)) continue;
+            sections.append(self.allocator, .{
                 .kind = .compaction_summary,
                 .role = .system,
                 .content = mk.summary_text,
@@ -199,11 +206,11 @@ pub const DefaultEngine = struct {
                 .tags = &.{},
                 .pinned = false,
                 .origin = "default-engine/summary",
-            });
+            }) catch return error.Internal;
         }
 
         // Emit the current prompt last (priority 0 so fit sees it first).
-        try sections.append(self.allocator, .{
+        sections.append(self.allocator, .{
             .kind = .current_prompt,
             .role = .user,
             .content = params.prompt,
@@ -212,9 +219,9 @@ pub const DefaultEngine = struct {
             .tags = &.{},
             .pinned = false,
             .origin = "default-engine/prompt",
-        });
+        }) catch return error.Internal;
 
-        const fit = try assemble.fit(self.allocator, sections.items, params.token_budget);
+        const fit = assemble.fit(self.allocator, sections.items, params.token_budget) catch return error.Internal;
         return .{
             .sections = fit.sections,
             .estimated_tokens = fit.estimated_tokens,
@@ -223,24 +230,89 @@ pub const DefaultEngine = struct {
         };
     }
 
-    fn afterTurn(_: *const Context, _: *anyopaque, _: t.AfterTurnParams) anyerror!void {
+    fn afterTurn(_: *const Context, _: *anyopaque, _: t.AfterTurnParams) PlugError!void {
         return;
     }
 
-    fn maintain(_: *const Context, _: *anyopaque, _: t.MaintainParams) anyerror!t.MaintainResult {
+    fn maintain(_: *const Context, _: *anyopaque, _: t.MaintainParams) PlugError!t.MaintainResult {
         return .{};
     }
 
-    fn compactFn(_: *const Context, _: *anyopaque, params: t.CompactParams) anyerror!t.CompactResult {
-        return .{
+    fn compactFn(ctx: *const Context, p: *anyopaque, params: t.CompactParams) PlugError!t.CompactResult {
+        const self = castSelf(p);
+        const tokens_before = params.current_token_count orelse visibleTokenCount(self, params.session_id);
+        if (!params.force and tokens_before <= params.token_budget) {
+            return .{
+                .compacted = false,
+                .tokens_before = tokens_before,
+                .reason = "within token budget",
+            };
+        }
+
+        const range = compactableRange(self, params.session_id) orelse return .{
             .compacted = false,
-            .tokens_before = params.current_token_count orelse 0,
-            .reason = "default engine: compact not wired yet",
+            .tokens_before = tokens_before,
+            .reason = "not enough compactable history",
+        };
+
+        const summary_text = buildSummary(self, params.session_id, range.start, range.end) catch return error.Internal;
+        defer self.allocator.free(summary_text);
+        const summary_entry_id = std.fmt.allocPrint(
+            self.allocator,
+            "summary:{s}:{s}",
+            .{ self.messages.items[range.start].message_id, self.messages.items[range.end].message_id },
+        ) catch return error.Internal;
+        defer self.allocator.free(summary_entry_id);
+
+        self.markers.append(.{
+            .session_id = params.session_id,
+            .range_start_id = self.messages.items[range.start].message_id,
+            .range_end_id = self.messages.items[range.end].message_id,
+            .summary_text = summary_text,
+            .summary_entry_id = summary_entry_id,
+            .created_at_ms = @intCast(@divTrunc(ctx.clock.nowNs(), std.time.ns_per_ms)),
+        }) catch return error.Internal;
+
+        const owned_summary_id = self.allocator.dupe(u8, summary_entry_id) catch return error.Internal;
+        return .{
+            .compacted = true,
+            .summary_entry_id = owned_summary_id,
+            .tokens_before = tokens_before,
+            .tokens_after = visibleTokenCount(self, params.session_id),
         };
     }
 
-    fn recall(_: *const Context, _: *anyopaque, _: t.RecallParams) anyerror!t.RecallResult {
-        return .{ .hits = &.{} };
+    fn recall(_: *const Context, p: *anyopaque, params: t.RecallParams) PlugError!t.RecallResult {
+        const self = castSelf(p);
+        if (params.k == 0 or params.query.len == 0) return .{ .hits = &.{} };
+
+        var hits: std.ArrayList(t.RecallHit) = .empty;
+        errdefer {
+            for (hits.items) |h| {
+                self.allocator.free(h.entry_id);
+                self.allocator.free(h.snippet);
+            }
+            hits.deinit(self.allocator);
+        }
+
+        for (self.messages.items) |m| {
+            if (hits.items.len >= params.k) break;
+            if (!std.mem.eql(u8, m.session_id, params.session_id)) continue;
+            if (self.markers.coversSession(params.session_id, m.message_id)) continue;
+            if (!containsIgnoreCase(m.content, params.query)) continue;
+
+            const entry_id = self.allocator.dupe(u8, m.message_id) catch return error.Internal;
+            errdefer self.allocator.free(entry_id);
+            const snippet = self.allocator.dupe(u8, snippetFor(m.content)) catch return error.Internal;
+            errdefer self.allocator.free(snippet);
+            hits.append(self.allocator, .{
+                .entry_id = entry_id,
+                .score = scoreFor(m.content, params.query),
+                .snippet = snippet,
+            }) catch return error.Internal;
+        }
+
+        return .{ .hits = hits.toOwnedSlice(self.allocator) catch return error.Internal };
     }
 
     fn dispose(_: *const Context, p: *anyopaque) void {
@@ -248,6 +320,89 @@ pub const DefaultEngine = struct {
         self.deinit();
     }
 };
+
+const MessageRange = struct { start: usize, end: usize };
+
+fn roleName(role: t.Role) []const u8 {
+    return switch (role) {
+        .system => "system",
+        .user => "user",
+        .assistant => "assistant",
+        .tool => "tool",
+    };
+}
+
+fn snippetFor(content: []const u8) []const u8 {
+    return content[0..@min(content.len, max_summary_content_bytes)];
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn scoreFor(content: []const u8, query: []const u8) f32 {
+    if (std.ascii.eqlIgnoreCase(content, query)) return 1.0;
+    if (std.mem.startsWith(u8, content, query)) return 0.9;
+    return 0.75;
+}
+
+fn visibleTokenCount(self: *DefaultEngine, session_id: []const u8) u32 {
+    var total: u32 = 0;
+    for (self.messages.items) |m| {
+        if (!std.mem.eql(u8, m.session_id, session_id)) continue;
+        if (self.markers.coversSession(session_id, m.message_id)) continue;
+        total +|= estimateTokens(m.content);
+    }
+    for (self.markers.all()) |mk| {
+        if (!std.mem.eql(u8, mk.session_id, session_id)) continue;
+        total +|= estimateTokens(mk.summary_text);
+    }
+    return total;
+}
+
+fn compactableRange(self: *DefaultEngine, session_id: []const u8) ?MessageRange {
+    var first: ?usize = null;
+    var eligible: usize = 0;
+    for (self.messages.items, 0..) |m, i| {
+        if (!std.mem.eql(u8, m.session_id, session_id)) continue;
+        if (m.is_heartbeat or self.markers.coversSession(session_id, m.message_id)) continue;
+        if (first == null) first = i;
+        eligible += 1;
+    }
+    if (eligible <= keep_recent_messages) return null;
+
+    const compact_count = eligible - keep_recent_messages;
+    var seen: usize = 0;
+    for (self.messages.items, 0..) |m, i| {
+        if (!std.mem.eql(u8, m.session_id, session_id)) continue;
+        if (m.is_heartbeat or self.markers.coversSession(session_id, m.message_id)) continue;
+        if (seen == compact_count) return .{ .start = first.?, .end = i };
+        seen += 1;
+    }
+    return null;
+}
+
+fn buildSummary(self: *DefaultEngine, session_id: []const u8, start: usize, end: usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    try out.appendSlice(self.allocator, "Compacted earlier turns:\n");
+    for (self.messages.items[start..end]) |m| {
+        if (!std.mem.eql(u8, m.session_id, session_id)) continue;
+        if (m.is_heartbeat or self.markers.coversSession(session_id, m.message_id)) continue;
+        try out.appendSlice(self.allocator, "- ");
+        try out.appendSlice(self.allocator, roleName(m.role));
+        try out.appendSlice(self.allocator, ": ");
+        try out.appendSlice(self.allocator, snippetFor(m.content));
+        try out.appendSlice(self.allocator, "\n");
+    }
+    return out.toOwnedSlice(self.allocator);
+}
 
 /// Rough token estimate: one token per four bytes, minimum 1.
 fn estimateTokens(s: []const u8) u32 {

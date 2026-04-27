@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const capabilities = @import("capabilities.zig");
-const errors = @import("errors.zig");
+const errors = @import("errors");
 const envelope = @import("envelope.zig");
 
 pub const Check = struct {

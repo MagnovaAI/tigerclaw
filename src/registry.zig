@@ -20,7 +20,7 @@
 
 const std = @import("std");
 const capabilities = @import("capabilities.zig");
-const errors = @import("errors.zig");
+const errors = @import("errors");
 
 const Capability = capabilities.Capability;
 const PlugError = errors.PlugError;

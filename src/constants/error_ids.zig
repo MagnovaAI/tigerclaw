@@ -9,7 +9,7 @@
 //! the test at the bottom.
 
 const std = @import("std");
-const errors = @import("../errors.zig");
+const errors = @import("errors");
 
 pub const invalid_argument = "invalid_argument";
 pub const not_found = "not_found";

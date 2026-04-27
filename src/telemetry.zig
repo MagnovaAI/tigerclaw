@@ -20,7 +20,7 @@
 //! Spec: docs/spec/agent-architecture-v3.yaml §infrastructure.telemetry
 
 const std = @import("std");
-const errors = @import("errors.zig");
+const errors = @import("errors");
 const context_mod = @import("context");
 
 const PlugError = errors.PlugError;

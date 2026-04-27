@@ -30,7 +30,7 @@ const manifest_mod = @import("manifest.zig");
 const dep_graph = @import("dep_graph.zig");
 const registry_mod = @import("registry.zig");
 const context_mod = @import("context");
-const errors = @import("errors.zig");
+const errors = @import("errors");
 
 const Capability = capabilities.Capability;
 const Manifest = manifest_mod.Manifest;

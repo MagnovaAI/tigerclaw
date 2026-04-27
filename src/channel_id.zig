@@ -15,7 +15,7 @@
 //! invariant in turn_flow.reply_routing.
 
 const std = @import("std");
-const errors = @import("errors.zig");
+const errors = @import("errors");
 
 const PlugError = errors.PlugError;
 

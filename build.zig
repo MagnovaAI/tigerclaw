@@ -93,6 +93,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const errors_mod = b.addModule("errors", .{
+        .root_source_file = b.path("src/errors.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const llm_provider_mod = b.addModule("llm_provider", .{
         .root_source_file = b.path("src/llm/provider.zig"),
         .target = target,
@@ -133,6 +139,7 @@ pub fn build(b: *std.Build) void {
     tigerclaw_mod.addImport("channels_spec", channels_spec_mod);
     tigerclaw_mod.addImport("memory_spec", memory_spec_mod);
     tigerclaw_mod.addImport("build_options", build_options_mod);
+    tigerclaw_mod.addImport("errors", errors_mod);
     // Core SQLite — instances, sessions, and the production
     // SessionStore all live in the same database. Linked
     // unconditionally because none of these features are optional
@@ -235,6 +242,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("llm_transport", llm_transport_mod);
     exe_mod.addImport("channels_spec", channels_spec_mod);
     exe_mod.addImport("memory_spec", memory_spec_mod);
+    exe_mod.addImport("errors", errors_mod);
     if (provider_anthropic_mod) |m| exe_mod.addImport("provider_anthropic", m);
     if (provider_openai_mod) |m| exe_mod.addImport("provider_openai", m);
     if (provider_bedrock_mod) |m| exe_mod.addImport("provider_bedrock", m);
@@ -384,6 +392,7 @@ pub fn build(b: *std.Build) void {
     unit_mod.addImport("llm_transport", llm_transport_mod);
     unit_mod.addImport("channels_spec", channels_spec_mod);
     unit_mod.addImport("memory_spec", memory_spec_mod);
+    unit_mod.addImport("errors", errors_mod);
     unit_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
     unit_mod.addImport("koino", koino_mod);
     if (provider_anthropic_mod) |m| unit_mod.addImport("provider_anthropic", m);
@@ -461,6 +470,7 @@ pub fn build(b: *std.Build) void {
     });
     ctx_engine_mod.addImport("context", context_mod);
     ctx_engine_mod.addImport("types.zig", ctx_types_mod);
+    ctx_engine_mod.addImport("errors", errors_mod);
 
     const ctx_engine_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/context_engine_vtable_test.zig"),
@@ -519,6 +529,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ctx_recall_mod.addImport("ctx_types", ctx_types_mod);
+    ctx_recall_mod.addImport("errors", errors_mod);
     const ctx_recall_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/context_recall_test.zig"),
         .target = target,
@@ -553,6 +564,7 @@ pub fn build(b: *std.Build) void {
     ctx_default_engine_mod.addImport("ctx_assemble", ctx_assemble_mod);
     ctx_default_engine_mod.addImport("ctx_compact", ctx_compact_mod);
     ctx_default_engine_mod.addImport("context", context_mod);
+    ctx_default_engine_mod.addImport("errors", errors_mod);
     // Default engine persists structured ContentBlocks alongside the
     // flat-text view, so it needs the wire `types` module.
     ctx_default_engine_mod.addImport("types", types_mod);

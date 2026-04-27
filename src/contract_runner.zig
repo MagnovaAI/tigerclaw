@@ -35,7 +35,7 @@
 const std = @import("std");
 const clock_mod = @import("clock");
 const context_mod = @import("context");
-const errors = @import("errors.zig");
+const errors = @import("errors");
 
 const Context = context_mod.Context;
 const PlugError = errors.PlugError;
