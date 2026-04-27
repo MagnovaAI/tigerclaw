@@ -32,7 +32,7 @@
 
 const std = @import("std");
 const envelope_mod = @import("envelope.zig");
-const errors = @import("errors.zig");
+const errors = @import("errors");
 
 const Envelope = envelope_mod.Envelope;
 const Verb = envelope_mod.Verb;

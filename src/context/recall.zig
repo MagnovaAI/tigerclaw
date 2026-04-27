@@ -1,5 +1,6 @@
 const std = @import("std");
 const t = @import("ctx_types");
+const PlugError = @import("errors").PlugError;
 
 /// Type-erased memory-index interface. Impls (e.g. memory-tigerclaw) set
 /// `ptr` to their state struct and `query_fn` to a static function that
@@ -11,7 +12,7 @@ pub const MemoryIndex = struct {
         allocator: std.mem.Allocator,
         query: []const u8,
         k: u8,
-    ) anyerror![]t.RecallHit,
+    ) PlugError![]t.RecallHit,
 };
 
 /// Dispatch a recall query to `idx`. Returned slice is caller-owned,
@@ -21,6 +22,6 @@ pub fn query(
     idx: MemoryIndex,
     q: []const u8,
     k: u8,
-) anyerror![]t.RecallHit {
+) PlugError![]t.RecallHit {
     return idx.query_fn(idx.ptr, allocator, q, k);
 }

@@ -27,7 +27,7 @@
 //! Spec: docs/spec/agent-architecture-v3.yaml §infrastructure.meter
 
 const std = @import("std");
-const errors = @import("errors.zig");
+const errors = @import("errors");
 
 const PlugError = errors.PlugError;
 

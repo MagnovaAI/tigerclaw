@@ -13,7 +13,7 @@
 const std = @import("std");
 const codec = @import("envelope_codec.zig");
 const envelope_mod = @import("envelope.zig");
-const errors = @import("errors.zig");
+const errors = @import("errors");
 
 const Envelope = envelope_mod.Envelope;
 const PlugError = errors.PlugError;

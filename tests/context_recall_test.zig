@@ -6,11 +6,11 @@ const FakeIndex = struct {
     last_k: u8 = 0,
     last_query: []const u8 = "",
 
-    fn queryImpl(self_ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, k: u8) anyerror![]t.RecallHit {
+    fn queryImpl(self_ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, k: u8) error{Internal}![]t.RecallHit {
         const self: *FakeIndex = @ptrCast(@alignCast(self_ptr));
         self.last_k = k;
         self.last_query = query;
-        const hits = try allocator.alloc(t.RecallHit, 1);
+        const hits = allocator.alloc(t.RecallHit, 1) catch return error.Internal;
         hits[0] = .{ .entry_id = "e1", .score = 0.9, .snippet = "hello" };
         return hits;
     }
@@ -35,8 +35,8 @@ test "recall dispatches to memory index" {
 
 test "recall propagates index errors" {
     const FailIndex = struct {
-        fn failQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u8) anyerror![]t.RecallHit {
-            return error.IndexUnavailable;
+        fn failQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u8) error{Unavailable}![]t.RecallHit {
+            return error.Unavailable;
         }
     };
     const allocator = std.testing.allocator;
@@ -45,5 +45,5 @@ test "recall propagates index errors" {
         .ptr = &fake,
         .query_fn = FailIndex.failQuery,
     };
-    try std.testing.expectError(error.IndexUnavailable, recall.query(allocator, idx, "q", 1));
+    try std.testing.expectError(error.Unavailable, recall.query(allocator, idx, "q", 1));
 }
