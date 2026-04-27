@@ -21,6 +21,8 @@ const tui = @import("../root.zig");
 const tool_preview = @import("../tool_preview.zig");
 const md = @import("../md.zig");
 const harness = @import("../../harness/root.zig");
+const llm_model_context = @import("../../llm/model_context.zig");
+const gateway_probe = @import("../../gateway/probe.zig");
 const Header = @import("header.zig");
 const History = @import("history.zig");
 const Input = @import("input.zig");
@@ -53,6 +55,10 @@ status_bar: StatusBar = .{},
 /// Wall-clock instant the current turn started, in ms since
 /// the Unix epoch. 0 when no turn is in flight.
 turn_started_ms: i64 = 0,
+/// Monotonic counter — bumped at each `beginTurn`. Stamped on
+/// every tool line so the renderer can group siblings into a
+/// single `├─` / `└─` tree per turn.
+current_turn_id: u32 = 0,
 /// Borrowed runner. Set by \`attachRunner\` before \`App.run\`;
 /// null during tests that don't spin up a real runner.
 runner: ?*harness.AgentRunner = null,
@@ -136,6 +142,12 @@ pub const InitOptions = struct {
     io: ?std.Io = null,
 };
 
+/// Wrapper around the shared `llm.model_context.maxContext` lookup
+/// so the status bar and the runner agree on the per-model window.
+fn modelMaxContext(model_line: []const u8) u64 {
+    return llm_model_context.maxContext(model_line);
+}
+
 pub fn init(allocator: std.mem.Allocator, opts: InitOptions) Root {
     return .{
         .allocator = allocator,
@@ -150,10 +162,13 @@ pub fn init(allocator: std.mem.Allocator, opts: InitOptions) Root {
         .workspace_dir = opts.workspace,
         .io = opts.io,
         .status_bar = .{
-            .workspace = if (opts.workspace.len == 0) "~" else opts.workspace,
-            .sandbox = "unlocked",
+            .agent_name = opts.agent_name,
             .model = opts.model_line,
-            .sandbox_caution = false,
+            .ctx_used = 0,
+            .ctx_max = modelMaxContext(opts.model_line),
+            .gateway_on = false,
+            .sandbox_locked = false,
+            .sandbox_path = "",
         },
     };
 }
@@ -163,6 +178,14 @@ pub fn init(allocator: std.mem.Allocator, opts: InitOptions) Root {
 pub fn attachRunner(self: *Root, runner: *harness.AgentRunner, app: *vxfw.App) void {
     self.runner = runner;
     self.app = app;
+}
+
+/// Tell the status bar whether a gateway daemon is reachable.
+/// The TUI itself runs the runner in-process and doesn't depend
+/// on the gateway, but operators want to see at a glance whether
+/// the daemon is up so they know remote agents can register.
+pub fn setGatewayOn(self: *Root, on: bool) void {
+    self.status_bar.gateway_on = on;
 }
 
 /// Wire the runner-side bridges for sandbox + ask gate.
@@ -378,12 +401,8 @@ fn setSandboxMode(self: *Root, mode: SandboxMode, path: []const u8) void {
     else
         &.{};
 
-    self.status_bar.sandbox = switch (mode) {
-        .unlocked => "unlocked",
-        .locked => "locked",
-        .plan => "plan",
-    };
-    self.status_bar.sandbox_caution = mode != .unlocked;
+    self.status_bar.sandbox_locked = mode != .unlocked;
+    self.status_bar.sandbox_path = self.sandbox_path;
 
     if (self.sandbox_setter) |setter| {
         if (self.sandbox_ctx) |ctx| setter(ctx, @intFromEnum(mode), self.sandbox_path);
@@ -591,12 +610,14 @@ pub const ue_error = "tui.error";
 pub const ue_tick = "tui.tick";
 pub const ue_ask_user = "tui.ask_user";
 pub const ue_ask_user_cancel = "tui.ask_user_cancel";
+pub const ue_usage = "tui.usage";
 
 pub const ChunkPayload = struct { text: []u8 };
 pub const AskUserPayload = struct { question: []u8 };
 pub const ToolStartPayload = struct { id: []u8, name: []u8, args_summary: []u8 };
 pub const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8, is_error: bool };
 pub const ErrorPayload = struct { message: []u8 };
+pub const UsagePayload = struct { ctx_used: u64 };
 
 /// Context the worker thread carries. Allocated on heap;
 /// worker frees on exit.
@@ -633,6 +654,7 @@ fn beginTurn(self: *Root, typed: []const u8) !void {
     self.thinking.verb_index = @intCast(@mod(vxfw.milliTimestamp(), 0xFF));
     self.thinking.elapsed_ms = 0;
     self.turn_started_ms = vxfw.milliTimestamp();
+    self.current_turn_id +%= 1;
 
     // Note: we do NOT kick the tick chain via `app.loop.postEvent(.tick)`
     // here — App.run holds the queue mutex while iterating drained events,
@@ -685,8 +707,14 @@ fn workerMain(ctx: *WorkerCtx) void {
         postDone(ctx);
         return;
     };
-    _ = result;
+    postUsage(ctx, result.usage.contextTokens());
     postDone(ctx);
+}
+
+fn postUsage(ctx: *WorkerCtx, ctx_used: u64) void {
+    const payload = ctx.allocator.create(UsagePayload) catch return;
+    payload.* = .{ .ctx_used = ctx_used };
+    postUserEvent(ctx, ue_usage, payload);
 }
 
 // Runner sinks — run on the worker thread. Each one heap-
@@ -977,6 +1005,12 @@ fn eventHandler(
             // Kick off the spinner tick loop so the header
             // spinner animates while a turn is pending.
             try ctx.tick(80, self.widget());
+            // Initial gateway probe so the status bar reads
+            // truth at boot. Subsequent probes piggy-back on
+            // turn completions — see `ue_done`. Skipped when
+            // `io` is null (test mode); the bar then stays
+            // `gateway: off` which is the correct default.
+            if (self.io) |io| self.setGatewayOn(gateway_probe.probeDefault(io));
             ctx.redraw = true;
         },
         .tick => {
@@ -1071,6 +1105,10 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
                 if (entry.tool_full) |s| self.allocator.free(s);
                 entry.tool_summary = null;
                 entry.tool_full = null;
+                entry.tool_turn_id = self.current_turn_id;
+                entry.tool_is_last_in_turn = false;
+                entry.tool_started_ms = vxfw.milliTimestamp();
+                entry.tool_duration_ms = 0;
                 try renderToolLine(self.allocator, entry);
                 ctx.redraw = true;
                 return;
@@ -1097,7 +1135,12 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
             .tool_id = id_owned,
             .tool_name = name_owned,
             .tool_args = args_owned,
+            .tool_turn_id = self.current_turn_id,
+            .tool_started_ms = vxfw.milliTimestamp(),
         });
+        // Earlier tool lines from the same turn need to re-render
+        // with `├─` instead of `└─` now that a new sibling exists.
+        try rerenderTurnTools(self, self.current_turn_id);
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_tool_done)) {
         const p: *const ToolDonePayload = @ptrCast(@alignCast(ue.data.?));
@@ -1130,6 +1173,10 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
                     entry.tool_status = if (p.is_error) .err else .ok;
                     if (entry.tool_name == null) {
                         entry.tool_name = try self.allocator.dupe(u8, p.name);
+                    }
+                    if (entry.tool_started_ms != 0) {
+                        const elapsed = vxfw.milliTimestamp() - entry.tool_started_ms;
+                        entry.tool_duration_ms = if (elapsed < 0) 0 else @intCast(elapsed);
                     }
                     try renderToolLine(self.allocator, entry);
                     entry.deinitToolId(self.allocator);
@@ -1164,6 +1211,13 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         self.endPendingReply();
         self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
         ctx.redraw = true;
+    } else if (std.mem.eql(u8, ue.name, ue_usage)) {
+        const p: *const UsagePayload = @ptrCast(@alignCast(ue.data.?));
+        defer self.allocator.destroy(@as(*UsagePayload, @constCast(p)));
+        if (p.ctx_used > 0) {
+            self.status_bar.ctx_used = p.ctx_used;
+            ctx.redraw = true;
+        }
     } else if (std.mem.eql(u8, ue.name, ue_error)) {
         const p: *const ErrorPayload = @ptrCast(@alignCast(ue.data.?));
         const message_slice = p.message;
@@ -1184,6 +1238,12 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         // sees consistent partials and the user sees a styled
         // final.
         renderAgentMarkdown(self) catch {};
+        markLastToolInTurn(self, self.current_turn_id) catch {};
+        // Refresh gateway status. A daemon may have come up or
+        // gone down between turns; re-probe cheaply so the bar
+        // doesn't lie. The probe is a single TCP connect with a
+        // tight timeout — negligible overhead.
+        if (self.io) |io| self.setGatewayOn(gateway_probe.probeDefault(io));
 
         // No placeholder to drop — the chunk handler creates the
         // agent line lazily, so an empty turn leaves no empty
@@ -1464,30 +1524,184 @@ fn summarizeToolOutput(output: []const u8) []const u8 {
 fn renderToolLine(allocator: std.mem.Allocator, entry: *tui.Line) !void {
     const name = entry.tool_name orelse return;
     entry.text.clearRetainingCapacity();
+    entry.deinitSpans(allocator);
     try renderToolHeader(allocator, &entry.text, name, entry.tool_args orelse "");
+
+    // Indent for continuation rows: 3 cols to clear the limb +
+    // bullet (`├─ ● ` is 5 cols but we only paint under the
+    // bullet; the limb scaffolding flows from the parent into
+    // the next sibling, not down into this row's body).
+    const child_indent = "   \u{2514}\u{2500} ";
 
     const has_full = if (entry.tool_full) |f| f.len > 0 else false;
     if (!has_full) return;
 
     if (entry.tool_expanded) {
-        // Expanded: every output line gets the `└` continuation.
+        // Expanded: every output line gets the same continuation
+        // glyph, so the body reads as a sibling list under the
+        // tool header. Duration is shown as the last child below.
         const trimmed = std.mem.trimEnd(u8, entry.tool_full.?, "\n");
-        if (trimmed.len == 0) return;
-        try entry.text.append(allocator, '\n');
-        var iter = std.mem.splitScalar(u8, trimmed, '\n');
-        var first = true;
-        while (iter.next()) |body_line| {
-            if (!first) try entry.text.append(allocator, '\n');
-            first = false;
-            try entry.text.appendSlice(allocator, "  \u{2514} ");
-            try entry.text.appendSlice(allocator, body_line);
+        if (trimmed.len > 0) {
+            var iter = std.mem.splitScalar(u8, trimmed, '\n');
+            while (iter.next()) |body_line| {
+                try entry.text.append(allocator, '\n');
+                try entry.text.appendSlice(allocator, child_indent);
+                try entry.text.appendSlice(allocator, body_line);
+            }
         }
     } else if (entry.tool_summary) |s| {
-        // Collapsed: one line, the summary.
-        if (s.len == 0) return;
-        try entry.text.append(allocator, '\n');
-        try entry.text.appendSlice(allocator, "  \u{2514} ");
-        try entry.text.appendSlice(allocator, s);
+        // Collapsed: one summary line, the most recent output's
+        // first non-empty row. The duration sits beneath the
+        // summary so the eye can read result→timing top-to-bottom.
+        if (s.len > 0) {
+            try entry.text.append(allocator, '\n');
+            try entry.text.appendSlice(allocator, child_indent);
+            try entry.text.appendSlice(allocator, s);
+        }
+    }
+
+    // Duration row trails the body in both states. Skipped when
+    // the dispatch hasn't reported a duration yet (still running
+    // or never finished).
+    if (entry.tool_duration_ms > 0) {
+        var dbuf: [48]u8 = undefined;
+        const verb: []const u8 = switch (entry.tool_status) {
+            .running => "Running",
+            .ok => "Completed",
+            .err => "Failed",
+        };
+        const dur = formatDuration(&dbuf, entry.tool_duration_ms, verb) catch "";
+        if (dur.len > 0) {
+            try entry.text.append(allocator, '\n');
+            try entry.text.appendSlice(allocator, child_indent);
+            try entry.text.appendSlice(allocator, dur);
+        }
+    }
+
+    // Diff coloring: when expanded and the body looks like a
+    // unified diff, attach per-line spans so add/remove/hunk rows
+    // paint in green/red/amber. The detector keys off the raw
+    // body (`tool_full`); spans index into the rendered text by
+    // walking it line by line and skipping the `child_indent`
+    // prefix on each row.
+    if (entry.tool_expanded) {
+        if (entry.tool_full) |body| {
+            if (looksLikeDiff(body)) {
+                entry.spans = try buildDiffSpansForRendered(allocator, entry.text.items, child_indent);
+            }
+        }
+    }
+}
+
+/// Walk rendered tool-line text and emit a span per indented diff
+/// line. Spans cover the body bytes only (skipping the limb +
+/// indent prefix) so the painter colors just the diff content.
+fn buildDiffSpansForRendered(
+    allocator: std.mem.Allocator,
+    rendered: []const u8,
+    indent: []const u8,
+) ![]md.Span {
+    var spans: std.ArrayList(md.Span) = .empty;
+    errdefer spans.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < rendered.len) {
+        const line_start = i;
+        while (i < rendered.len and rendered[i] != '\n') i += 1;
+        const line_end = i;
+
+        // Only color rows that are body continuations — i.e. lines
+        // starting with our indent prefix. Skips the header row
+        // and any non-indented duration row.
+        if (line_end > line_start and std.mem.startsWith(u8, rendered[line_start..line_end], indent)) {
+            const content_start = line_start + indent.len;
+            if (content_start < line_end) {
+                const c = rendered[content_start];
+                const kind: ?md.StyleKind = switch (c) {
+                    '+' => .diff_add,
+                    '-' => .diff_del,
+                    '@' => if (line_end - content_start >= 2 and rendered[content_start + 1] == '@') @as(md.StyleKind, .diff_hunk) else null,
+                    else => null,
+                };
+                if (kind) |k| {
+                    try spans.append(allocator, .{
+                        .start = @intCast(content_start),
+                        .len = @intCast(line_end - content_start),
+                        .style = k,
+                    });
+                }
+            }
+        }
+
+        if (i < rendered.len) i += 1;
+    }
+
+    return spans.toOwnedSlice(allocator);
+}
+
+/// True when `text` looks like a unified diff: at least one `@@ `
+/// hunk header AND at least one line starting with `+` or `-`
+/// that isn't part of `+++`/`---` file headers (those count too
+/// — but the hunk marker is the cheap discriminator).
+fn looksLikeDiff(text: []const u8) bool {
+    if (std.mem.indexOf(u8, text, "\n@@ ") == null and !std.mem.startsWith(u8, text, "@@ ")) return false;
+    var iter = std.mem.splitScalar(u8, text, '\n');
+    while (iter.next()) |line| {
+        if (line.len == 0) continue;
+        if (line[0] == '+' or line[0] == '-') return true;
+    }
+    return false;
+}
+
+/// `1234ms` → `Completed in 1.2s`. Sub-second stays as ms; over
+/// 60s rolls to `1m 23s`. Caller owns the slice — buffer-backed.
+fn formatDuration(buf: []u8, ms: u64, verb: []const u8) ![]const u8 {
+    if (ms < 1000) {
+        return std.fmt.bufPrint(buf, "{s} in {d}ms", .{ verb, ms });
+    }
+    if (ms < 60_000) {
+        const s = @as(f64, @floatFromInt(ms)) / 1000.0;
+        return std.fmt.bufPrint(buf, "{s} in {d:.1}s", .{ verb, s });
+    }
+    const mins = ms / 60_000;
+    const rem_s = (ms % 60_000) / 1000;
+    return std.fmt.bufPrint(buf, "{s} in {d}m {d}s", .{ verb, mins, rem_s });
+}
+
+/// Re-render every tool row of `turn_id` so the limb glyph
+/// reflects the current sibling layout (`├─` mid, `└─` last).
+/// Called when a new tool joins a turn or when the turn finishes.
+fn rerenderTurnTools(self: *Root, turn_id: u32) !void {
+    if (turn_id == 0) return;
+    var i: usize = 0;
+    while (i < self.history.items.len) : (i += 1) {
+        const entry = &self.history.items[i];
+        if (entry.role != .tool) continue;
+        if (entry.tool_name == null) continue;
+        if (entry.tool_turn_id != turn_id) continue;
+        try renderToolLine(self.allocator, entry);
+    }
+}
+
+/// Walk the history once to find the last tool row of `turn_id`,
+/// flag it `is_last_in_turn`, and re-render every tool of that
+/// turn so limbs render as a clean `├─…├─…└─` chain.
+fn markLastToolInTurn(self: *Root, turn_id: u32) !void {
+    if (turn_id == 0) return;
+    var last_idx: ?usize = null;
+    var i: usize = self.history.items.len;
+    while (i > 0) {
+        i -= 1;
+        const entry = &self.history.items[i];
+        if (entry.role != .tool) continue;
+        if (entry.tool_name == null) continue;
+        if (entry.tool_turn_id != turn_id) continue;
+        last_idx = i;
+        break;
+    }
+    if (last_idx) |idx| {
+        self.history.items[idx].tool_is_last_in_turn = true;
+        try rerenderTurnTools(self, turn_id);
     }
 }
 

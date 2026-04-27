@@ -11,6 +11,14 @@ pub const TokenUsage = struct {
     pub fn total(self: TokenUsage) u64 {
         return @as(u64, self.input) +| self.output +| self.cache_read +| self.cache_write;
     }
+
+    /// Tokens occupying the provider's context window on the most
+    /// recent call: prompt tokens (`input`) plus tokens read from
+    /// or written to the prompt cache. Excludes `output` because
+    /// those are produced after the window is sized.
+    pub fn contextTokens(self: TokenUsage) u64 {
+        return @as(u64, self.input) +| self.cache_read +| self.cache_write;
+    }
 };
 
 // --- tests -----------------------------------------------------------------

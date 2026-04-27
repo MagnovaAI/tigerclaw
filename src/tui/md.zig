@@ -26,6 +26,15 @@ pub const StyleKind = enum {
     link,
     heading,
     block_quote,
+    /// Unified-diff additions (`+` lines and `+++` file header).
+    /// Painted in the tool-bullet green so add/remove read at a
+    /// glance against the dim tool body color.
+    diff_add,
+    /// Unified-diff removals (`-` lines and `---` file header).
+    diff_del,
+    /// Unified-diff hunk markers (`@@ -a,b +c,d @@`). Painted in
+    /// the heading amber so they don't compete with body content.
+    diff_hunk,
 };
 
 /// A byte range within the rendered output that should be painted

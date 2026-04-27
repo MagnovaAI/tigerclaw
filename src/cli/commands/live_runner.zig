@@ -528,6 +528,10 @@ pub const LiveAgentRunner = struct {
         // Assemble the context window. The default engine also emits
         // a `current_prompt` section for `prompt`; we drop it during
         // conversion because the user message is already in history.
+        // Budget is sized off the model's known context window minus
+        // a reserve for the output — see `llm.model_context` — so a
+        // 1M-window Opus session does not get clipped to a 64k slice
+        // and a long Haiku session does not push past the 200k limit.
         const assembled = self.context_engine.engine().vtable.assemble(
             &context_bundle,
             self.context_engine.engine().ptr,
@@ -536,7 +540,7 @@ pub const LiveAgentRunner = struct {
                 .prompt = req.input,
                 .model = self.model,
                 .available_tools = &.{},
-                .token_budget = 64 * 1024,
+                .token_budget = llm.model_context.promptBudget(self.model),
             },
         ) catch return error.InternalError;
         defer self.context_engine.freeAssembleResult(assembled);
@@ -581,6 +585,11 @@ pub const LiveAgentRunner = struct {
         var final_text: []u8 = &.{};
         errdefer self.allocator.free(final_text);
         var last_stop: types.StopReason = .end_turn;
+        // Track the most recent provider call's token usage. Each
+        // round resends the cumulative prompt + tool results, so
+        // the last round's `input + cache_*` reflects the live
+        // context-window footprint after this turn.
+        var last_usage: types.TokenUsage = .{};
 
         while (true) : (round += 1) {
             const chat_req: llm.provider.ChatRequest = .{
@@ -629,6 +638,7 @@ pub const LiveAgentRunner = struct {
             };
             defer resp.deinit(self.allocator);
             last_stop = resp.stop_reason;
+            last_usage = resp.usage;
 
             const text = resp.text orelse "";
 
@@ -931,7 +941,11 @@ pub const LiveAgentRunner = struct {
         }
 
         self.last_output = final_text;
-        return .{ .output = self.last_output, .completed = last_stop != .refusal };
+        return .{
+            .output = self.last_output,
+            .completed = last_stop != .refusal,
+            .usage = last_usage,
+        };
     }
 
     /// Allocate a unique message id of the form `"msg-<counter>"`.

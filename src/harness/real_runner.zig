@@ -246,6 +246,7 @@ pub const RealRunner = struct {
         return .{
             .output = final,
             .completed = out.reason == .model_finished,
+            .usage = out.usage,
         };
     }
 

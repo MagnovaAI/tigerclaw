@@ -256,17 +256,18 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
         }
 
         const base_style = styleFor(line.role);
-        const prefix = prefixFor(line);
-        const prefix_style = prefixStyleFor(line);
-        const prefix_cols = measureCols(prefix);
+        const parts = splitPrefix(line);
+        const prefix_cols = measureCols(parts.limb) + measureCols(parts.bullet);
 
         // First physical row of the line gets the speaker glyph.
         // Continuation rows indent under it so wrapped text aligns
-        // visually with the body of the first row. The prefix gets
-        // its own style so tool rows can paint a status bullet
-        // (green/red/white) without dragging the body color along.
+        // visually with the body of the first row. Limb is dimmed
+        // (it's structural scaffolding); the bullet picks up the
+        // status color so tool rows can show green/red/white.
         if (r.is_first) {
-            writeGraphemes(ctx, surface, 0, screen_row, prefix, prefix_style);
+            writeGraphemes(ctx, surface, 0, screen_row, parts.limb, tui.palette.tool);
+            const bullet_col: u16 = @intCast(measureCols(parts.limb));
+            writeGraphemes(ctx, surface, bullet_col, screen_row, parts.bullet, prefixStyleFor(line));
         }
 
         const body = line.text.items[r.bytes_offset..][0..r.bytes_len];
@@ -442,12 +443,29 @@ fn prefixFor(line: *const tui.Line) []const u8 {
         .user => "› ",
         .agent => "⏺ ",
         .system => "∙ ",
-        // Same `●` glyph as the agent (`⏺` is the agent's
-        // record-button variant). Tool rows separate visually
-        // from agent prose via the status color (white / green /
-        // red), not size — the user wanted the bigger dot.
-        .tool => if (line.tool_name != null) "● " else "⎿ ",
+        // Tool rows: the visible prefix is the tree limb plus the
+        // status-colored bullet. Limb selection drives sibling
+        // grouping — `├─` for mid, `└─` for last (or unfinished —
+        // we only know "last" once the turn ends). `tool_name`
+        // null means this is a tool-result continuation row, not
+        // a header — those get the legacy fallback glyph.
+        .tool => if (line.tool_name != null)
+            (if (line.tool_is_last_in_turn) "└─ ● " else "├─ ● ")
+        else
+            "⎿ ",
     };
+}
+
+/// Split a tool row's prefix into its limb (`├─ ` / `└─ `) and
+/// bullet (`● `) so the two can be painted with different styles.
+/// For non-tool rows or continuation rows the limb is empty and
+/// the whole prefix is the bullet, matching the legacy behavior.
+fn splitPrefix(line: *const tui.Line) struct { limb: []const u8, bullet: []const u8 } {
+    if (line.role == .tool and line.tool_name != null) {
+        const limb: []const u8 = if (line.tool_is_last_in_turn) "└─ " else "├─ ";
+        return .{ .limb = limb, .bullet = "● " };
+    }
+    return .{ .limb = "", .bullet = prefixFor(line) };
 }
 
 fn styleFor(role: tui.Line.Role) vaxis.Style {

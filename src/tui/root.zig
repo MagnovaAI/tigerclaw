@@ -145,6 +145,20 @@ pub const Line = struct {
     /// is the user's action, not a tool failure, and we already
     /// surface "[cancelled by user]" as the summary.
     tool_status: ToolStatus = .running,
+    /// Turn this tool was dispatched in. Sibling tool lines in the
+    /// same turn render as a connected tree (`├─` / `└─` prefixes);
+    /// the last tool line in a turn switches to the `└─` glyph
+    /// once the turn finishes via `markLastToolInTurn`.
+    tool_turn_id: u32 = 0,
+    /// True once the turn this tool belongs to has ended *and* this
+    /// is the tail tool of that turn. Drives `└─` vs `├─` selection.
+    tool_is_last_in_turn: bool = false,
+    /// Wall-clock time the tool dispatch began (ms since vaxis epoch).
+    /// Used to compute `tool_duration_ms` on done.
+    tool_started_ms: i64 = 0,
+    /// Duration of the dispatch in milliseconds. Zero pre-finish; set
+    /// on `turn_tool_done`. Rendered as `Completed in 1.0s`.
+    tool_duration_ms: u64 = 0,
 
     pub const ToolStatus = enum { running, ok, err };
 
@@ -296,6 +310,12 @@ pub const palette = struct {
                 s.bold = true;
             },
             .block_quote => s.fg = smoke,
+            .diff_add => s.fg = .{ .rgb = .{ 0x4A, 0xC8, 0x76 } },
+            .diff_del => s.fg = .{ .rgb = .{ 0xD9, 0x4F, 0x4F } },
+            .diff_hunk => {
+                s.fg = heading;
+                s.bold = true;
+            },
         }
         return s;
     }

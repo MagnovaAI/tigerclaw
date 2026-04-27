@@ -16,6 +16,7 @@
 //! session state; the vtable only describes the turn surface.
 
 const std = @import("std");
+const types = @import("types");
 
 // --- in-flight counter -----------------------------------------------------
 
@@ -258,6 +259,10 @@ pub const TurnResult = struct {
     output: []const u8,
     /// True when the turn completed without being cancelled.
     completed: bool,
+    /// Provider-reported token usage for this turn. Defaults to all
+    /// zeros; impls that don't surface usage (mock, echo) leave it
+    /// untouched and the consumer treats that as "unknown".
+    usage: types.TokenUsage = .{},
 };
 
 pub const TurnError = error{

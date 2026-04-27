@@ -13,6 +13,7 @@ pub const transport = @import("llm_transport");
 pub const routing = @import("routing/root.zig");
 pub const reliability = @import("reliability/root.zig");
 pub const factory = @import("factory.zig");
+pub const model_context = @import("model_context.zig");
 
 pub const Provider = provider.Provider;
 pub const ChatRequest = provider.ChatRequest;
