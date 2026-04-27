@@ -26,7 +26,8 @@
 //!      reason == .model_finished }`.
 //!
 //! Streaming sinks on `TurnRequest` are ignored in v1; end-of-turn
-//! delivery only. The TODO in `react.zig` is the future hook.
+//! delivery only. Per-fragment delivery is tracked by
+//! docs/adr/0004-sse-wire-format.md.
 
 const std = @import("std");
 
@@ -147,10 +148,10 @@ pub const RealRunner = struct {
 
     fn cancelFn(ctx: *anyopaque, turn_id: agent_runner.TurnId) void {
         const self: *RealRunner = @ptrCast(@alignCast(ctx));
-        // turn_id is ignored until streaming lands (see the TODO in
-        // react.zig). Cancelling whatever turn is currently running
-        // is the only meaningful semantics for the v1 blocking
-        // surface.
+        // turn_id is ignored until streaming lands; see
+        // docs/adr/0004-sse-wire-format.md. Cancelling whatever turn
+        // is currently running is the only meaningful semantics for
+        // the v1 blocking surface.
         _ = turn_id;
         self.interrupt.request();
     }
@@ -223,8 +224,9 @@ pub const RealRunner = struct {
 
         // Streaming sinks are surfaced in v1 only at end-of-turn:
         // emit the final text once if a stream sink is wired.
-        // TODO: per-fragment streaming hook lives in react.zig and
-        // lands with the streaming-aware runner.
+        // ADR docs/adr/0004-sse-wire-format.md: per-fragment
+        // streaming hook lives in react.zig and lands with the
+        // streaming-aware runner.
         if (req.stream_sink) |sink| {
             if (final.len > 0) sink(req.stream_sink_ctx, final);
         }

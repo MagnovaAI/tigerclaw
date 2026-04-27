@@ -179,7 +179,6 @@ fn drawWide(self: *const Header, ctx: vxfw.DrawContext, surface: vxfw.Surface, w
         writeGraphemes(ctx, surface, col, info_row, self.agent_name, agent_accent_style);
     }
 
-
     // Divider on the final row.
     drawDivider(surface, width, wide_rows - 1);
 }
@@ -211,7 +210,6 @@ fn drawCompact(self: *const Header, ctx: vxfw.DrawContext, surface: vxfw.Surface
         writeGraphemes(ctx, surface, info_col, 0, version_line, title_style);
 
         writeGraphemes(ctx, surface, info_col, 1, self.agent_name, agent_accent_style);
-
     }
 
     drawDivider(surface, width, compact_rows - 1);

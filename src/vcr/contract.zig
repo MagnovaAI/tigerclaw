@@ -49,7 +49,7 @@ pub const ContractDecision = union(enum) {
     skip: void,
     /// Caller is in record/live mode AND has an API key — but the
     /// live HTTP wiring is not implemented yet, so the actual record
-    /// step is deferred. Tests treat this as a skip with a TODO note.
+    /// step is deferred. Tests treat this as a skip with a pending-recording note.
     record_pending: void,
 };
 

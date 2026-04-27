@@ -35,7 +35,7 @@ const TAGLINES = [_][]const u8{
     "🐯 *stretches* Alright, where are we pouncing today?",
     "Stripes on. Claws out. What's the target?",
     "Padding into your shell on silent paws. You won't hear a thing until it's done.",
-    "I saw that TODO. It's prey now.",
+    "I saw that rough edge. It's on the list.",
     "Your jungle's a mess. Good thing I live for this.",
     "Pouncing on boilerplate since you opened the terminal.",
     "The logs are my waterhole. I drink deep, I see all.",

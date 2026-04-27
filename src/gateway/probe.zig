@@ -28,7 +28,7 @@ pub const default_port: u16 = 8765;
 /// because Zig 0.16 net is `Io`-scoped.
 ///
 /// Note: the stdlib's POSIX `netConnectIp` does not yet honour
-/// `timeout` (it panics with "TODO" when set), so we leave the
+/// `timeout` (it panics on the unimplemented path), so we leave the
 /// timeout `.none`. Localhost connect fails immediately on
 /// `ECONNREFUSED`; remote-host probing isn't a use case here.
 pub fn probe(io: std.Io, host: []const u8, port: u16) bool {
