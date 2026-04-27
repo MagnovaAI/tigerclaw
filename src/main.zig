@@ -345,7 +345,7 @@ pub fn main(init: std.process.Init) !u8 {
             };
         },
         .diag => |sub| {
-            // Resolve $HOME → ~/.tigerclaw/state/diagnostics.jsonl and
+            // Resolve $HOME → the default instance diagnostics file and
             // inject it as the path override. We do the path build in
             // main so the diag command itself stays a pure reader with
             // no environment coupling — which also makes it trivially
@@ -355,7 +355,7 @@ pub fn main(init: std.process.Init) !u8 {
             const home = init.environ_map.get("HOME") orelse "";
             const default_path = try std.fmt.bufPrint(
                 &path_buf,
-                "{s}/.tigerclaw/state/diagnostics.jsonl",
+                "{s}/.tigerclaw/instances/default/sessions/default/diagnostics.jsonl",
                 .{home},
             );
             switch (resolved) {
@@ -394,7 +394,7 @@ pub fn main(init: std.process.Init) !u8 {
         .gateway => |opts| {
             const home = init.environ_map.get("HOME") orelse "";
             var state_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const state_path = try std.fmt.bufPrint(&state_buf, "{s}/.tigerclaw/state", .{home});
+            const state_path = try std.fmt.bufPrint(&state_buf, "{s}/.tigerclaw/instances/default", .{home});
 
             // Resolve the current working directory so `<cwd>/.tigerclaw/`
             // can override the global `<home>/.tigerclaw/`. A failure to
@@ -429,7 +429,7 @@ pub fn main(init: std.process.Init) !u8 {
             const home = init.environ_map.get("HOME") orelse "";
             const state_path = try std.fmt.bufPrint(
                 &state_buf,
-                "{s}/.tigerclaw/state",
+                "{s}/.tigerclaw/instances/default",
                 .{home},
             );
             cli.commands.gateway.runStop(io, .{
@@ -470,7 +470,7 @@ pub fn main(init: std.process.Init) !u8 {
             const home = init.environ_map.get("HOME") orelse "";
             const path = try std.fmt.bufPrint(
                 &path_buf,
-                "{s}/.tigerclaw/logs/gateway.log",
+                "{s}/.tigerclaw/instances/default/logs/server.log",
                 .{home},
             );
             if (opts.follow) cli.commands.gateway.installInterruptHandler();

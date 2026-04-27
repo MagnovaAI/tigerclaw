@@ -47,7 +47,7 @@ best-effort migrated, so drift is visible instead of hidden.
 
 ## Consequences
 
-- An operator running `ls ~/.tigerclaw/state/telegram/` immediately
+- An operator running `ls ~/.tigerclaw/instances/default/sessions/telegram/` immediately
   sees which chat each session belongs to. This is the primary win —
   debugging a session is a question of `cat`, not a hash-table
   lookup. The content of `state.json` already contains the full

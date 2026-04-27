@@ -1,10 +1,11 @@
 //! `tigerclaw diag` — inspect recent diagnostic events.
 //!
 //! v0.1.0 surface: reads the on-disk diagnostics dump written by the
-//! gateway at `~/.tigerclaw/state/diagnostics.jsonl` (one JSON event
-//! per line). The runtime has an in-process buffer that future commits
-//! will expose over HTTP; until that ships, the file is the authoritative
-//! read-side source.
+//! gateway at
+//! `~/.tigerclaw/instances/default/sessions/default/diagnostics.jsonl`
+//! (one JSON event per line). The runtime has an in-process buffer that
+//! future commits will expose over HTTP; until that ships, the file is the
+//! authoritative read-side source.
 //!
 //! Sub-verbs:
 //!
@@ -28,7 +29,7 @@ pub const Subcommand = union(enum) {
 pub const TailArgs = struct {
     lines: u32 = 50,
     /// Optional absolute path override. When null, the runner
-    /// resolves `$HOME/.tigerclaw/state/diagnostics.jsonl`.
+    /// resolves the default instance diagnostics file.
     path: ?[]const u8 = null,
 };
 

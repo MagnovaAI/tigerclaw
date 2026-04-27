@@ -189,7 +189,7 @@ const builtin = @import("builtin");
 
 pub const LogsRunOptions = struct {
     /// Absolute path to the log file. The main.zig dispatch resolves
-    /// `$HOME/.tigerclaw/logs/gateway.log`; tests pass a tmpdir path.
+    /// `$HOME/.tigerclaw/instances/default/logs/server.log`; tests pass a tmpdir path.
     path: []const u8,
     follow: bool = false,
     /// Trailing lines to print before (optional) follow. Zero means
@@ -348,9 +348,9 @@ const startup_log = @import("../../gateway/startup_log.zig");
 const log_formatter = @import("../../gateway/log_formatter.zig");
 const pidfile = @import("../../daemon/pidfile.zig");
 
-/// Pidfile name inside the state directory. Kept as a stable
+/// Pidfile name inside the instance directory. Kept as a stable
 /// relative path so both start and stop paths agree.
-pub const pidfile_name = "gateway.pid";
+pub const pidfile_name = "locks/daemon.pid";
 
 const gw_log = std.log.scoped(.gateway);
 
@@ -358,8 +358,9 @@ pub const RunRunOptions = struct {
     /// Resolved bind. Production main resolves --host into an IpAddress;
     /// tests inject a localhost ephemeral binding.
     address: std.Io.net.IpAddress,
-    /// Caller-resolved absolute path to `<HOME>/.tigerclaw/state`. The
-    /// boot layer owns subdirectory creation under it (outbox, etc.).
+    /// Caller-resolved absolute path to
+    /// `<HOME>/.tigerclaw/instances/default`. The boot layer owns
+    /// subdirectory creation under it (outbox, etc.).
     state_dir_path: []const u8,
     /// Caller-resolved $HOME so the runner can find config.json + the
     /// agent's SOUL.md. When empty, the live runner falls back to
@@ -401,6 +402,22 @@ fn wallNowNs() i128 {
     return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
 }
 
+fn ensureInstanceSkeleton(io: std.Io, state_dir: std.Io.Dir) RunRunError!void {
+    const dirs = [_][]const u8{
+        "sessions",
+        "audit",
+        "meter",
+        "telemetry",
+        "inbox",
+        "outbox",
+        "locks",
+        "logs",
+    };
+    for (dirs) |dir| {
+        state_dir.createDirPath(io, dir) catch return error.StateDirOpenFailed;
+    }
+}
+
 /// Boot the gateway in the foreground. Blocks until SIGTERM/SIGINT
 /// trips `tcp_server.requestStop`, then runs the documented drain
 /// (in-flight wait → manager stop → outbox flush) before returning.
@@ -428,6 +445,8 @@ pub fn runGateway(
         else => return error.StateDirOpenFailed,
     };
     defer state_dir.close(io);
+
+    try ensureInstanceSkeleton(io, state_dir);
 
     // `--force`: if a live pidfile points at another process, kill it
     // and wait before we try to bind. A stale pidfile is overwritten
@@ -622,7 +641,7 @@ pub fn runGateway(
 // `gateway stop` execution — signal the running daemon via its pidfile.
 
 pub const StopRunOptions = struct {
-    /// Caller-resolved absolute path to `<HOME>/.tigerclaw/state`.
+    /// Caller-resolved absolute path to `<HOME>/.tigerclaw/instances/default`.
     state_dir_path: []const u8,
     force: bool = false,
     /// Host + port probed when the pidfile is missing or stale. A
@@ -650,7 +669,7 @@ pub const StopRunError = error{
     Timeout,
 } || std.Io.Writer.Error || std.mem.Allocator.Error;
 
-/// Signal the daemon referenced by `<state_dir>/gateway.pid` and wait
+/// Signal the daemon referenced by `<instance_dir>/locks/daemon.pid` and wait
 /// for it to clear. SIGTERM is the default; `--force` sends SIGKILL
 /// immediately. A soft 5s grace period gives the drain path time to
 /// finish; on timeout we escalate to SIGKILL automatically.
