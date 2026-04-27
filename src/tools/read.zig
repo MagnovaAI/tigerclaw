@@ -23,6 +23,7 @@ const max_bytes: usize = 4 * 1024 * 1024;
 pub fn handler(inv: schema.Invocation) anyerror!types.ToolResult {
     const path = extractPath(inv.call.arguments_json) orelse
         return schema.errResult(inv.allocator, inv.call.id, "tool.args", "missing 'path'");
+    if (try schema.checkWorkspacePath(inv, path, .read)) |err_result| return err_result;
 
     const bytes = inv.workspace.readFileAlloc(
         inv.io,

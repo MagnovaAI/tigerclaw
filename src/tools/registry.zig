@@ -24,6 +24,7 @@ pub const Registry = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     workspace: std.Io.Dir,
+    fs_policy: schema_mod.FsPolicy = schema_mod.default_workspace_fs_policy,
     tools: std.ArrayList(schema_mod.Tool),
 
     pub fn init(
@@ -35,6 +36,22 @@ pub const Registry = struct {
             .allocator = allocator,
             .io = io,
             .workspace = workspace,
+            .fs_policy = schema_mod.default_workspace_fs_policy,
+            .tools = .empty,
+        };
+    }
+
+    pub fn initWithFsPolicy(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        workspace: std.Io.Dir,
+        fs_policy: schema_mod.FsPolicy,
+    ) Registry {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .workspace = workspace,
+            .fs_policy = fs_policy,
             .tools = .empty,
         };
     }
@@ -79,6 +96,7 @@ pub const Registry = struct {
             .allocator = allocator,
             .io = self.io,
             .workspace = self.workspace,
+            .fs_policy = self.fs_policy,
             .call = call,
         });
     }

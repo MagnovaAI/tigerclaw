@@ -8,6 +8,14 @@
 
 const std = @import("std");
 const types = @import("types");
+const sandbox = @import("../sandbox/root.zig");
+
+pub const FsPolicy = sandbox.FsPolicy;
+
+pub const default_workspace_fs_policy = sandbox.FsPolicy{
+    .allowlist = &.{"/"},
+    .writes_allowed = true,
+};
 
 /// Tool category — drives both prompt-time selection and the
 /// Commit 41 "justification lint" that ensures every registered
@@ -48,6 +56,10 @@ pub const Invocation = struct {
     /// need multi-path access should refuse and surface an error;
     /// anything richer lives with real sandboxing (Commit 29).
     workspace: std.Io.Dir,
+    /// Filesystem policy for logical workspace paths. Paths are
+    /// normalised as `/<relative-path>` before policy checks so the
+    /// default policy allows only the workspace subtree.
+    fs_policy: sandbox.FsPolicy = default_workspace_fs_policy,
     call: types.ToolCall,
 };
 
@@ -58,6 +70,78 @@ pub const Tool = struct {
     spec: ToolSpec,
     handler: Handler,
 };
+
+pub fn checkWorkspacePath(
+    inv: Invocation,
+    path: []const u8,
+    access: sandbox.fs.Access,
+) !?types.ToolResult {
+    if (!isWorkspaceRelativePath(path)) {
+        return try errResult(inv.allocator, inv.call.id, "fs.path", "path must be workspace-relative");
+    }
+
+    const logical = try std.fmt.allocPrint(inv.allocator, "/{s}", .{path});
+    defer inv.allocator.free(logical);
+    if (sandbox.fs.check(inv.fs_policy, logical, access) == .deny) {
+        return try errResult(inv.allocator, inv.call.id, "permissions.denied", path);
+    }
+
+    const has_symlink = pathHasSymlink(inv, path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try errResult(inv.allocator, inv.call.id, "fs.error", @errorName(err)),
+    };
+    if (has_symlink) {
+        return try errResult(inv.allocator, inv.call.id, "fs.symlink", "symlink paths are not allowed");
+    }
+
+    return null;
+}
+
+fn isWorkspaceRelativePath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.fs.path.isAbsolute(path)) return false;
+    if (std.mem.startsWith(u8, path, "/")) return false;
+    if (std.mem.startsWith(u8, path, "\\")) return false;
+    if (std.mem.indexOfScalar(u8, path, ':') != null) return false;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
+
+    var saw_component = false;
+    var it = std.mem.splitAny(u8, path, "/\\");
+    while (it.next()) |part| {
+        if (part.len == 0) return false;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+        saw_component = true;
+    }
+    return saw_component;
+}
+
+fn pathHasSymlink(inv: Invocation, path: []const u8) !bool {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(inv.allocator);
+
+    var it = std.mem.splitAny(u8, path, "/\\");
+    while (it.next()) |part| {
+        try parts.append(inv.allocator, part);
+    }
+
+    var current: std.ArrayList(u8) = .empty;
+    defer current.deinit(inv.allocator);
+
+    for (parts.items) |part| {
+        if (current.items.len != 0) try current.append(inv.allocator, '/');
+        try current.appendSlice(inv.allocator, part);
+
+        const stat = inv.workspace.statFile(inv.io, current.items, .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        if (stat.kind == .sym_link) return true;
+    }
+
+    return false;
+}
 
 pub fn okResult(allocator: std.mem.Allocator, call_id: []const u8, payload: []const u8) !types.ToolResult {
     const id_copy = try allocator.dupe(u8, call_id);
@@ -103,4 +187,67 @@ test "okResult / errResult produce owning strings" {
     defer testing.allocator.free(err.call_id);
     defer testing.allocator.free(err.outcome.err.detail);
     try testing.expectEqualStrings("x.y", err.outcome.err.id);
+}
+
+test "checkWorkspacePath: rejects absolute and traversal paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const inv = Invocation{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .workspace = tmp.dir,
+        .call = .{ .id = "c1", .name = "read", .arguments_json = "{}" },
+    };
+
+    const absolute = (try checkWorkspacePath(inv, "/etc/passwd", .read)).?;
+    defer testing.allocator.free(absolute.call_id);
+    defer testing.allocator.free(absolute.outcome.err.detail);
+    try testing.expectEqualStrings("fs.path", absolute.outcome.err.id);
+
+    const traversal = (try checkWorkspacePath(inv, "../secret", .read)).?;
+    defer testing.allocator.free(traversal.call_id);
+    defer testing.allocator.free(traversal.outcome.err.detail);
+    try testing.expectEqualStrings("fs.path", traversal.outcome.err.id);
+}
+
+test "checkWorkspacePath: enforces write policy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const inv = Invocation{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .workspace = tmp.dir,
+        .fs_policy = .{ .allowlist = &.{"/"} },
+        .call = .{ .id = "c1", .name = "write", .arguments_json = "{}" },
+    };
+
+    const denied = (try checkWorkspacePath(inv, "out.txt", .write)).?;
+    defer testing.allocator.free(denied.call_id);
+    defer testing.allocator.free(denied.outcome.err.detail);
+    try testing.expectEqualStrings("permissions.denied", denied.outcome.err.id);
+}
+
+test "checkWorkspacePath: rejects symlink components" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "target.txt", .data = "target" });
+    tmp.dir.symLink(testing.io, "target.txt", "link.txt", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied, error.FileSystem => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const inv = Invocation{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .workspace = tmp.dir,
+        .call = .{ .id = "c1", .name = "read", .arguments_json = "{}" },
+    };
+
+    const denied = (try checkWorkspacePath(inv, "link.txt", .read)).?;
+    defer testing.allocator.free(denied.call_id);
+    defer testing.allocator.free(denied.outcome.err.detail);
+    try testing.expectEqualStrings("fs.symlink", denied.outcome.err.id);
 }

@@ -32,6 +32,8 @@ pub fn handler(inv: schema.Invocation) anyerror!types.ToolResult {
     };
     defer parsed.deinit();
 
+    if (try schema.checkWorkspacePath(inv, parsed.value.path, .read)) |err_result| return err_result;
+
     const src = inv.workspace.readFileAlloc(
         inv.io,
         parsed.value.path,

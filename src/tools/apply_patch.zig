@@ -32,6 +32,8 @@ pub fn handler(inv: schema.Invocation) anyerror!types.ToolResult {
     };
     defer parsed.deinit();
 
+    if (try schema.checkWorkspacePath(inv, parsed.value.path, .write)) |err_result| return err_result;
+
     internal_writes.writeAtomic(inv.workspace, inv.io, parsed.value.path, parsed.value.contents) catch |err| {
         return schema.errResult(inv.allocator, inv.call.id, "fs.error", @errorName(err));
     };
