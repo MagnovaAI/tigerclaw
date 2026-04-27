@@ -70,6 +70,11 @@ pub const Manifest = struct {
     /// allow at most one active plug per capability; shared allows N.
     slot: Slot,
 
+    /// Declared vtable ABI version for every provided capability.
+    /// Registration refuses plugs whose declaration does not match the
+    /// runtime's current capability ABI.
+    vtable_version: u16 = 1,
+
     /// Optional JSON-schema path (relative to repo root) describing
     /// the plug's config block. Empty string = no schema.
     config_schema: []const u8 = "",

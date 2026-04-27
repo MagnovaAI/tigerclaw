@@ -55,6 +55,11 @@ pub const PlugHandle = struct {
 
 pub const Phase = enum { idle, registered, started, draining, stopped };
 
+pub const InstallSnapshotError = std.mem.Allocator.Error || error{
+    VtableVersionMismatch,
+    ExclusiveSlotConflict,
+};
+
 /// Lifecycle state machine. Owns the topological order of plugs and
 /// tracks which phase they're in.
 pub const Lifecycle = struct {
@@ -87,19 +92,43 @@ pub const Lifecycle = struct {
     /// Build the initial Registry snapshot containing every plug's
     /// capability entry and install it atomically. Must be called
     /// AFTER start has run so implementations are live.
-    pub fn installSnapshot(self: *Lifecycle, reg: *Registry) !void {
+    pub fn installSnapshot(self: *Lifecycle, reg: *Registry) InstallSnapshotError!void {
         std.debug.assert(self.phase == .started);
-        const entries = try self.alloc.alloc(registry_mod.Entry, self.plugs.len * 2);
+
+        var entry_count: usize = 0;
+        for (self.order) |i| {
+            entry_count += self.plugs[i].manifest.provides.len;
+        }
+
+        const entries = try self.alloc.alloc(registry_mod.Entry, entry_count);
         defer self.alloc.free(entries);
 
+        var occupied = [_]bool{false} ** capabilities.capability_count;
+        var exclusive_owner = [_]?[]const u8{null} ** capabilities.capability_count;
         var idx: usize = 0;
         for (self.order) |i| {
             const p = self.plugs[i];
             for (p.manifest.provides) |cap| {
+                if (p.manifest.vtable_version != capabilities.currentVtableVersion(cap)) {
+                    return error.VtableVersionMismatch;
+                }
+
+                const tag = cap.tag();
+                if (p.manifest.slot == .exclusive and occupied[tag]) {
+                    return error.ExclusiveSlotConflict;
+                }
+                if (p.manifest.slot != .exclusive and exclusive_owner[tag] != null) {
+                    return error.ExclusiveSlotConflict;
+                }
+                if (p.manifest.slot == .exclusive) {
+                    exclusive_owner[tag] = p.manifest.id;
+                }
+                occupied[tag] = true;
+
                 entries[idx] = .{
                     .capability = cap,
                     .plug_id = p.manifest.id,
-                    .vtable_ver = capabilities.currentVtableVersion(cap),
+                    .vtable_ver = p.manifest.vtable_version,
                     .impl = p.impl,
                 };
                 idx += 1;
@@ -351,4 +380,104 @@ test "lifecycle: drain timeout on one plug surfaces at end" {
     try testing.expectEqual(@as(usize, 1), p_b.drain_called);
 
     lc.stop(&ctx);
+}
+
+test "lifecycle.installSnapshot: handles arbitrary capability counts" {
+    var fixed = clock_mod.FixedClock{ .value_ns = 0 };
+    const clk = fixed.clock();
+    const ctx = mkTestContext(&clk);
+
+    var p_infra = TestPlug{};
+
+    const plugs = [_]PlugHandle{
+        .{
+            .manifest = mkManifest("infra-combo", &[_]Capability{ .clock, .meter, .telemetry }, &.{}),
+            .impl = @ptrCast(&p_infra),
+            .vtable = &TestPlug.vtable,
+        },
+    };
+
+    var lc = try Lifecycle.init(testing.allocator, &plugs);
+    defer lc.deinit();
+
+    const reg = try Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    try lc.start(&ctx);
+    defer lc.stop(&ctx);
+
+    try lc.installSnapshot(reg);
+
+    const snap = reg.acquire();
+    defer Registry.release(snap);
+
+    try testing.expectEqual(@as(usize, 1), Registry.sharedFor(snap, .clock).len);
+    try testing.expectEqual(@as(usize, 1), Registry.sharedFor(snap, .meter).len);
+    try testing.expectEqual(@as(usize, 1), Registry.sharedFor(snap, .telemetry).len);
+}
+
+test "lifecycle.installSnapshot: rejects declared vtable version mismatch" {
+    var fixed = clock_mod.FixedClock{ .value_ns = 0 };
+    const clk = fixed.clock();
+    const ctx = mkTestContext(&clk);
+
+    var p_clock = TestPlug{};
+    var manifest = mkManifest("clock-system", &[_]Capability{.clock}, &.{});
+    manifest.vtable_version = 999;
+
+    const plugs = [_]PlugHandle{
+        .{
+            .manifest = manifest,
+            .impl = @ptrCast(&p_clock),
+            .vtable = &TestPlug.vtable,
+        },
+    };
+
+    var lc = try Lifecycle.init(testing.allocator, &plugs);
+    defer lc.deinit();
+
+    const reg = try Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    try lc.start(&ctx);
+    defer lc.stop(&ctx);
+
+    try testing.expectError(error.VtableVersionMismatch, lc.installSnapshot(reg));
+}
+
+test "lifecycle.installSnapshot: rejects duplicate exclusive capability" {
+    var fixed = clock_mod.FixedClock{ .value_ns = 0 };
+    const clk = fixed.clock();
+    const ctx = mkTestContext(&clk);
+
+    var p_clock_a = TestPlug{};
+    var p_clock_b = TestPlug{};
+    var manifest_a = mkManifest("clock-a", &[_]Capability{.clock}, &.{});
+    var manifest_b = mkManifest("clock-b", &[_]Capability{.clock}, &.{});
+    manifest_a.slot = .exclusive;
+    manifest_b.slot = .exclusive;
+
+    const plugs = [_]PlugHandle{
+        .{
+            .manifest = manifest_a,
+            .impl = @ptrCast(&p_clock_a),
+            .vtable = &TestPlug.vtable,
+        },
+        .{
+            .manifest = manifest_b,
+            .impl = @ptrCast(&p_clock_b),
+            .vtable = &TestPlug.vtable,
+        },
+    };
+
+    var lc = try Lifecycle.init(testing.allocator, &plugs);
+    defer lc.deinit();
+
+    const reg = try Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    try lc.start(&ctx);
+    defer lc.stop(&ctx);
+
+    try testing.expectError(error.ExclusiveSlotConflict, lc.installSnapshot(reg));
 }
