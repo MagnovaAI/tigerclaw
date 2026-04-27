@@ -519,7 +519,9 @@ fn runHttp(
     const status_code: u16 = @intFromEnum(response.head.status);
     if (status_code != 200) {
         var transfer_buf: [4096]u8 = undefined;
-        const body_reader = response.reader(&transfer_buf);
+        var decompress: std.http.Decompress = undefined;
+        var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
+        const body_reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
         return refusalFromHttp(allocator, status_code, body_reader);
     }
 
