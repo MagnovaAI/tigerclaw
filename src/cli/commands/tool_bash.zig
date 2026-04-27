@@ -7,6 +7,7 @@
 //! surface a denylist for the well-known destructive patterns.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const BashError = error{
     DeniedCommand,
@@ -29,15 +30,16 @@ pub const BashOptions = struct {
     /// Wall-clock timeout in ms. Clamped at MAX_TIMEOUT_MS.
     timeout_ms: u64 = 120_000,
     /// Optional sink invoked on the captured stdout/stderr. Today
-    /// the runner uses `std.process.run` which buffers both streams
-    /// and surfaces them only on completion -- so we fire the sink
-    /// once with the full buffer at the end of the call rather than
-    /// chunk-by-chunk. Honest semantics: consumers see the data, but
-    /// they don't see it incrementally. A future refactor that
-    /// drives `std.process.spawn + multi_reader.fill` directly can
-    /// keep the same sink contract and gain real streaming for free.
+    /// the runner buffers both streams and surfaces them only on
+    /// completion -- so we fire the sink once with the full buffer at
+    /// the end of the call rather than chunk-by-chunk. Honest
+    /// semantics: consumers see the data, but they don't see it
+    /// incrementally.
     progress_sink: ?ProgressSink = null,
     progress_ctx: ?*anyopaque = null,
+    /// Shared turn cancel flag. When set, the shell and its children
+    /// are terminated and the result is marked interrupted.
+    cancel_token: ?*const std.atomic.Value(bool) = null,
 };
 
 pub const BashResult = struct {
@@ -75,76 +77,180 @@ pub fn run(
 
     const start_ts = std.Io.Clock.Timestamp.now(io, .awake);
 
-    const result = std.process.run(allocator, io, .{
+    var child = std.process.spawn(io, .{
         .argv = &.{ "/bin/sh", "-c", options.command },
         .cwd = .{ .path = options.cwd },
-        // Stream caps include headroom for the truncation marker. The
-        // runner returns StreamTooLong if either limit is exceeded; we
-        // re-run unbounded in that case so we still capture *something*.
-        .stdout_limit = .unlimited,
-        .stderr_limit = .unlimited,
-        .timeout = .{ .duration = .{
-            .raw = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
-            .clock = .awake,
-        } },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        // Put POSIX shells in their own process group. A cancelled
+        // `find ... -exec ...` otherwise leaves the grandchild alive
+        // after the shell dies, keeping the UI stuck in "stopping".
+        .pgid = if (supportsProcessGroups()) 0 else null,
     }) catch |err| switch (err) {
-        error.Timeout => {
-            const elapsed = elapsedMs(io, start_ts);
-            // The std runner kills the child on Timeout via defer;
-            // there's no captured stdout/stderr to surface. Synthesise
-            // an explanatory pair instead.
-            const stdout = try allocator.alloc(u8, 0);
-            errdefer allocator.free(stdout);
+        else => return error.SpawnFailed,
+    };
+    var child_alive = true;
+    defer if (child_alive) child.kill(io);
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    const poll_timeout: std.Io.Timeout = .{ .duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(100),
+        .clock = .awake,
+    } };
+
+    while (true) {
+        if (options.cancel_token) |token| {
+            if (token.load(.acquire)) {
+                terminateChildTree(&child, io);
+                child_alive = false;
+                return interruptedResult(allocator, io, start_ts, "bash: command cancelled by user");
+            }
+        }
+
+        if (elapsedMs(io, start_ts) >= timeout_ms) {
+            terminateChildTree(&child, io);
+            child_alive = false;
             const stderr = try std.fmt.allocPrint(
                 allocator,
                 "bash: command timed out after {d} ms",
                 .{timeout_ms},
             );
-            return .{
-                .stdout = stdout,
-                .stderr = stderr,
-                .exit_code = -1,
-                .interrupted = true,
-                .duration_ms = elapsed,
-            };
-        },
-        else => return error.SpawnFailed,
+            return interruptedResultOwned(allocator, io, start_ts, stderr);
+        }
+
+        while (multi_reader.fill(64, poll_timeout)) |_| {} else |err| switch (err) {
+            error.EndOfStream => break,
+            error.Timeout => continue,
+            else => return error.SpawnFailed,
+        }
+        break;
+    }
+
+    multi_reader.checkAnyError() catch return error.SpawnFailed;
+    const term = child.wait(io) catch return error.SpawnFailed;
+    child_alive = false;
+
+    const stdout_owned = try multi_reader.toOwnedSlice(0);
+    const stderr_owned = multi_reader.toOwnedSlice(1) catch |err| {
+        allocator.free(stdout_owned);
+        return err;
     };
+
+    const result: std.process.RunResult = .{
+        .term = term,
+        .stdout = stdout_owned,
+        .stderr = stderr_owned,
+    };
+
     // result owns stdout/stderr — we may need to trim or replace, so
     // be careful about ownership.
+    return finishResult(allocator, io, start_ts, options, result);
+}
+
+fn finishResult(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    start_ts: std.Io.Clock.Timestamp,
+    options: BashOptions,
+    result: std.process.RunResult,
+) BashError!BashResult {
+    const owned = result;
 
     // Fire the progress sink with the full captured buffers before
     // we trim. Listeners that pipe to a TUI widget see the same data
     // they would get through a streamed spawn -- just all at once.
     if (options.progress_sink) |sink| {
-        if (result.stdout.len > 0) sink(options.progress_ctx, .stdout_chunk, result.stdout);
-        if (result.stderr.len > 0) sink(options.progress_ctx, .stderr_chunk, result.stderr);
+        if (owned.stdout.len > 0) sink(options.progress_ctx, .stdout_chunk, owned.stdout);
+        if (owned.stderr.len > 0) sink(options.progress_ctx, .stderr_chunk, owned.stderr);
     }
 
-    const stdout_trimmed = try trimWithMarker(allocator, result.stdout, "stdout");
-    // stdout_trimmed may either be result.stdout (handed off) or a
-    // newly-allocated slice. Free original only when replaced.
-    if (stdout_trimmed.ptr != result.stdout.ptr) allocator.free(result.stdout);
-
-    const stderr_trimmed = trimWithMarker(allocator, result.stderr, "stderr") catch |e| {
-        allocator.free(stdout_trimmed);
+    const stdout_trimmed = trimWithMarker(allocator, owned.stdout, "stdout") catch |e| {
+        allocator.free(owned.stdout);
+        allocator.free(owned.stderr);
         return e;
     };
-    if (stderr_trimmed.ptr != result.stderr.ptr) allocator.free(result.stderr);
+    // stdout_trimmed may either be result.stdout (handed off) or a
+    // newly-allocated slice. Free original only when replaced.
+    if (stdout_trimmed.ptr != owned.stdout.ptr) allocator.free(owned.stdout);
+
+    const stderr_trimmed = trimWithMarker(allocator, owned.stderr, "stderr") catch |e| {
+        allocator.free(stdout_trimmed);
+        allocator.free(owned.stderr);
+        return e;
+    };
+    if (stderr_trimmed.ptr != owned.stderr.ptr) allocator.free(owned.stderr);
 
     return .{
         .stdout = stdout_trimmed,
         .stderr = stderr_trimmed,
-        .exit_code = switch (result.term) {
+        .exit_code = switch (owned.term) {
             .exited => |c| @intCast(c),
             .signal => -1,
             .stopped => -1,
             .unknown => -1,
         },
-        .interrupted = switch (result.term) {
+        .interrupted = switch (owned.term) {
             .exited => false,
             else => true,
         },
+        .duration_ms = elapsedMs(io, start_ts),
+    };
+}
+
+fn supportsProcessGroups() bool {
+    return switch (builtin.os.tag) {
+        .windows, .wasi, .emscripten, .ios, .tvos, .visionos, .watchos => false,
+        else => true,
+    };
+}
+
+fn terminateChildTree(child: *std.process.Child, io: std.Io) void {
+    if (supportsProcessGroups()) {
+        if (child.id) |pid| {
+            if (pid > 0) {
+                while (true) switch (std.posix.errno(std.posix.system.kill(-pid, .TERM))) {
+                    .SUCCESS, .SRCH => break,
+                    .INTR => continue,
+                    else => break,
+                };
+            }
+        }
+    }
+    child.kill(io);
+}
+
+fn interruptedResult(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    start_ts: std.Io.Clock.Timestamp,
+    stderr_text: []const u8,
+) std.mem.Allocator.Error!BashResult {
+    return interruptedResultOwned(
+        allocator,
+        io,
+        start_ts,
+        try allocator.dupe(u8, stderr_text),
+    );
+}
+
+fn interruptedResultOwned(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    start_ts: std.Io.Clock.Timestamp,
+    stderr: []u8,
+) std.mem.Allocator.Error!BashResult {
+    errdefer allocator.free(stderr);
+    const stdout = try allocator.alloc(u8, 0);
+    return .{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = -1,
+        .interrupted = true,
         .duration_ms = elapsedMs(io, start_ts),
     };
 }
@@ -303,6 +409,18 @@ test "ProgressSink type signature accepts a captured-counter callback" {
     sink(&counter, .stdout_chunk, "hi");
     sink(&counter, .stderr_chunk, "err");
     try testing.expectEqual(@as(usize, 2), counter.count);
+}
+
+test "interruptedResultOwned: marks cancelled shell results" {
+    const start = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    const stderr = try testing.allocator.dupe(u8, "bash: command cancelled by user");
+    const result = try interruptedResultOwned(testing.allocator, std.testing.io, start, stderr);
+    defer result.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, -1), result.exit_code);
+    try testing.expect(result.interrupted);
+    try testing.expectEqualStrings("", result.stdout);
+    try testing.expectEqualStrings("bash: command cancelled by user", result.stderr);
 }
 
 test "trimWithMarker: oversize input gets capped + marker" {

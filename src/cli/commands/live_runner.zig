@@ -1252,7 +1252,7 @@ fn dispatchBuiltinTool(
                 .plan => return refuseSandbox(allocator, name, .plan, ""),
             }
         }
-        const out = try runBash(allocator, io, workspace_root, arguments_json, null, null);
+        const out = try runBash(allocator, io, workspace_root, runner, arguments_json, null, null);
         // Bash may have touched any file; drop the whole session's
         // read cache so the next read sees real content.
         if (runner) |r| r.read_state.invalidateSession(r.allocator, session_id);
@@ -1864,6 +1864,7 @@ fn runBash(
     allocator: std.mem.Allocator,
     io: std.Io,
     workspace_root: []const u8,
+    runner: ?*LiveAgentRunner,
     arguments_json: []const u8,
     progress_sink: ?tool_bash.ProgressSink,
     progress_ctx: ?*anyopaque,
@@ -1888,6 +1889,7 @@ fn runBash(
         .timeout_ms = parsed.value.timeout orelse 120_000,
         .progress_sink = progress_sink,
         .progress_ctx = progress_ctx,
+        .cancel_token = if (runner) |r| &r.cancel_flag else null,
     }) catch |e| switch (e) {
         error.DeniedCommand => return std.fmt.allocPrint(
             allocator,
