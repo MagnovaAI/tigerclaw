@@ -60,9 +60,10 @@ pub fn step(
     };
 
     const response = try provider.chat(agent_state.allocator, request);
-    // Provider-allocated strings: we either adopt them into the
-    // history (via pushAssistant, which duplicates) or free.
-    defer if (response.text) |t| agent_state.allocator.free(t);
+    // Provider responses own all returned strings. We duplicate anything
+    // that needs to outlive this step into AgentState, then release the
+    // provider-owned response as a unit.
+    defer response.deinit(agent_state.allocator);
 
     var appended_text: ?[]const u8 = null;
     if (response.text) |text| if (text.len > 0) {

@@ -5,9 +5,10 @@
 //! list return `error.MockExhausted`. Each invocation also increments a
 //! call counter so tests can assert how many times they were invoked.
 //!
-//! Memory contract: the `text` and `tool_calls` slices live as long as
-//! the `MockProvider`. `chat` clones the text into the caller's
-//! allocator so downstream code that frees the response is safe.
+//! Memory contract: replies are static fixtures, but `chat` returns an
+//! owning `ChatResponse` whose text and tool-call fields are cloned into
+//! the caller's allocator. Downstream code can always call
+//! `ChatResponse.deinit`.
 
 const std = @import("std");
 const provider_mod = @import("llm_provider");
@@ -59,9 +60,12 @@ pub const MockProvider = struct {
         const r = self.replies[self.cursor];
         self.cursor += 1;
 
+        const text = try allocator.dupe(u8, r.text);
+        errdefer allocator.free(text);
+        const tool_calls = try cloneToolCalls(allocator, r.tool_calls);
         return .{
-            .text = try allocator.dupe(u8, r.text),
-            .tool_calls = r.tool_calls,
+            .text = text,
+            .tool_calls = tool_calls,
             .usage = r.usage,
             .stop_reason = r.stop_reason,
         };
@@ -81,6 +85,44 @@ pub const MockProvider = struct {
         .deinit = doDeinit,
     };
 };
+
+fn cloneToolCalls(
+    allocator: std.mem.Allocator,
+    calls: []const types.ToolCall,
+) std.mem.Allocator.Error![]const types.ToolCall {
+    if (calls.len == 0) return &.{};
+
+    const out = try allocator.alloc(types.ToolCall, calls.len);
+    errdefer allocator.free(out);
+
+    var initialized: usize = 0;
+    errdefer freeToolCalls(allocator, out[0..initialized]);
+
+    for (calls, 0..) |call, i| {
+        const id = try allocator.dupe(u8, call.id);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, call.name);
+        errdefer allocator.free(name);
+        const arguments_json = try allocator.dupe(u8, call.arguments_json);
+
+        out[i] = .{
+            .id = id,
+            .name = name,
+            .arguments_json = arguments_json,
+        };
+        initialized += 1;
+    }
+
+    return out;
+}
+
+fn freeToolCalls(allocator: std.mem.Allocator, calls: []const types.ToolCall) void {
+    for (calls) |call| {
+        allocator.free(call.id);
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
+}
 
 // --- tests -----------------------------------------------------------------
 
@@ -103,14 +145,14 @@ test "MockProvider: serves replies in order" {
         .messages = &msgs,
         .model = .{ .provider = "mock", .model = "0" },
     });
-    defer if (r1.text) |t| testing.allocator.free(t);
+    defer r1.deinit(testing.allocator);
     try testing.expectEqualStrings("first", r1.text.?);
 
     const r2 = try p.chat(testing.allocator, .{
         .messages = &msgs,
         .model = .{ .provider = "mock", .model = "0" },
     });
-    defer if (r2.text) |t| testing.allocator.free(t);
+    defer r2.deinit(testing.allocator);
     try testing.expectEqualStrings("second", r2.text.?);
 
     try testing.expectEqual(@as(u32, 2), mock.call_count);
@@ -126,7 +168,7 @@ test "MockProvider: exhaustion returns MockExhausted" {
         .messages = &msgs,
         .model = .{ .provider = "mock", .model = "0" },
     });
-    defer if (r1.text) |t| testing.allocator.free(t);
+    defer r1.deinit(testing.allocator);
 
     try testing.expectError(
         error.MockExhausted,
@@ -147,7 +189,7 @@ test "MockProvider: reset rewinds cursor and counter" {
         .messages = &msgs,
         .model = .{ .provider = "mock", .model = "0" },
     });
-    defer if (r.text) |t| testing.allocator.free(t);
+    defer r.deinit(testing.allocator);
 
     mock.reset();
     try testing.expectEqual(@as(u32, 0), mock.call_count);
@@ -159,4 +201,26 @@ test "MockProvider: name is 'mock' and native tools is configurable" {
     const p = mock.provider();
     try testing.expectEqualStrings("mock", p.name());
     try testing.expect(p.supportsNativeTools());
+}
+
+test "MockProvider: clones tool calls into the response allocator" {
+    const calls = [_]types.ToolCall{
+        .{ .id = "c1", .name = "read", .arguments_json = "{\"path\":\"x\"}" },
+    };
+    const replies = [_]Reply{
+        .{ .text = "", .tool_calls = &calls, .stop_reason = .tool_use },
+    };
+    var mock = MockProvider{ .replies = &replies };
+    const p = mock.provider();
+
+    const msgs = emptyMessages();
+    const r = try p.chat(testing.allocator, .{
+        .messages = &msgs,
+        .model = .{ .provider = "mock", .model = "0" },
+    });
+    defer r.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), r.tool_calls.len);
+    try testing.expectEqualStrings("c1", r.tool_calls[0].id);
+    try testing.expect(r.tool_calls.ptr != calls[0..].ptr);
 }

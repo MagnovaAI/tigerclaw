@@ -29,7 +29,6 @@ pub const ChatRequest = struct {
     cancel_token: ?*std.atomic.Value(bool) = null,
 };
 
-
 pub const ChatResponse = struct {
     text: ?[]const u8 = null,
     tool_calls: []const types.ToolCall = &.{},
