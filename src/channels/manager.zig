@@ -25,6 +25,8 @@ const std = @import("std");
 const spec = @import("channels_spec");
 const dispatch_mod = @import("dispatch.zig");
 
+const log = std.log.scoped(.channels);
+
 pub const AddError = error{ OutOfMemory, DuplicateBinding };
 pub const StartError = std.Thread.SpawnError || error{OutOfMemory};
 
@@ -92,6 +94,7 @@ pub const Manager = struct {
         errdefer self.allocator.destroy(entry);
         entry.* = .{ .agent_name = agent_name, .channel = channel };
         self.entries.append(self.allocator, entry) catch return error.OutOfMemory;
+        log.info("channel registered channel={s} agent={s}", .{ @tagName(cid), agent_name });
     }
 
     /// Look up a previously-added channel by (agent_name, channel_id).
@@ -118,9 +121,14 @@ pub const Manager = struct {
     /// hold a live thread handle.
     pub fn start(self: *Manager) StartError!void {
         self.cancel.store(false, .release);
+        log.info("channel manager starting bindings={d}", .{self.entries.items.len});
         for (self.entries.items) |entry| {
             if (entry.thread != null) continue;
             entry.thread = try std.Thread.spawn(.{}, receiveLoopWrapper, .{ self, entry });
+            log.info("channel receive loop started channel={s} agent={s}", .{
+                @tagName(entry.channel.id()),
+                entry.agent_name,
+            });
         }
     }
 
@@ -134,6 +142,10 @@ pub const Manager = struct {
             if (entry.thread) |t| {
                 t.join();
                 entry.thread = null;
+                log.info("channel receive loop stopped channel={s} agent={s}", .{
+                    @tagName(entry.channel.id()),
+                    entry.agent_name,
+                });
             }
         }
     }
@@ -145,6 +157,7 @@ const ChannelEntry = struct {
     agent_name: []const u8,
     channel: spec.Channel,
     thread: ?std.Thread = null,
+    receive_failures: u32 = 0,
 };
 
 fn receiveLoopWrapper(self: *Manager, entry: *ChannelEntry) void {
@@ -161,18 +174,25 @@ fn receiveLoop(self: *Manager, entry: *ChannelEntry) void {
     while (!self.cancel.load(.acquire)) {
         const n = entry.channel.receive(buf, &self.cancel) catch |err| switch (err) {
             error.Unauthorized, error.TransportFailure => {
-                // Sleep cancellably so `stop` still unsticks us
-                // even when the upstream is in a sustained error
-                // state.
-                std.Io.sleep(
-                    self.io,
-                    std.Io.Duration.fromNanoseconds(@intCast(self.retry_backoff_ns)),
-                    .awake,
-                ) catch {};
+                if (self.cancel.load(.acquire)) return;
+                entry.receive_failures +|= 1;
+                logReceiveFailure(entry, err);
+                backoffSleep(&self.cancel, self.retry_backoff_ns);
                 continue;
             },
         };
-        if (n == 0) continue;
+        if (n == 0) {
+            backoffSleep(&self.cancel, empty_receive_backoff_ns);
+            continue;
+        }
+        if (entry.receive_failures > 0) {
+            log.info("channel receive recovered channel={s} agent={s} after_failures={d}", .{
+                @tagName(entry.channel.id()),
+                entry.agent_name,
+                entry.receive_failures,
+            });
+            entry.receive_failures = 0;
+        }
         const cid = entry.channel.id();
         for (buf[0..n]) |raw| {
             // Stamp routing fields before the message leaves the
@@ -183,9 +203,69 @@ fn receiveLoop(self: *Manager, entry: *ChannelEntry) void {
             var msg = raw;
             msg.channel_id = cid;
             msg.agent_name = entry.agent_name;
-            _ = self.dispatch.enqueue(msg);
+            const accepted = self.dispatch.enqueue(msg);
+            const stats = self.dispatch.stats();
+            log.info("inbound message channel={s} agent={s} conversation={s} thread={s} sender={s} upstream={d} text_bytes={d} queued={} queue_enqueued={d} queue_drained={d} queue_dropped={d} queue_in_flight={d}", .{
+                @tagName(cid),
+                entry.agent_name,
+                msg.conversation_key,
+                threadKey(msg.thread_key),
+                msg.sender_id,
+                msg.upstream_id,
+                msg.text.len,
+                accepted,
+                stats.enqueued,
+                stats.drained,
+                stats.dropped,
+                self.dispatch.inFlight(),
+            });
+            if (!accepted) {
+                log.warn("dispatch queue dropped oldest channel={s} agent={s}", .{
+                    @tagName(cid),
+                    entry.agent_name,
+                });
+            }
         }
     }
+}
+
+fn backoffSleep(cancel: *const std.atomic.Value(bool), total_ns: u64) void {
+    const chunk_ns = 50 * std.time.ns_per_ms;
+    var remaining = total_ns;
+    while (remaining > 0 and !cancel.load(.acquire)) {
+        const nap = @min(remaining, chunk_ns);
+        sleepNs(nap);
+        remaining -= nap;
+    }
+}
+
+fn sleepNs(ns: u64) void {
+    const requested: std.c.timespec = .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    _ = std.c.nanosleep(&requested, null);
+}
+
+const empty_receive_backoff_ns: u64 = 50 * std.time.ns_per_ms;
+
+fn logReceiveFailure(entry: *const ChannelEntry, err: spec.ReceiveError) void {
+    const failure_count = entry.receive_failures;
+    const args = .{
+        @tagName(entry.channel.id()),
+        entry.agent_name,
+        @errorName(err),
+        failure_count,
+    };
+    if (failure_count == 1 or failure_count % 12 == 0) {
+        log.warn("channel receive failed channel={s} agent={s} err={s} count={d}", args);
+    } else {
+        log.debug("channel receive failed channel={s} agent={s} err={s} count={d}", args);
+    }
+}
+
+fn threadKey(value: ?[]const u8) []const u8 {
+    return value orelse "-";
 }
 
 // --- tests -----------------------------------------------------------------

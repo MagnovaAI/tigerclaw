@@ -30,6 +30,10 @@ const spec = @import("channels_spec");
 
 const log = std.log.scoped(.outbox_sender);
 
+fn threadKey(value: ?[]const u8) []const u8 {
+    return value orelse "-";
+}
+
 pub const Sender = struct {
     io: std.Io,
     manager: *manager_mod.Manager,
@@ -91,6 +95,7 @@ pub const Sender = struct {
         if (self.thread != null) return;
         self.cancel.store(false, .release);
         self.thread = try std.Thread.spawn(.{}, loop, .{self});
+        log.info("outbox sender started channel={s}", .{@tagName(self.channel_id)});
     }
 
     pub fn stop(self: *Sender) void {
@@ -103,6 +108,7 @@ pub const Sender = struct {
             for (self.failed_acks.items) |f| alloc.free(f);
             self.failed_acks.deinit(alloc);
         }
+        log.info("outbox sender stopped channel={s}", .{@tagName(self.channel_id)});
     }
 };
 
@@ -159,6 +165,16 @@ fn drainOnce(self: *Sender, ch: spec.Channel) !void {
         // restart is preferable to duplicated delivery.
         if (self.hasFailedAck(pending.id)) continue;
 
+        log.info("outbound attempt channel={s} record_id={s} conversation={s} thread={s} attempts={d} next_due_unix_ms={d} text_bytes={d}", .{
+            @tagName(self.channel_id),
+            pending.id,
+            pending.conversation_key,
+            threadKey(pending.thread_key),
+            pending.attempts,
+            pending.next_due_unix_ms,
+            pending.text.len,
+        });
+
         const sent = ch.send(.{
             .conversation_key = pending.conversation_key,
             .thread_key = pending.thread_key,
@@ -178,6 +194,14 @@ fn drainOnce(self: *Sender, ch: spec.Channel) !void {
                 continue;
             },
             error.RateLimited, error.TransportFailure => {
+                log.warn("outbound retry channel={s} record_id={s} conversation={s} thread={s} err={s} attempts={d}", .{
+                    @tagName(self.channel_id),
+                    pending.id,
+                    pending.conversation_key,
+                    threadKey(pending.thread_key),
+                    @errorName(err),
+                    pending.attempts + 1,
+                });
                 // Retryable — bump backoff and move on. The next
                 // drainOnce pass will retry once next_due_unix_ms
                 // is in the past.
@@ -192,6 +216,14 @@ fn drainOnce(self: *Sender, ch: spec.Channel) !void {
             log.warn("outbox: ack failed after successful send: {s}", .{@errorName(err)});
             self.rememberFailedAck(pending.id);
         };
+        log.info("outbound sent channel={s} record_id={s} conversation={s} thread={s} text_bytes={d} attempts={d}", .{
+            @tagName(self.channel_id),
+            pending.id,
+            pending.conversation_key,
+            threadKey(pending.thread_key),
+            pending.text.len,
+            pending.attempts,
+        });
     }
 }
 

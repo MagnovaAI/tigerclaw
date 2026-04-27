@@ -27,7 +27,7 @@ pub const items: []const Item = &.{
     .{ .name = "config", .description = "Show current configuration" },
     .{ .name = "skills", .description = "List installed skills (use @<name> to invoke)" },
     .{ .name = "skill", .description = "Show one skill's details: /skill <name>" },
-    .{ .name = "tools", .description = "Toggle tool output (on|off)" },
+    .{ .name = "tools", .description = "Show tool output (default on; off hides)" },
     .{ .name = "lock", .description = "Lock writes to <path> (default: cwd)" },
     .{ .name = "unlock", .description = "Unlock workspace" },
     .{ .name = "plan", .description = "Plan mode (read-only)" },

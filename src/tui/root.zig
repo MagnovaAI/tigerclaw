@@ -42,6 +42,7 @@ const vxfw = vaxis.vxfw;
 pub const md = @import("md.zig");
 pub const ansi = @import("ansi.zig");
 const tool_preview = @import("tool_preview.zig");
+const gateway_runner_mod = @import("gateway_runner.zig");
 const live_runner = @import("../cli/commands/live_runner.zig");
 const harness = @import("../harness/root.zig");
 const HeaderWidget = @import("widgets/header.zig");
@@ -192,12 +193,12 @@ pub const Line = struct {
 
 pub const Options = struct {
     agent: []const u8 = "tiger",
-    /// Caller-resolved `$HOME`. The TUI instantiates a
-    /// `LiveAgentRunner` in-process against this root so there is no
-    /// gateway daemon to launch or port to bind; every turn flows
-    /// straight from the provider through the runner's streaming
-    /// sinks into the vaxis event queue.
+    /// Caller-resolved `$HOME`. Used for local agent discovery and
+    /// skill/config commands; agent turns now flow through the gateway.
     home: []const u8 = "",
+    /// Gateway base URL. TUI acts as a localhost client of the daemon.
+    base_url: []const u8 = "http://127.0.0.1:8765",
+    bearer: ?[]const u8 = null,
 };
 
 const EventLoop = vaxis.Loop(Event);
@@ -336,12 +337,7 @@ const spinner_frames = [_][]const u8{
 
 const RootWidget = @import("widgets/root.zig");
 
-/// New TUI entry point driven by `vxfw.App.run`. Setting the
-/// environment variable `TIGERCLAW_VXFW=1` routes `run()` here
-/// instead of the hand-rolled loop below. Lets us iterate on the
-/// vxfw migration without breaking the working TUI; when feature
-/// parity lands, the hand-rolled path goes away and this becomes
-/// the one true entry point.
+/// New TUI entry point driven by `vxfw.App.run`.
 fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     // Agent roster. Same logic as the old run() — the vxfw path
     // needs the default agent name to hand to RootWidget.
@@ -351,17 +347,9 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     const default_index = agents.findOrAppend(opts.agent) catch 0;
     const default_agent = agents.name(default_index);
 
-    // Load the in-process runner for the default agent. Same
-    // error-path as the hand-rolled run(): print to stderr and
-    // exit so the user can fix their config.
-    var live = live_runner.LiveAgentRunner.load(allocator, io, default_agent, "", opts.home) catch |err| {
-        const msg = try std.fmt.allocPrint(allocator, "tigerclaw tui: could not load agent '{s}': {s}\n", .{ default_agent, @errorName(err) });
-        defer allocator.free(msg);
-        _ = std.c.write(2, msg.ptr, msg.len);
-        return err;
-    };
-    defer live.deinit();
-    var agent_runner: harness.AgentRunner = live.runner();
+    var gateway_runner = gateway_runner_mod.GatewayRunner.init(allocator, io, opts.base_url, opts.bearer);
+    defer gateway_runner.deinit();
+    var agent_runner: harness.AgentRunner = gateway_runner.runner();
 
     var app = try vxfw.App.init(allocator, io);
     defer app.deinit();
@@ -370,14 +358,10 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     app.vx.sgr = .legacy;
     app.vx.caps.rgb = true;
 
-    // Build the banner's model line — "<provider> <model>"
-    // — and use the process's cwd as a stand-in for the
-    // workspace path. Both are displayed in the right column
-    // of the 4-row startup banner.
     const model_line = try std.fmt.allocPrint(
         allocator,
-        "{s} {s}",
-        .{ @tagName(live.provider_kind), live.model },
+        "gateway {s}",
+        .{opts.base_url},
     );
     defer allocator.free(model_line);
 
@@ -400,13 +384,6 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     defer root.deinit();
     root.wireSubmit();
     root.attachRunner(&agent_runner, &app);
-    root.attachSandbox(&live, sandboxAdapter, askGateAdapter);
-    live.ask_user_bridge = .{
-        .ctx = &root,
-        .post = askUserPostAdapter,
-        .take = askUserTakeAdapter,
-        .cancel = askUserCancelAdapter,
-    };
 
     try app.run(root.widget(), .{});
 }
@@ -534,6 +511,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     var ticker_thread: ?std.Thread = null;
 
     var pending: bool = false;
+    var stopping: bool = false;
     var pending_agent_line: ?usize = null;
     var pending_saw_text: bool = false;
 
@@ -554,6 +532,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                 // and unwind the turn with a "[cancelled]" marker.
                 // Idle ESC is a no-op (no in-flight work to abort).
                 if (key.matches(vaxis.Key.escape, .{}) and pending and !picker_open) {
+                    if (!stopping) {
+                        stopping = true;
+                        try appendLine(&history, allocator, .system, "∙ stopping turn…");
+                    }
                     agent_runner.cancel(0);
                     continue;
                 }
@@ -636,6 +618,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                         }
                         pending_agent_line = null;
                         pending = false;
+                        stopping = false;
                         const msg = try std.fmt.allocPrint(
                             allocator,
                             "! could not spawn worker: {s}",
@@ -786,6 +769,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
                 pending_agent_line = null;
                 pending_saw_text = false;
                 pending = false;
+                stopping = false;
                 ticker_stop.store(true, .release);
                 if (ticker_thread) |t| {
                     t.join();
@@ -1634,15 +1618,19 @@ fn workerMain(ctx: *WorkerCtx) void {
     }
 
     runTurn(ctx) catch |err| {
-        const msg = std.fmt.allocPrint(
-            ctx.allocator,
-            "! turn failed: {s}",
-            .{@errorName(err)},
-        ) catch {
+        const msg = if (err == error.Interrupted or err == error.Cancelled)
+            ctx.allocator.dupe(u8, "∙ turn cancelled")
+        else
+            std.fmt.allocPrint(
+                ctx.allocator,
+                "! turn failed: {s}",
+                .{@errorName(err)},
+            );
+        const owned_msg = msg catch {
             ctx.loop.postEvent(.turn_done);
             return;
         };
-        ctx.loop.postEvent(.{ .turn_error = msg });
+        ctx.loop.postEvent(.{ .turn_error = owned_msg });
         return;
     };
     ctx.loop.postEvent(.turn_done);

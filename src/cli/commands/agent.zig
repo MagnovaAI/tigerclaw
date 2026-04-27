@@ -10,17 +10,13 @@
 //! gateway to cancel the in-flight react loop and exits with a
 //! non-zero status so shell scripts can react.
 //!
-//! v0.1.0 caveat: the gateway buffers the SSE body before responding
-//! (the dispatcher returns one Response value), so Ctrl-C arrives at
-//! the verb either before the POST finishes or after — never mid
-//! stream. The DELETE fires on the post-finish path so the gateway
-//! still observes the cancel intent and can release the next turn's
-//! state. Mid-stream interrupts arrive once the dispatcher gains a
-//! streaming response shape in v0.2.0.
+//! The client reads the response body incrementally, so tokens can
+//! render as the gateway flushes each SSE frame.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const http_client = @import("http_client.zig");
+const sse_client = @import("../../tui/sse_client.zig");
 
 pub const Options = struct {
     /// Base URL for the gateway, e.g. `http://127.0.0.1:8765`.
@@ -101,10 +97,13 @@ pub fn run(
     }, .{});
     defer allocator.free(body_json);
 
-    var body_buf: [16 * 1024]u8 = undefined;
-    var body_writer: std.Io.Writer = .fixed(&body_buf);
+    var sse_ctx = SseRenderCtx{
+        .parser = sse_client.Parser.init(allocator),
+        .out = opts.out,
+    };
+    defer sse_ctx.parser.deinit();
 
-    const send_result = http_client.send(
+    const send_result = http_client.sendStreaming(
         allocator,
         io,
         .{
@@ -116,7 +115,8 @@ pub fn run(
             // renderer below has token events to walk.
             .accept = "text/event-stream",
         },
-        &body_writer,
+        renderSseChunk,
+        &sse_ctx,
         .{},
     );
 
@@ -137,10 +137,28 @@ pub fn run(
         return error.Interrupted;
     }
 
-    try renderSse(opts.out, body_writer.buffered());
     // Trailing newline so the shell prompt lands on the next line —
     // the SSE token frames carry no terminator of their own.
     opts.out.writeAll("\n") catch return error.InvalidResponse;
+}
+
+const SseRenderCtx = struct {
+    parser: sse_client.Parser,
+    out: *std.Io.Writer,
+};
+
+fn renderSseChunk(ctx: ?*anyopaque, bytes: []const u8) http_client.Error!void {
+    const self: *SseRenderCtx = @ptrCast(@alignCast(ctx.?));
+    self.parser.feed(bytes, renderSseEvent, self) catch return error.InvalidResponse;
+}
+
+fn renderSseEvent(ctx: ?*anyopaque, event: sse_client.Event) void {
+    const self: *SseRenderCtx = @ptrCast(@alignCast(ctx.?));
+    switch (event) {
+        .chunk => |text| self.out.writeAll(text) catch {},
+        .tool_start, .tool_done, .done => {},
+        .err => |msg| self.out.writeAll(msg) catch {},
+    }
 }
 
 /// Fire DELETE /sessions/:id/turns/current. Surfaced separately so the

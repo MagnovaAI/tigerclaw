@@ -270,6 +270,7 @@ pub const TurnError = error{
     BudgetExceeded,
     Cancelled,
     Interrupted,
+    GatewayDown,
     InternalError,
     OutOfMemory,
 };

@@ -20,6 +20,7 @@
 //! Spec: docs/spec/agent-architecture-v3.yaml §infrastructure.telemetry
 
 const std = @import("std");
+const builtin = @import("builtin");
 const errors = @import("errors");
 const context_mod = @import("context");
 
@@ -28,7 +29,156 @@ const Context = context_mod.Context;
 const TraceId = context_mod.TraceId;
 const SpanId = context_mod.SpanId;
 
+extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: *anyopaque, buffersize: c_int) c_int;
+
 pub const Status = enum { ok, err, cancelled };
+
+pub const ResourceSample = struct {
+    cpu_user_us: u64,
+    cpu_system_us: u64,
+    cpu_total_us: u64,
+    cpu_percent_x100: u64,
+    cpu_logical_cores: u32,
+    app_ram_used_bytes: u64,
+    max_rss_bytes: u64,
+    system_ram_total_bytes: u64,
+
+    pub fn appRamUsedPctX100(self: ResourceSample) u64 {
+        if (self.system_ram_total_bytes == 0) return 0;
+        return @divTrunc(self.app_ram_used_bytes * 10_000, self.system_ram_total_bytes);
+    }
+
+    pub fn appRamAvailableBytes(self: ResourceSample) u64 {
+        return self.system_ram_total_bytes -| self.app_ram_used_bytes;
+    }
+};
+
+pub fn sampleResources() ResourceSample {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return emptyResourceSample();
+    }
+
+    const sampled_ns = monotonicNowNs();
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    const cpu_user_us = timevalMicros(usage.utime);
+    const cpu_system_us = timevalMicros(usage.stime);
+    const cpu_total_us = cpu_user_us + cpu_system_us;
+    const cpu_logical_cores = logicalCpuCount();
+    const max_rss_bytes = rssBytes(usage.maxrss);
+    return .{
+        .cpu_user_us = cpu_user_us,
+        .cpu_system_us = cpu_system_us,
+        .cpu_total_us = cpu_total_us,
+        .cpu_percent_x100 = cpuPercentX100(sampled_ns, cpu_total_us, cpu_logical_cores),
+        .cpu_logical_cores = cpu_logical_cores,
+        .app_ram_used_bytes = currentResidentBytes() orelse max_rss_bytes,
+        .max_rss_bytes = max_rss_bytes,
+        .system_ram_total_bytes = systemRamTotalBytes(),
+    };
+}
+
+fn emptyResourceSample() ResourceSample {
+    return .{
+        .cpu_user_us = 0,
+        .cpu_system_us = 0,
+        .cpu_total_us = 0,
+        .cpu_percent_x100 = 0,
+        .cpu_logical_cores = 0,
+        .app_ram_used_bytes = 0,
+        .max_rss_bytes = 0,
+        .system_ram_total_bytes = 0,
+    };
+}
+
+fn timevalMicros(tv: std.c.timeval) u64 {
+    const secs: u64 = @intCast(@max(tv.sec, 0));
+    const usecs: u64 = @intCast(@max(tv.usec, 0));
+    return secs * 1_000_000 + usecs;
+}
+
+fn rssBytes(maxrss: isize) u64 {
+    const value: u64 = @intCast(@max(maxrss, 0));
+    return switch (builtin.target.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => value,
+        else => value * 1024,
+    };
+}
+
+fn logicalCpuCount() u32 {
+    const count = std.Thread.getCpuCount() catch return 0;
+    return @intCast(@min(count, std.math.maxInt(u32)));
+}
+
+fn monotonicNowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    if (ts.sec < 0 or ts.nsec < 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+var last_sample_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var last_sample_cpu_us: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+fn cpuPercentX100(sampled_ns: u64, cpu_total_us: u64, logical_cores: u32) u64 {
+    if (sampled_ns == 0 or logical_cores == 0) return 0;
+
+    const previous_ns = last_sample_ns.swap(sampled_ns, .monotonic);
+    const previous_cpu_us = last_sample_cpu_us.swap(cpu_total_us, .monotonic);
+    if (previous_ns == 0 or sampled_ns <= previous_ns or cpu_total_us < previous_cpu_us) return 0;
+
+    const elapsed_us = @divTrunc(sampled_ns - previous_ns, std.time.ns_per_us);
+    if (elapsed_us == 0) return 0;
+
+    const cpu_delta_us = cpu_total_us - previous_cpu_us;
+    const capacity_us = elapsed_us * logical_cores;
+    if (capacity_us == 0) return 0;
+    return @divTrunc(cpu_delta_us * 10_000, capacity_us);
+}
+
+fn systemRamTotalBytes() u64 {
+    return std.process.totalSystemMemory() catch 0;
+}
+
+fn currentResidentBytes() ?u64 {
+    return switch (builtin.target.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => currentResidentBytesDarwin(),
+        else => null,
+    };
+}
+
+fn currentResidentBytesDarwin() ?u64 {
+    const PROC_PIDTASKINFO: c_int = 4;
+    const ProcTaskInfo = extern struct {
+        pti_virtual_size: u64,
+        pti_resident_size: u64,
+        pti_total_user: u64,
+        pti_total_system: u64,
+        pti_threads_user: u64,
+        pti_threads_system: u64,
+        pti_policy: i32,
+        pti_faults: i32,
+        pti_pageins: i32,
+        pti_cow_faults: i32,
+        pti_messages_sent: i32,
+        pti_messages_received: i32,
+        pti_syscalls_mach: i32,
+        pti_syscalls_unix: i32,
+        pti_csw: i32,
+        pti_threadnum: i32,
+        pti_numrunning: i32,
+        pti_priority: i32,
+    };
+    var info: ProcTaskInfo = undefined;
+    const got = proc_pidinfo(
+        @intCast(std.c.getpid()),
+        PROC_PIDTASKINFO,
+        0,
+        &info,
+        @intCast(@sizeOf(ProcTaskInfo)),
+    );
+    if (got != @sizeOf(ProcTaskInfo)) return null;
+    return info.pti_resident_size;
+}
 
 pub const AttrValue = union(enum) {
     text: []const u8,
@@ -262,4 +412,17 @@ test "NoopSink: spanStart returns distinct span ids" {
     const a = try t.spanStart(&ctx, "span-a", &.{});
     const b = try t.spanStart(&ctx, "span-b", &.{});
     try testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "sampleResources: returns monotonic process counters" {
+    const first = sampleResources();
+    const second = sampleResources();
+
+    try testing.expect(second.cpu_user_us >= first.cpu_user_us);
+    try testing.expect(second.cpu_system_us >= first.cpu_system_us);
+    try testing.expectEqual(second.cpu_user_us + second.cpu_system_us, second.cpu_total_us);
+    try testing.expect(second.cpu_logical_cores > 0);
+    try testing.expect(second.app_ram_used_bytes > 0);
+    try testing.expect(second.system_ram_total_bytes >= second.app_ram_used_bytes);
+    try testing.expect(second.max_rss_bytes >= first.max_rss_bytes);
 }

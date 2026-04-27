@@ -49,6 +49,7 @@ const verbs = [_][]const u8{
 
 // --- state ---
 pending: bool = false,
+stopping: bool = false,
 spinner_tick: u64 = 0,
 /// Index into `verbs`. Bumped when a turn starts so each turn
 /// gets a different verb.
@@ -88,6 +89,7 @@ pub fn draw(self: *const Thinking, ctx: vxfw.DrawContext) std.mem.Allocator.Erro
 
     const dim_style: vaxis.Style = tui.palette.hint;
     const accent_style: vaxis.Style = .{ .fg = tui.palette.orange };
+    const stop_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xF0, 0xA0, 0x55 } }, .bold = true };
 
     // Start 2 cells in so the row aligns with history's side
     // margin.
@@ -103,9 +105,11 @@ pub fn draw(self: *const Thinking, ctx: vxfw.DrawContext) std.mem.Allocator.Erro
 
     // Verb + ellipsis. Arena-allocate so the surface cell's
     // grapheme slice stays valid until render.
-    const verb = verbs[self.verb_index % verbs.len];
-    const verb_line = std.fmt.allocPrint(ctx.arena, "{s}…", .{verb}) catch verb;
-    col += writeText(ctx, surface, col, 0, verb_line, dim_style, width);
+    const line = if (self.stopping) "stopping…" else blk: {
+        const verb = verbs[self.verb_index % verbs.len];
+        break :blk std.fmt.allocPrint(ctx.arena, "{s}…", .{verb}) catch verb;
+    };
+    col += writeText(ctx, surface, col, 0, line, if (self.stopping) stop_style else dim_style, width);
 
     // Elapsed time, shown once the turn's been running at
     // least 3 seconds. Rendered in parens with a leading space.

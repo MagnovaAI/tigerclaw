@@ -114,10 +114,9 @@ pub const Dispatch = struct {
 
     /// Pop the next message, waiting if the queue is empty. Returns
     /// `null` once `cancel.load(.acquire)` is observed true while
-    /// the queue is empty. The wait is a yield-poll loop rather
-    /// than a condvar because `std.Io.Condition` requires an `Io`
-    /// handle we would otherwise have to plumb through every
-    /// caller.
+    /// the queue is empty. Empty waits sleep briefly instead of
+    /// yielding in a hot loop; `Thread.yield` still pinned a core on
+    /// macOS when the gateway sat idle.
     pub fn dequeue(
         self: *Dispatch,
         cancel: *const std.atomic.Value(bool),
@@ -135,7 +134,7 @@ pub const Dispatch = struct {
             self.mutex.unlock();
 
             if (cancel.load(.acquire)) return null;
-            std.Thread.yield() catch {};
+            sleepNs(empty_wait_ns);
         }
     }
 
@@ -160,6 +159,16 @@ pub const Dispatch = struct {
         return self.in_flight.load(.acquire);
     }
 };
+
+fn sleepNs(ns: u64) void {
+    const requested: std.c.timespec = .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    _ = std.c.nanosleep(&requested, null);
+}
+
+const empty_wait_ns: u64 = 10 * std.time.ns_per_ms;
 
 // --- tests -----------------------------------------------------------------
 

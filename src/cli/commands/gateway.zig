@@ -347,6 +347,8 @@ const harness_agent_registry = @import("../../harness/agent_registry.zig");
 const startup_log = @import("../../gateway/startup_log.zig");
 const log_formatter = @import("../../gateway/log_formatter.zig");
 const pidfile = @import("../../daemon/pidfile.zig");
+const logfile = @import("../../daemon/logfile.zig");
+const telemetry_mod = @import("../../telemetry.zig");
 
 /// Pidfile name inside the instance directory. Kept as a stable
 /// relative path so both start and stop paths agree.
@@ -418,6 +420,34 @@ fn ensureInstanceSkeleton(io: std.Io, state_dir: std.Io.Dir) RunRunError!void {
     }
 }
 
+fn appendGatewayLog(ptr: *anyopaque, line: []const u8) void {
+    const sink: *logfile.LogSink = @ptrCast(@alignCast(ptr));
+    sink.append(line) catch {};
+}
+
+fn logResourceSample(label: []const u8) void {
+    const sample = telemetry_mod.sampleResources();
+    gw_log.info(
+        "[RAM:{d}MiB,CPU:{d}.{d:0>2}%] metric phase={s} app_cpu_used_us={d} app_cpu_percent_x100={d} app_cpu_available_cores={d} cpu_user_us={d} cpu_system_us={d} app_ram_used_bytes={d} app_ram_available_bytes={d} system_ram_total_bytes={d} app_ram_used_pct_x100={d} app_ram_peak_bytes={d}",
+        .{
+            sample.app_ram_used_bytes / std.math.pow(u64, 1024, 2),
+            sample.cpu_percent_x100 / 100,
+            sample.cpu_percent_x100 % 100,
+            label,
+            sample.cpu_total_us,
+            sample.cpu_percent_x100,
+            sample.cpu_logical_cores,
+            sample.cpu_user_us,
+            sample.cpu_system_us,
+            sample.app_ram_used_bytes,
+            sample.appRamAvailableBytes(),
+            sample.system_ram_total_bytes,
+            sample.appRamUsedPctX100(),
+            sample.max_rss_bytes,
+        },
+    );
+}
+
 /// Boot the gateway in the foreground. Blocks until SIGTERM/SIGINT
 /// trips `tcp_server.requestStop`, then runs the documented drain
 /// (in-flight wait → manager stop → outbox flush) before returning.
@@ -437,6 +467,21 @@ pub fn runGateway(
     log_formatter.setVerbose(opts.verbose);
     log_formatter.setColor(opts.color);
 
+    const build_options = @import("build_options");
+    startup_log.printBanner(out, .{
+        .version = build_options.version,
+        .commit = build_options.commit,
+        .host = opts.host_str,
+        .port = opts.address.getPort(),
+        .verbose = opts.verbose,
+        .color = opts.color,
+    });
+    out.flush() catch {};
+
+    gw_log.info("loading configuration...", .{});
+    gw_log.debug("state root requested: {s}", .{opts.state_dir_path});
+    logResourceSample("gateway_start");
+
     var state_dir = std.Io.Dir.cwd().openDir(io, opts.state_dir_path, .{}) catch |e| switch (e) {
         error.FileNotFound => blk: {
             std.Io.Dir.cwd().createDirPath(io, opts.state_dir_path) catch return error.StateDirOpenFailed;
@@ -445,36 +490,29 @@ pub fn runGateway(
         else => return error.StateDirOpenFailed,
     };
     defer state_dir.close(io);
+    gw_log.info("state root ready: {s}", .{opts.state_dir_path});
 
     try ensureInstanceSkeleton(io, state_dir);
+    gw_log.info("runtime directories ready", .{});
 
-    // `--force`: if a live pidfile points at another process, kill it
-    // and wait before we try to bind. A stale pidfile is overwritten
-    // silently by the write below.
+    var log_sink = logfile.LogSink.open(io, state_dir, "logs/server.log") catch null;
+    defer if (log_sink) |*sink| sink.close();
+    if (log_sink) |*sink| {
+        log_formatter.setFileSink(.{ .ptr = sink, .append = appendGatewayLog });
+    }
+    defer log_formatter.setFileSink(null);
+    gw_log.info("log file: {s}/logs/server.log", .{opts.state_dir_path});
+    logResourceSample("log_sink_ready");
+
+    // `--force` is a restart operation. Kill any live daemon hard,
+    // clear stale bookkeeping, and evict an orphan listener before
+    // this process writes its own pidfile. Using SIGKILL here avoids
+    // the old daemon's defer path racing us and deleting the new
+    // pidfile after we publish it.
     if (opts.force) {
-        if (!pidfile.isStale(io, state_dir, pidfile_name)) {
-            if (pidfile.read(io, state_dir, pidfile_name)) |existing_pid| {
-                gw_log.info("--force: stopping existing gateway (pid {d})", .{existing_pid});
-                std.posix.kill(existing_pid, std.posix.SIG.TERM) catch {};
-                // Poll up to 5s then escalate to SIGKILL. Mirrors
-                // runStop's cadence so operator expectations align.
-                const poll_ns: u64 = 100 * std.time.ns_per_ms;
-                const max_ns: u64 = 5 * std.time.ns_per_s;
-                var waited: u64 = 0;
-                while (waited < max_ns) {
-                    std.Io.sleep(io, std.Io.Duration.fromNanoseconds(poll_ns), .awake) catch {};
-                    waited += poll_ns;
-                    std.posix.kill(existing_pid, @enumFromInt(0)) catch |e| switch (e) {
-                        error.ProcessNotFound => break,
-                        else => break,
-                    };
-                }
-                if (waited >= max_ns) {
-                    gw_log.warn("existing gateway did not exit in 5s — sending SIGKILL", .{});
-                    std.posix.kill(existing_pid, std.posix.SIG.KILL) catch {};
-                }
-            } else |_| {}
-        }
+        forceClearExistingGateway(allocator, io, state_dir, opts.host_str, opts.address.getPort()) catch {
+            return error.BindFailed;
+        };
     }
 
     // Publish our pid so `gateway stop` can find us. Stale pidfiles
@@ -485,12 +523,15 @@ pub fn runGateway(
         gw_log.warn("pidfile write failed: {s}", .{@errorName(e)});
     };
     defer pidfile.remove(io, state_dir, pidfile_name) catch {};
+    gw_log.info("pidfile ready: {s} pid={d}", .{ pidfile_name, self_pid });
 
     // Reset the stop flag so consecutive runs in the same process
     // (tests, REPL-style smoke runs) do not inherit a poisoned flag.
     tcp_server.resetStopForTesting();
+    gw_log.info("shutdown handlers armed", .{});
 
     var clock_cb: clock_mod.CallbackClock = .{ .now_fn = wallNowNs };
+    gw_log.info("resolving agents...", .{});
 
     // Load the AgentsConfig from disk and convert to a harness
     // Registry for Boot.init to walk. An empty or missing agents
@@ -522,7 +563,9 @@ pub fn runGateway(
     } else {
         gw_log.warn("home_path is empty — no agents loaded", .{});
     }
+    logResourceSample("agents_resolved");
 
+    gw_log.info("initializing gateway runtime...", .{});
     var boot = gateway_root.boot.Boot.init(allocator, io, .{
         .address = opts.address,
         .state_root = state_dir,
@@ -537,6 +580,8 @@ pub fn runGateway(
         return error.BindFailed;
     };
     defer boot.deinit();
+    gw_log.info("gateway runtime initialized", .{});
+    logResourceSample("runtime_initialized");
 
     // Pre-load every agent under ~/.tigerclaw/agents. Registry
     // load happens before the banner so the banner can show the
@@ -546,9 +591,11 @@ pub fn runGateway(
     defer registry.deinit();
     var load_err: ?anyerror = null;
     if (opts.home_path.len > 0 or opts.workspace_path.len > 0) {
+        gw_log.info("loading runtime agents...", .{});
         registry.loadAll(io, opts.workspace_path, opts.home_path) catch |e| {
             load_err = e;
         };
+        gw_log.info("runtime agents loaded: {d}", .{registry.entries.items.len});
     }
     var ctx: gateway_root.routes.Context = .{
         .runner = registry.runner(),
@@ -585,26 +632,11 @@ pub fn runGateway(
         }) catch null;
     } else null;
 
-    // Pretty banner on stdout (the CLI writer). Runtime log lines
-    // (warnings, debug, request traces) go to stderr via the
-    // std.log formatter. Version + commit come from build_options
-    // — the build step derives them from today's date and .git/HEAD
-    // unless overridden with `-Dversion=` / `-Dcommit=`.
-    const build_options = @import("build_options");
-    startup_log.printBanner(out, .{
-        .version = build_options.version,
-        .commit = build_options.commit,
-        .host = opts.host_str,
-        .port = opts.address.getPort(),
-        .agent_model = agent_model,
-        .loaded_agents = agent_names_buf[0..agent_names_len],
-        .verbose = opts.verbose,
-        .color = opts.color,
-    });
-    // Flush stdout so the banner lands before any subsequent stderr
-    // log lines — the two streams are buffered independently and the
-    // terminal can otherwise interleave them out of order.
-    out.flush() catch {};
+    if (agent_model) |model| {
+        gw_log.info("agent model: {s}", .{model});
+    }
+    gw_log.info("ready ({d} agents loaded)", .{agent_names_len});
+    logResourceSample("banner_printed");
 
     // Post-banner diagnostics. Warnings surface regardless of
     // verbose; the per-agent dump only fires under `--verbose`
@@ -629,12 +661,84 @@ pub fn runGateway(
         });
     }
 
+    gw_log.info("starting HTTP server on {s}:{d}", .{ opts.host_str, opts.address.getPort() });
     boot.run(&ctx) catch |e| {
         gw_log.err("gateway exited with error: {s}", .{@errorName(e)});
         return;
     };
 
+    logResourceSample("gateway_stopped");
+    gw_log.info("gateway stopped cleanly", .{});
     try out.writeAll("tigerclaw gateway stopped cleanly\n");
+}
+
+const ForceClearError = error{GatewayStillRunning};
+
+fn forceClearExistingGateway(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_dir: std.Io.Dir,
+    host: []const u8,
+    port: u16,
+) ForceClearError!void {
+    if (pidfile.read(io, state_dir, pidfile_name)) |existing_pid| {
+        if (pidfile.isStale(io, state_dir, pidfile_name)) {
+            pidfile.remove(io, state_dir, pidfile_name) catch {};
+            gw_log.info("--force: cleared stale pidfile pid={d}", .{existing_pid});
+        } else {
+            gw_log.info("--force: killing existing gateway pid={d}", .{existing_pid});
+            killAndWait(io, existing_pid, host, port) catch return error.GatewayStillRunning;
+            pidfile.remove(io, state_dir, pidfile_name) catch {};
+        }
+    } else |err| switch (err) {
+        error.FileMissing => {},
+        error.Corrupt, error.IoFailure => {
+            pidfile.remove(io, state_dir, pidfile_name) catch {};
+            gw_log.warn("--force: removed unreadable pidfile: {s}", .{@errorName(err)});
+        },
+    }
+
+    if (!probeGatewayPort(allocator, io, host, port)) return;
+
+    const orphan_pid = findOrphanPid(allocator, port) orelse {
+        gw_log.warn("--force: {s}:{d} is still occupied but no listener pid was found", .{ host, port });
+        return error.GatewayStillRunning;
+    };
+    gw_log.info("--force: killing orphan gateway listener pid={d} port={d}", .{ orphan_pid, port });
+    killAndWait(io, orphan_pid, host, port) catch return error.GatewayStillRunning;
+}
+
+fn killAndWait(
+    io: std.Io,
+    pid: std.posix.pid_t,
+    host: []const u8,
+    port: u16,
+) ForceClearError!void {
+    std.posix.kill(pid, std.posix.SIG.CONT) catch {};
+    std.posix.kill(pid, std.posix.SIG.KILL) catch |e| switch (e) {
+        error.ProcessNotFound => return,
+        else => return error.GatewayStillRunning,
+    };
+
+    const poll_ns: u64 = 100 * std.time.ns_per_ms;
+    const max_ns: u64 = 5 * std.time.ns_per_s;
+    var waited: u64 = 0;
+    while (waited < max_ns) {
+        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(poll_ns), .awake) catch {};
+        waited += poll_ns;
+
+        const pid_gone = blk: {
+            std.posix.kill(pid, @enumFromInt(0)) catch |e| switch (e) {
+                error.ProcessNotFound => break :blk true,
+                else => break :blk false,
+            };
+            break :blk false;
+        };
+        if (pid_gone or !probeGatewayPort(std.heap.page_allocator, io, host, port)) {
+            return;
+        }
+    }
+    return error.GatewayStillRunning;
 }
 
 // ---------------------------------------------------------------------------

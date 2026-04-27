@@ -36,6 +36,22 @@ const runtime_mod = @import("../harness/runtime.zig");
 
 const log = std.log.scoped(.dispatch_worker);
 
+fn monotonicNowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+}
+
+fn elapsedMs(started_ns: i128) u64 {
+    const now = monotonicNowNs();
+    if (now <= started_ns) return 0;
+    return @intCast(@divTrunc(now - started_ns, std.time.ns_per_ms));
+}
+
+fn threadKey(value: ?[]const u8) []const u8 {
+    return value orelse "-";
+}
+
 /// Worker can be wired to either a single runner (legacy / mock /
 /// CLI single-agent path) or a runtime registry (production
 /// multi-agent path). The choice is made at construction time and
@@ -118,6 +134,20 @@ pub const Worker = struct {
 fn loop(self: *Worker) void {
     while (!self.cancel.load(.acquire)) {
         const msg = self.dispatch.dequeue(&self.cancel) orelse return;
+        const stats = self.dispatch.stats();
+        log.info("dispatch dequeued channel={s} agent={s} conversation={s} thread={s} sender={s} upstream={d} text_bytes={d} queue_enqueued={d} queue_drained={d} queue_dropped={d} queue_in_flight={d}", .{
+            @tagName(msg.channel_id),
+            msg.agent_name,
+            msg.conversation_key,
+            threadKey(msg.thread_key),
+            msg.sender_id,
+            msg.upstream_id,
+            msg.text.len,
+            stats.enqueued,
+            stats.drained,
+            stats.dropped,
+            self.dispatch.inFlight(),
+        });
         processOne(self, msg) catch |err| {
             log.warn("turn failed for agent={s}: {s}", .{
                 msg.agent_name,
@@ -139,6 +169,20 @@ fn processOne(self: *Worker, msg: spec.InboundMessage) TurnError!void {
         return;
     };
 
+    const started_ns = monotonicNowNs();
+    self.dispatch.beginTurn();
+    defer self.dispatch.endTurn();
+
+    log.info("turn start channel={s} agent={s} session={s} conversation={s} thread={s} sender={s} upstream={d} queue_in_flight={d}", .{
+        @tagName(msg.channel_id),
+        msg.agent_name,
+        msg.agent_name,
+        msg.conversation_key,
+        threadKey(msg.thread_key),
+        msg.sender_id,
+        msg.upstream_id,
+        self.dispatch.inFlight(),
+    });
     const req: agent_runner.TurnRequest = .{
         .session_id = msg.agent_name,
         .input = msg.text,
@@ -150,9 +194,23 @@ fn processOne(self: *Worker, msg: spec.InboundMessage) TurnError!void {
         return err;
     };
     if (!result.completed) {
-        log.info("dispatch: turn returned incomplete for agent={s}", .{msg.agent_name});
+        log.info("turn incomplete channel={s} agent={s} session={s} duration_ms={d}", .{
+            @tagName(msg.channel_id),
+            msg.agent_name,
+            msg.agent_name,
+            elapsedMs(started_ns),
+        });
         return;
     }
+    log.info("turn complete channel={s} agent={s} session={s} completed={} output_bytes={d} duration_ms={d} queue_in_flight={d}", .{
+        @tagName(msg.channel_id),
+        msg.agent_name,
+        msg.agent_name,
+        result.completed,
+        result.output.len,
+        elapsedMs(started_ns),
+        self.dispatch.inFlight(),
+    });
     if (result.output.len == 0) return; // nothing to reply with
 
     // Fan the reply out to the outbox. The sender thread picks it up
@@ -165,6 +223,15 @@ fn processOne(self: *Worker, msg: spec.InboundMessage) TurnError!void {
         log.warn("dispatch: outbox append failed: {s}", .{@errorName(err)});
         return err;
     };
+    log.info("outbox queued channel={s} agent={s} conversation={s} thread={s} record_id={s} reply_bytes={d} turn_duration_ms={d}", .{
+        @tagName(msg.channel_id),
+        msg.agent_name,
+        msg.conversation_key,
+        threadKey(msg.thread_key),
+        record_id,
+        result.output.len,
+        elapsedMs(started_ns),
+    });
     // Append returns a caller-owned id the sender would use to ack;
     // we don't track it here (the sender walks the outbox by cursor
     // order, not by id).

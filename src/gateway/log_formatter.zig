@@ -8,8 +8,8 @@
 //!
 //! Level gating is a global atomic so `--verbose` can flip debug
 //! on at runtime without having to rebuild with a different
-//! log_level. Non-gateway scopes fall through to a plain formatter
-//! so `std.log` calls outside the gateway still surface.
+//! log_level. When a file sink is installed, debug lines are still
+//! persisted even if they are hidden from the gateway console.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,12 +37,37 @@ pub var verbose_enabled: std.atomic.Value(bool) = .init(false);
 /// `NO_COLOR` honour flip this off up front.
 pub var color_enabled: std.atomic.Value(bool) = .init(false);
 
+pub const FileSink = struct {
+    ptr: *anyopaque,
+    append: *const fn (ptr: *anyopaque, line: []const u8) void,
+};
+
+var file_sink: ?FileSink = null;
+var file_sink_lock: std.atomic.Value(bool) = .init(false);
+
+fn lockFileSink() void {
+    while (true) {
+        if (file_sink_lock.cmpxchgStrong(false, true, .acquire, .monotonic) == null) return;
+        std.Thread.yield() catch {};
+    }
+}
+
+fn unlockFileSink() void {
+    file_sink_lock.store(false, .release);
+}
+
 pub fn setVerbose(on: bool) void {
     verbose_enabled.store(on, .release);
 }
 
 pub fn setColor(on: bool) void {
     color_enabled.store(on, .release);
+}
+
+pub fn setFileSink(sink: ?FileSink) void {
+    lockFileSink();
+    defer unlockFileSink();
+    file_sink = sink;
 }
 
 // ── std_options hook ─────────────────────────────────────────
@@ -56,9 +81,8 @@ pub fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    // Gate `.debug` behind the verbose flag so info is the default
-    // floor and debug only fires under `--verbose`.
-    if (level == .debug and !verbose_enabled.load(.acquire)) return;
+    const verbose = verbose_enabled.load(.acquire);
+    const emit_console = level != .debug or verbose;
 
     // Suppress vaxis's `.info` chatter ("kitty keyboard capability
     // detected", etc.). It writes to stderr before the alt-screen
@@ -69,21 +93,20 @@ pub fn logFn(
     // any scope continue to log at all levels.
     if (scope == .vaxis and level == .info) return;
 
-    // Build the line into a stack buffer. We avoid heap allocation
-    // in the log path so logging stays usable under OOM.
-    var buf: [4096]u8 = undefined;
-    var bw = std.Io.Writer.fixed(&buf);
+    if (emit_console) {
+        var buf: [4096]u8 = undefined;
+        var bw = std.Io.Writer.fixed(&buf);
 
-    const color = color_enabled.load(.acquire);
-    writeTimestamp(&bw, color);
-    writeScopeAndLevel(&bw, level, scope, color);
-    bw.print(format, args) catch return;
-    bw.writeAll("\n") catch return;
+        const color = color_enabled.load(.acquire);
+        writeTimestamp(&bw, color);
+        writeScopeAndLevel(&bw, level, scope, color);
+        bw.print(format, args) catch return;
+        bw.writeAll("\n") catch return;
 
-    // Best-effort write to stderr via the libc file descriptor so
-    // we don't need a std.Io handle here.
-    const written = bw.buffered();
-    writeStderr(written);
+        writeStderr(bw.buffered());
+    }
+
+    writeFileLine(level, scope, format, args);
 }
 
 fn writeStderr(bytes: []const u8) void {
@@ -98,6 +121,25 @@ fn writeStderr(bytes: []const u8) void {
     // POSIX: libc write(2) is async-signal-safe and doesn't allocate.
     // Zig 0.16 dropped std.posix.write; we reach for libc directly.
     _ = std.c.write(2, bytes.ptr, bytes.len);
+}
+
+fn writeFileLine(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    lockFileSink();
+    defer unlockFileSink();
+
+    const sink = file_sink orelse return;
+    var buf: [4096]u8 = undefined;
+    var bw = std.Io.Writer.fixed(&buf);
+    writeTimestamp(&bw, false);
+    writeScopeAndLevel(&bw, level, scope, false);
+    bw.print(format, args) catch return;
+    bw.writeAll("\n") catch return;
+    sink.append(sink.ptr, bw.buffered());
 }
 
 fn nowEpochSecs() i64 {
@@ -174,4 +216,37 @@ test "setColor toggles the gate" {
     try testing.expect(color_enabled.load(.acquire));
     setColor(false);
     try testing.expect(!color_enabled.load(.acquire));
+}
+
+test "setFileSink accepts and clears a sink" {
+    const Capture = struct {
+        var calls: u32 = 0;
+        fn append(_: *anyopaque, _: []const u8) void {
+            calls += 1;
+        }
+    };
+    var byte: u8 = 0;
+    setFileSink(.{ .ptr = &byte, .append = Capture.append });
+    setFileSink(null);
+    try testing.expectEqual(@as(u32, 0), Capture.calls);
+}
+
+test "logFn persists debug lines when verbose is disabled" {
+    const Capture = struct {
+        var calls: u32 = 0;
+        fn append(_: *anyopaque, line: []const u8) void {
+            calls += 1;
+            testing.expect(std.mem.indexOf(u8, line, "[gateway:debug] deep metric=7") != null) catch unreachable;
+        }
+    };
+
+    defer setFileSink(null);
+    defer setVerbose(false);
+    var byte: u8 = 0;
+    Capture.calls = 0;
+    setVerbose(false);
+    setFileSink(.{ .ptr = &byte, .append = Capture.append });
+
+    logFn(.debug, .gateway, "deep metric={d}", .{7});
+    try testing.expectEqual(@as(u32, 1), Capture.calls);
 }

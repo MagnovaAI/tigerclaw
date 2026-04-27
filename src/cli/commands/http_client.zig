@@ -91,6 +91,8 @@ pub const Options = struct {
     retry_delay_ns: u64 = 50 * std.time.ns_per_ms,
 };
 
+pub const ChunkSink = *const fn (ctx: ?*anyopaque, bytes: []const u8) Error!void;
+
 /// Issue one request, retrying once on `ConnectionRefused`. Writes the
 /// response body into `body_out` (pass a discarding writer to drop it).
 pub fn send(
@@ -104,6 +106,98 @@ pub fn send(
     defer client.deinit();
 
     return doFetchWith(io, req, body_out, opts, &client, fetchOnceFromClient);
+}
+
+/// Issue one request and stream response body chunks to `sink` as soon
+/// as the socket yields bytes. Used for SSE; unlike `send`, this does
+/// not buffer the full body before callers can parse events.
+pub fn sendStreaming(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    req: Request,
+    sink: ChunkSink,
+    sink_ctx: ?*anyopaque,
+    opts: Options,
+) Error!Response {
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    return streamOnce(allocator, io, &client, req, sink, sink_ctx) catch |err| switch (err) {
+        error.ConnectionRefused => blk: {
+            std.Io.sleep(io, std.Io.Duration.fromNanoseconds(@intCast(opts.retry_delay_ns)), .awake) catch {};
+            break :blk streamOnce(allocator, io, &client, req, sink, sink_ctx) catch |retry_err| switch (retry_err) {
+                error.ConnectionRefused => return error.GatewayDown,
+                else => return classifyStreamTransport(retry_err),
+            };
+        },
+        else => return classifyStreamTransport(err),
+    };
+}
+
+const StreamError = std.http.Client.RequestError ||
+    std.http.Client.Request.ReceiveHeadError ||
+    std.Io.Writer.Error ||
+    std.Io.Reader.ShortError ||
+    Error;
+
+fn streamOnce(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    client: *std.http.Client,
+    req_opts: Request,
+    sink: ChunkSink,
+    sink_ctx: ?*anyopaque,
+) StreamError!Response {
+    _ = allocator;
+    _ = io;
+    const uri = std.Uri.parse(req_opts.url) catch return error.InvalidResponse;
+    var auth_buf: [256]u8 = undefined;
+    var extra: [3]std.http.Header = undefined;
+    var extra_len: usize = 0;
+
+    if (req_opts.bearer) |token| {
+        const rendered = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch
+            return error.InvalidResponse;
+        extra[extra_len] = .{ .name = "authorization", .value = rendered };
+        extra_len += 1;
+    }
+    if (req_opts.json_body != null) {
+        extra[extra_len] = .{ .name = "content-type", .value = "application/json" };
+        extra_len += 1;
+    }
+    if (req_opts.accept) |a| {
+        extra[extra_len] = .{ .name = "accept", .value = a };
+        extra_len += 1;
+    }
+
+    var request = try client.request(req_opts.method.toStd(), uri, .{
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .extra_headers = extra[0..extra_len],
+    });
+    defer request.deinit();
+
+    if (req_opts.json_body) |payload| {
+        try request.sendBodyComplete(@constCast(payload));
+    } else {
+        try request.sendBodiless();
+    }
+
+    var response = try request.receiveHead(&.{});
+    const classified = try classifyResponse(.{ .status = response.head.status });
+
+    var transfer_buffer: [64]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = reader.readSliceShort(&chunk) catch |err| switch (err) {
+            error.ReadFailed => return err,
+        };
+        if (n == 0) break;
+        try sink(sink_ctx, chunk[0..n]);
+    }
+
+    return classified;
 }
 
 const FetchFn = *const fn (
@@ -170,6 +264,13 @@ fn fetchOnceFromClient(
 }
 
 fn classifyTransport(err: std.http.Client.FetchError) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidResponse,
+    };
+}
+
+fn classifyStreamTransport(err: StreamError) Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidResponse,

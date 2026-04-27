@@ -180,10 +180,9 @@ pub fn attachRunner(self: *Root, runner: *harness.AgentRunner, app: *vxfw.App) v
     self.app = app;
 }
 
-/// Tell the status bar whether a gateway daemon is reachable.
-/// The TUI itself runs the runner in-process and doesn't depend
-/// on the gateway, but operators want to see at a glance whether
-/// the daemon is up so they know remote agents can register.
+/// Tell the status bar whether the gateway daemon is reachable.
+/// The TUI sends turns through the daemon, so this must reflect the
+/// live probe instead of assuming the gateway is on.
 pub fn setGatewayOn(self: *Root, on: bool) void {
     self.status_bar.gateway_on = on;
 }
@@ -300,15 +299,14 @@ fn dispatchCommand(self: *Root, cmd: []const u8) void {
         return;
     }
     if (std.mem.eql(u8, name, "tools")) {
-        if (std.mem.eql(u8, args, "on")) {
+        if (args.len == 0 or std.mem.eql(u8, args, "on")) {
             self.tool_output_enabled = true;
             self.appendLine(.system, "tool output: on") catch {};
         } else if (std.mem.eql(u8, args, "off")) {
             self.tool_output_enabled = false;
             self.appendLine(.system, "tool output: off") catch {};
         } else {
-            const msg = if (self.tool_output_enabled) "tool output: on (use `/tools off` to hide)" else "tool output: off (use `/tools on` to show)";
-            self.appendLine(.system, msg) catch {};
+            self.appendLine(.system, "usage: /tools [on|off]") catch {};
         }
         return;
     }
@@ -648,6 +646,8 @@ fn beginTurn(self: *Root, typed: []const u8) !void {
     self.pending_saw_text = false;
 
     self.thinking.pending = true;
+    self.thinking.stopping = false;
+    self.status_bar.turn_stopping = false;
     self.thinking.spinner_tick = 0;
     // Rotate verb per turn via a cheap LCG; anything is fine here
     // since we just want the verb to change each time.
@@ -703,7 +703,12 @@ fn workerMain(ctx: *WorkerCtx) void {
         .tool_event_sink = toolEventSink,
         .tool_event_sink_ctx = @ptrCast(ctx),
     }) catch |err| {
-        postError(ctx, @errorName(err));
+        const message = switch (err) {
+            error.GatewayDown => "gateway unreachable; start tigerclaw gateway",
+            error.Interrupted, error.Cancelled => "turn cancelled",
+            else => @errorName(err),
+        };
+        postError(ctx, message);
         postDone(ctx);
         return;
     };
@@ -862,6 +867,12 @@ fn eventHandler(
                 !(self.input.buf.items.len > 0 and self.input.buf.items[0] == '/') and
                 key.matches(vaxis.Key.escape, .{});
             if (esc_pending_turn) {
+                if (!self.thinking.stopping) {
+                    self.thinking.stopping = true;
+                    self.status_bar.turn_stopping = true;
+                    self.hint.left = "stopping turn  ·  waiting for gateway cancel";
+                    try self.appendLine(.system, "∙ stopping turn…");
+                }
                 self.runner.?.cancel(0);
                 // If the agent was in an ask_user wait, clear the
                 // UI-side pending flag here (we're already on the
@@ -876,7 +887,9 @@ fn eventHandler(
                     if (self.pending_reply) |slot| self.allocator.free(slot);
                     self.pending_reply = null;
                     self.endPendingReply();
-                    self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
+                    if (!self.thinking.stopping) {
+                        self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
+                    }
                 }
                 ctx.consumeAndRedraw();
                 return;
@@ -1225,7 +1238,13 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         defer self.allocator.free(message_slice);
 
         var buf: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "! turn failed: {s}", .{p.message}) catch "! turn failed";
+        const cancelled = std.mem.eql(u8, p.message, "turn cancelled") or
+            std.mem.eql(u8, p.message, "Interrupted") or
+            std.mem.eql(u8, p.message, "Cancelled");
+        const line = if (cancelled)
+            "∙ turn cancelled"
+        else
+            std.fmt.bufPrint(&buf, "! turn failed: {s}", .{p.message}) catch "! turn failed";
         try self.appendLine(.system, line);
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_done)) {
@@ -1251,7 +1270,10 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         self.pending_agent_line = null;
         self.pending_saw_text = false;
         self.thinking.pending = false;
+        self.thinking.stopping = false;
+        self.status_bar.turn_stopping = false;
         self.turn_started_ms = 0;
+        self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
         ctx.redraw = true;
     }
 }
@@ -1720,4 +1742,25 @@ pub fn toggleAllToolExpand(self: *Root) !usize {
         n += 1;
     }
     return n;
+}
+
+const testing = std.testing;
+
+test "root: tool output defaults on" {
+    var root = Root.init(testing.allocator, .{});
+    defer root.deinit();
+
+    try testing.expect(root.tool_output_enabled);
+}
+
+test "root: /tools without args enables output" {
+    var root = Root.init(testing.allocator, .{});
+    defer root.deinit();
+    root.tool_output_enabled = false;
+
+    root.dispatchCommand("tools");
+
+    try testing.expect(root.tool_output_enabled);
+    try testing.expect(root.history.items.len == 1);
+    try testing.expectEqualStrings("tool output: on", root.history.items[0].text.items);
 }

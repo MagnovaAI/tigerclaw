@@ -28,6 +28,7 @@ ctx_used: u64 = 0,
 /// bar then renders just the used count, no bar, no percent.
 ctx_max: u64 = 0,
 gateway_on: bool = false,
+turn_stopping: bool = false,
 /// Sandbox state. `unlocked` shows just the word; `locked` shows
 /// `locked: <last-3-path-segments>`.
 sandbox_locked: bool = false,
@@ -126,7 +127,14 @@ pub fn draw(self: *const StatusBar, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     }
     col = writeSep(ctx, surface, col, sep_style, width);
 
-    // 5. sandbox: unlocked or `locked: tail`
+    // 5. turn state: only shown when cancel is actively in flight.
+    if (self.turn_stopping) {
+        col = writeText(ctx, surface, col, "turn: ", sep_style, width);
+        col = writeText(ctx, surface, col, "stopping", caution_style, width);
+        col = writeSep(ctx, surface, col, sep_style, width);
+    }
+
+    // 6. sandbox: unlocked or `locked: tail`
     if (self.sandbox_locked) {
         col = writeText(ctx, surface, col, "locked: ", caution_style, width);
         const tail = lastNSegments(self.sandbox_path, 3);

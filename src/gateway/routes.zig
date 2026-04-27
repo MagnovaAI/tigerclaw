@@ -20,6 +20,8 @@ const db_mod = @import("../db/root.zig");
 const clock_mod = @import("clock");
 const instance_auth = @import("../instances/auth.zig");
 
+const log = std.log.scoped(.gateway_routes);
+
 pub const Context = struct {
     runner: harness.AgentRunner,
     /// Optional runtime registry. When set, `/health` reports the
@@ -203,6 +205,7 @@ fn sessionsListHandler(
 ) dispatcher.HandlerError!http.Response {
     // The mock gateway does not persist sessions; return an empty
     // array so clients can smoke-test the shape.
+    log.info("sessions list requested", .{});
     return http.Response.jsonOk("{\"sessions\":[]}");
 }
 
@@ -213,6 +216,7 @@ fn sessionsCreateHandler(
     _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     // Always returns a fixed mock id so tests are deterministic.
+    log.info("session created id=mock-session", .{});
     return .{
         .status = .created,
         .headers = &json_headers,
@@ -227,6 +231,7 @@ fn sessionsGetHandler(
     _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     const id = findParam(params, "id") orelse return error.BadRequest;
+    log.info("session get id={s}", .{id});
     if (std.mem.eql(u8, id, "mock-session")) {
         return http.Response.jsonOk("{\"id\":\"mock-session\",\"turns\":0}");
     }
@@ -239,17 +244,19 @@ fn sessionsDeleteHandler(
     _: ?[]const u8,
     _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
-    _ = findParam(params, "id") orelse return error.BadRequest;
+    const id = findParam(params, "id") orelse return error.BadRequest;
+    log.info("session deleted id={s}", .{id});
     return .{ .status = .no_content };
 }
 
 fn sessionsMessageHandler(
-    _: http.Request,
+    req: http.Request,
     params: []const router.Param,
     _: ?[]const u8,
     _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
-    _ = findParam(params, "id") orelse return error.BadRequest;
+    const id = findParam(params, "id") orelse return error.BadRequest;
+    log.info("session message accepted id={s} body_bytes={d}", .{ id, req.body.len });
     return .{ .status = .accepted };
 }
 
@@ -261,6 +268,11 @@ fn sessionsTurnHandler(
 ) dispatcher.HandlerError!http.Response {
     const ctx = try contextOrInternal();
     const id = findParam(params, "id") orelse return error.BadRequest;
+    log.info("session turn requested id={s} body_bytes={d} sse={}", .{
+        id,
+        req.body.len,
+        wantsSse(req),
+    });
 
     // Budget gate — see the non-streaming note below, same semantics.
     if (ctx.budget) |b| {
@@ -271,8 +283,16 @@ fn sessionsTurnHandler(
         };
     }
 
-    const message_or_empty = extractMessage(req.body) catch return error.BadRequest;
-    const message = if (message_or_empty.len > 0) message_or_empty else "ping";
+    var extracted_message = extractMessage(std.heap.page_allocator, req.body) catch |err| switch (err) {
+        error.BadRequest => {
+            log.warn("session turn rejected id={s} body_bytes={d} err={s}", .{ id, req.body.len, @errorName(err) });
+            return error.BadRequest;
+        },
+        error.OutOfMemory => return error.InternalServerError,
+    };
+    defer extracted_message.deinit(std.heap.page_allocator);
+    const message = if (extracted_message.text.len > 0) extracted_message.text else "ping";
+    log.info("session turn input id={s} message_bytes={d}", .{ id, message.len });
 
     // Non-streaming path (e.g. the CLI smoke tests that don't ask for
     // SSE) still goes through the blocking run + JSON envelope. The
@@ -284,9 +304,11 @@ fn sessionsTurnHandler(
             error.BudgetExceeded => return .{ .status = .too_many_requests, .body = "budget exceeded\n" },
             else => return error.InternalServerError,
         };
+        log.info("session turn completed id={s} output_bytes={d}", .{ id, result.output.len });
         return renderJsonFromOutput(result.output);
     }
 
+    log.info("session turn streaming id={s}", .{id});
     return streamTurn(ctx, stream_hook.?, id, message);
 }
 
@@ -336,7 +358,15 @@ fn streamTurn(
         .tool_event_sink_ctx = &frame_ctx,
     });
 
-    if (run_err) |_| {
+    if (run_err) |result| {
+        if (frame_ctx.chunk_count == 0 and result.output.len > 0) {
+            writeChunkFrame(&body_writer, result.output) catch {};
+        }
+        log.info("session turn stream completed id={s} chunks={d} output_bytes={d}", .{
+            session_id,
+            frame_ctx.chunk_count,
+            result.output.len,
+        });
         writeFrame(&body_writer, "{\"type\":\"done\"}") catch {};
     } else |err| {
         const msg = switch (err) {
@@ -358,10 +388,12 @@ fn streamTurn(
 /// every sink signature.
 const StreamCtx = struct {
     body: *std.http.BodyWriter,
+    chunk_count: u64 = 0,
 };
 
 fn chunkSink(ctx: ?*anyopaque, fragment: []const u8) void {
     const self: *StreamCtx = @ptrCast(@alignCast(ctx.?));
+    self.chunk_count += 1;
     writeChunkFrame(self.body, fragment) catch {};
 }
 
@@ -429,27 +461,32 @@ fn writeErrorFrame(body: *std.http.BodyWriter, message: []const u8) !void {
     try body.writer.flush();
 }
 
-/// Pull `message` out of the request body JSON. Empty body → empty
+const ExtractedMessage = struct {
+    text: []const u8,
+    owned: ?[]u8 = null,
+
+    fn deinit(self: ExtractedMessage, allocator: std.mem.Allocator) void {
+        if (self.owned) |owned| allocator.free(owned);
+    }
+};
+
+/// Pull `message` out of the request body JSON. Empty body -> empty
 /// string (the runner falls back to a deterministic prompt). Returns
-/// `error.BadRequest` for malformed JSON or non-string `message` to
-/// surface a typo at the wire boundary instead of inside the runner.
-fn extractMessage(body: []const u8) error{BadRequest}![]const u8 {
-    if (body.len == 0) return "";
-    // We need a leaky parse so we can borrow the slice into the body
-    // bytes without re-allocating. The handler returns immediately
-    // after this; the tcp_server frees `body` once dispatch finishes.
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch
+/// an owned decoded copy so prompts containing JSON escapes (`\"`,
+/// `\n`, unicode) do not fail at the wire boundary.
+fn extractMessage(allocator: std.mem.Allocator, body: []const u8) error{ BadRequest, OutOfMemory }!ExtractedMessage {
+    if (body.len == 0) return .{ .text = "" };
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
         return error.BadRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.BadRequest;
-    const m = parsed.value.object.get("message") orelse return "";
+    const m = parsed.value.object.get("message") orelse
+        parsed.value.object.get("input") orelse
+        parsed.value.object.get("prompt") orelse
+        return .{ .text = "" };
     if (m != .string) return error.BadRequest;
-    // Slice aliases the parsed arena; that arena dies at deinit above.
-    // We re-find the slice in the original body so the returned slice
-    // outlives this function.
-    const needle = m.string;
-    const start = std.mem.indexOf(u8, body, needle) orelse return error.BadRequest;
-    return body[start .. start + needle.len];
+    const owned = try allocator.dupe(u8, m.string);
+    return .{ .text = owned, .owned = owned };
 }
 
 /// Shared buffer for both the SSE and JSON renderers. Threadlocal
@@ -494,6 +531,7 @@ fn instancesListHandler(
 ) dispatcher.HandlerError!http.Response {
     const ctx = try contextOrInternal();
     const db = ctx.db orelse return dbUnavailable();
+    log.info("instances list requested", .{});
 
     var repo = db_mod.InstanceRepo.init(db);
     var list = repo.listLive(std.heap.page_allocator) catch return error.InternalServerError;
@@ -546,6 +584,13 @@ fn instancesRegisterHandler(
     const io = ctx.io orelse return dbUnavailable();
 
     const args = parseRegisterBody(req.body) catch return error.BadRequest;
+    log.info("instance registering kind={s} name={s} agent={s} session={s} heartbeat_ms={d}", .{
+        args.kind.toString(),
+        args.name,
+        args.agent_id,
+        args.session_id,
+        args.heartbeat_interval_ms,
+    });
 
     var id_buf: [16]u8 = undefined;
     const id = instance_auth.genInstanceId(io, &id_buf, args.kind.toString()) catch
@@ -566,6 +611,13 @@ fn instancesRegisterHandler(
         .last_heartbeat_at_ns = now,
     }) catch return error.InternalServerError;
     _ = repo.setTokenHash(id, &token_hash) catch return error.InternalServerError;
+    log.info("instance registered id={s} kind={s} name={s} agent={s} session={s}", .{
+        id,
+        args.kind.toString(),
+        args.name,
+        args.agent_id,
+        args.session_id,
+    });
 
     var w = std.Io.Writer.fixed(&render_body_buf);
     w.writeAll("{\"id\":\"") catch return error.InternalServerError;
@@ -598,6 +650,7 @@ fn instancesHeartbeatHandler(
     const clock = ctx.clock orelse return dbUnavailable();
 
     const id = findParam(params, "id") orelse return error.BadRequest;
+    log.info("instance heartbeat id={s}", .{id});
 
     var repo = db_mod.InstanceRepo.init(db);
     switch (try resolveInstanceAuth(&repo, req, id)) {
@@ -605,7 +658,10 @@ fn instancesHeartbeatHandler(
         .response => |r| return r,
     }
     const ok = repo.heartbeat(id, clock.nowNs()) catch return error.InternalServerError;
-    if (!ok) return http.Response.notFound();
+    if (!ok) {
+        log.warn("instance heartbeat unknown id={s}", .{id});
+        return http.Response.notFound();
+    }
     return .{ .status = .no_content };
 }
 
@@ -624,6 +680,7 @@ fn instancesDeleteHandler(
     const ctx = try contextOrInternal();
     const db = ctx.db orelse return dbUnavailable();
     const id = findParam(params, "id") orelse return error.BadRequest;
+    log.info("instance delete id={s}", .{id});
 
     var repo = db_mod.InstanceRepo.init(db);
     switch (try resolveInstanceAuth(&repo, req, id)) {
@@ -631,6 +688,7 @@ fn instancesDeleteHandler(
         .response => |r| return r,
     }
     repo.delete(id) catch return error.InternalServerError;
+    log.info("instance deleted id={s}", .{id});
     return .{ .status = .no_content };
 }
 
@@ -744,7 +802,8 @@ fn sessionsTurnCancelHandler(
     _: dispatcher.StreamHook,
 ) dispatcher.HandlerError!http.Response {
     const ctx = try contextOrInternal();
-    _ = findParam(params, "id") orelse return error.BadRequest;
+    const id = findParam(params, "id") orelse return error.BadRequest;
+    log.info("session turn cancel id={s}", .{id});
 
     // The mock runner ignores the turn id; production will plumb a
     // session→turn map so cancel reaches the right react loop. The
@@ -933,6 +992,24 @@ fn runTurnSseFallback(runner: *harness.MockAgentRunner) anyerror!void {
 
 test "routes: POST /sessions/:id/turns falls back to JSON when no stream hook present" {
     try withMockContext(runTurnSseFallback);
+}
+
+test "routes: extractMessage decodes escaped quotes" {
+    const body =
+        \\{"message":"\"scan home\""}
+    ;
+    const msg = try extractMessage(testing.allocator, body);
+    defer msg.deinit(testing.allocator);
+    try testing.expectEqualStrings("\"scan home\"", msg.text);
+}
+
+test "routes: extractMessage accepts input alias" {
+    const body =
+        \\{"input":"hello"}
+    ;
+    const msg = try extractMessage(testing.allocator, body);
+    defer msg.deinit(testing.allocator);
+    try testing.expectEqualStrings("hello", msg.text);
 }
 
 fn runTurnCancel(_: *harness.MockAgentRunner) anyerror!void {

@@ -7,17 +7,20 @@
 //! isolation. Here we:
 //!
 //!   1. Bind a TCP listener via `std.Io.net.IpAddress.listen`.
-//!   2. In a loop: `accept` → wrap the stream in `std.http.Server` →
-//!      `receiveHead` → translate to `gateway.http.Request` →
-//!      `dispatcher.dispatch` → `request.respond` with the response.
+//!   2. In a loop: `accept` → hand the stream to a detached worker →
+//!      wrap the stream in `std.http.Server` → `receiveHead` →
+//!      translate to `gateway.http.Request` → `dispatcher.dispatch`
+//!      → `request.respond` with the response.
 //!   3. Honour an atomic shutdown flag so signal handlers can ask the
 //!      loop to drain and exit between connections.
 //!
-//! The connection model is intentionally one-shot per accept: each
-//! request is read, dispatched, responded, and the socket is closed.
-//! Keep-alive and pipelining are not implemented in beta — the daemon
-//! handles request volume by being a local-only control plane, not a
-//! production HTTP server.
+//! The connection model is intentionally one-shot per accepted stream:
+//! each request is read, dispatched, responded, and the socket is
+//! closed. Workers are detached so a long-lived SSE turn does not
+//! block control requests such as DELETE /turns/current. Keep-alive
+//! and pipelining are not implemented in beta — the daemon handles
+//! request volume by being a local-only control plane, not a production
+//! HTTP server.
 //!
 //! Signal handlers are installed via `installShutdownHandlers` which
 //! points SIGINT and SIGTERM at the shared `should_stop` flag. Tests
@@ -29,6 +32,7 @@ const builtin = @import("builtin");
 const router = @import("router.zig");
 const http = @import("http.zig");
 const dispatcher = @import("dispatcher.zig");
+const telemetry_mod = @import("../telemetry.zig");
 
 /// Process-wide stop flag. The accept loop reads it between
 /// connections; signal handlers and tests set it to ask the server to
@@ -69,6 +73,15 @@ pub const ServeOptions = struct {
     max_request_headers: usize = http.max_request_headers,
 };
 
+const ConnectionJob = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    routes: []const router.Route,
+    handlers: dispatcher.HandlerMap,
+    opts: ServeOptions,
+};
+
 /// Bind, accept, dispatch. Returns when `should_stop` is observed
 /// true between connections, or when the listener errors fatally.
 pub fn serve(
@@ -105,14 +118,50 @@ pub fn serve(
             error.SocketNotListening => return,
             else => return error.AcceptFailed,
         };
-        defer stream.close(io);
+        if (should_stop.load(.acquire)) {
+            stream.close(io);
+            break;
+        }
 
-        handleConnection(allocator, io, &stream, routes, handlers, opts) catch {
-            // Per-connection failures are intentionally swallowed; the
-            // server stays up. A future commit can plumb a structured
-            // log sink so each failure becomes a daemon log line.
+        const job = allocator.create(ConnectionJob) catch |err| {
+            stream.close(io);
+            return err;
         };
+        job.* = .{
+            .allocator = allocator,
+            .io = io,
+            .stream = stream,
+            .routes = routes,
+            .handlers = handlers,
+            .opts = opts,
+        };
+
+        const thread = std.Thread.spawn(.{}, connectionWorker, .{job}) catch |err| {
+            std.log.scoped(.gateway).warn("connection worker spawn failed: {s}", .{@errorName(err)});
+            job.stream.close(job.io);
+            allocator.destroy(job);
+            continue;
+        };
+        thread.detach();
     }
+}
+
+fn connectionWorker(job: *ConnectionJob) void {
+    defer job.allocator.destroy(job);
+    defer job.stream.close(job.io);
+
+    handleConnection(
+        job.allocator,
+        job.io,
+        &job.stream,
+        job.routes,
+        job.handlers,
+        job.opts,
+    ) catch |err| {
+        // Per-connection failures are intentionally swallowed; the
+        // server stays up, but the daemon log keeps the failure.
+        std.log.scoped(.gateway).warn("connection failed: {s}", .{@errorName(err)});
+    };
 }
 
 fn handleConnection(
@@ -123,6 +172,7 @@ fn handleConnection(
     handlers: dispatcher.HandlerMap,
     opts: ServeOptions,
 ) !void {
+    const started_ns = monotonicNowNs();
     const head_buf = try allocator.alloc(u8, opts.head_buffer_bytes);
     defer allocator.free(head_buf);
     const out_buf = try allocator.alloc(u8, 4 * 1024);
@@ -135,6 +185,7 @@ fn handleConnection(
     var request = http_server.receiveHead() catch return;
 
     const method = mapMethod(request.head.method) orelse {
+        logRequestOutcome("UNKNOWN", request.head.target, .method_not_allowed, started_ns);
         try respondStatus(&request, .method_not_allowed, "method not allowed\n");
         return;
     };
@@ -190,18 +241,22 @@ fn handleConnection(
 
     const resp = dispatcher.dispatch(routes, handlers, our_req, @ptrCast(&request)) catch |err| switch (err) {
         error.HandlerMissing, error.InternalServerError => {
+            logRequestOutcome(@tagName(method), target_owned, .internal_server_error, started_ns);
             try respondStatus(&request, .internal_server_error, "internal error\n");
             return;
         },
         error.BadRequest => {
+            logRequestOutcome(@tagName(method), target_owned, .bad_request, started_ns);
             try respondStatus(&request, .bad_request, "bad request\n");
             return;
         },
         error.TooManyParams => {
+            logRequestOutcome(@tagName(method), target_owned, .bad_request, started_ns);
             try respondStatus(&request, .bad_request, "too many path params\n");
             return;
         },
     };
+    logRequestOutcome(@tagName(method), target_owned, resp.status, started_ns);
 
     // If the handler already streamed its response, the connection's
     // BodyWriter has been closed by the handler itself — don't try to
@@ -209,6 +264,49 @@ fn handleConnection(
     if (resp.streaming_handled) return;
 
     try respondResolved(&request, resp);
+}
+
+fn monotonicNowNs() i128 {
+    if (builtin.os.tag == .windows) return 0;
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+}
+
+fn elapsedMs(started_ns: i128) u64 {
+    const now = monotonicNowNs();
+    if (now <= started_ns) return 0;
+    return @intCast(@divTrunc(now - started_ns, std.time.ns_per_ms));
+}
+
+fn logRequestOutcome(method: []const u8, target: []const u8, status: http.Status, started_ns: i128) void {
+    const scope = std.log.scoped(.gateway);
+    const elapsed_ms = elapsedMs(started_ns);
+    scope.info("{s} {s} -> {d} {d}ms", .{ method, target, @intFromEnum(status), elapsed_ms });
+
+    const sample = telemetry_mod.sampleResources();
+    scope.debug(
+        "[RAM:{d}MiB,CPU:{d}.{d:0>2}%] metric request method={s} target={s} status={d} duration_ms={d} app_cpu_used_us={d} app_cpu_percent_x100={d} app_cpu_available_cores={d} cpu_user_us={d} cpu_system_us={d} app_ram_used_bytes={d} app_ram_available_bytes={d} system_ram_total_bytes={d} app_ram_used_pct_x100={d} app_ram_peak_bytes={d}",
+        .{
+            sample.app_ram_used_bytes / std.math.pow(u64, 1024, 2),
+            sample.cpu_percent_x100 / 100,
+            sample.cpu_percent_x100 % 100,
+            method,
+            target,
+            @intFromEnum(status),
+            elapsed_ms,
+            sample.cpu_total_us,
+            sample.cpu_percent_x100,
+            sample.cpu_logical_cores,
+            sample.cpu_user_us,
+            sample.cpu_system_us,
+            sample.app_ram_used_bytes,
+            sample.appRamAvailableBytes(),
+            sample.system_ram_total_bytes,
+            sample.appRamUsedPctX100(),
+            sample.max_rss_bytes,
+        },
+    );
 }
 
 fn respondResolved(request: *std.http.Server.Request, resp: http.Response) !void {
