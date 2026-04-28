@@ -713,6 +713,9 @@ pub const ue_tick = "tui.tick";
 pub const ue_ask_user = "tui.ask_user";
 pub const ue_ask_user_cancel = "tui.ask_user_cancel";
 pub const ue_usage = "tui.usage";
+/// Per-slot timeout fired by the sub-turn watchdog. Posted with a
+/// `SubturnTimeoutPayload` matching the slot key.
+pub const ue_subturn_timeout = "tui.subturn_timeout";
 
 // Every event payload carries the `turn_epoch` it was produced
 // under. The main-loop handler drops payloads whose epoch no longer
@@ -742,6 +745,45 @@ pub const UsagePayload = struct { epoch: u64, ctx_used: u64 };
 /// Carries just an epoch — used by `ue_done` so the handler can
 /// drop stale completions the same way it drops stale chunks.
 pub const EmptyPayload = struct { epoch: u64 };
+
+/// Posted by `postDone` when a turn completes successfully. Carries
+/// the dispatch metadata echoed by the runner so the auto-dispatch
+/// state machine can branch on `dispatch_kind` and the mention
+/// scanner can read `output` directly (D4 forbids reconstructing
+/// from transcript text). All slices are heap-owned by the payload
+/// and freed by the handler — see `dropStaleIfNeeded` for the stale
+/// path and the `ue_done` branch for the live path.
+pub const DonePayload = struct {
+    epoch: u64,
+    /// Echoed from the originating `TurnRequest`. Distinguishes a
+    /// primary user-triggered turn from an auto-dispatched sub-turn
+    /// or invoker resume.
+    dispatch_kind: harness.agent_runner.DispatchKind,
+    /// For `.subturn`: the inviting agent. Owned heap slice. Null
+    /// for `.primary` and `.resume_`.
+    invoker: ?[]u8,
+    /// Agent that ran the turn. Owned heap slice.
+    target_agent: []u8,
+    /// Mention-order index from the invoker's reply. 0 for primary
+    /// and resume turns.
+    mention_idx: u8,
+    /// Final assistant text from the turn. Owned heap slice; may
+    /// be empty if the turn produced no text (tool-only round, or
+    /// an error path that posted done after the error).
+    output: []u8,
+};
+
+/// Posted by the per-slot timeout watchdog when a sub-turn exceeds
+/// its wall-clock cap. The handler matches the slot by
+/// `(invoker, mention_idx, target)` and marks it `timed_out` if
+/// still `in_flight`. Late `ue_done` for a timed-out slot is
+/// discarded by the same triple match.
+pub const SubturnTimeoutPayload = struct {
+    epoch: u64,
+    invoker: []u8,
+    target: []u8,
+    mention_idx: u8,
+};
 
 /// One in-flight sub-turn under the cross-agent auto-dispatch tree.
 /// The invoker fans out one slot per known mention in its reply;
@@ -912,7 +954,7 @@ fn workerMain(ctx: *WorkerCtx) void {
 
     const runner = ctx.root.runner orelse {
         postError(ctx, "no runner");
-        postDone(ctx);
+        postDone(ctx, null);
         return;
     };
 
@@ -935,11 +977,11 @@ fn workerMain(ctx: *WorkerCtx) void {
             else => @errorName(err),
         };
         postError(ctx, message);
-        postDone(ctx);
+        postDone(ctx, null);
         return;
     };
     postUsage(ctx, result.usage.contextTokens());
-    postDone(ctx);
+    postDone(ctx, result);
 }
 
 fn postUsage(ctx: *WorkerCtx, ctx_used: u64) void {
@@ -1056,9 +1098,59 @@ fn postError(ctx: *WorkerCtx, message: []const u8) void {
     postUserEvent(ctx, ue_error, payload);
 }
 
-fn postDone(ctx: *WorkerCtx) void {
-    const payload = ctx.allocator.create(EmptyPayload) catch return;
-    payload.* = .{ .epoch = ctx.epoch };
+/// Post a turn-completion event. `result` carries the runner's
+/// echoed dispatch metadata plus the final assistant text so the
+/// auto-dispatch state machine can branch on `dispatch_kind` and
+/// scan `output` directly. Pass `null` from error paths where the
+/// runner never returned a result; the handler then renders error
+/// state but does NOT scan or fan out (a failed primary turn does
+/// not auto-dispatch).
+fn postDone(ctx: *WorkerCtx, result: ?harness.agent_runner.TurnResult) void {
+    const r = result orelse {
+        // Error path: post a stub payload that's `dispatch_kind=primary`
+        // with empty output. The handler's mention scan returns 0 and
+        // no fan-out fires.
+        const payload = ctx.allocator.create(DonePayload) catch return;
+        payload.* = .{
+            .epoch = ctx.epoch,
+            .dispatch_kind = ctx.dispatch_kind,
+            .invoker = if (ctx.invoker) |s| ctx.allocator.dupe(u8, s) catch null else null,
+            .target_agent = ctx.allocator.dupe(u8, ctx.session_id) catch {
+                ctx.allocator.destroy(payload);
+                return;
+            },
+            .mention_idx = ctx.mention_order_idx,
+            .output = ctx.allocator.dupe(u8, "") catch {
+                ctx.allocator.free(payload.target_agent);
+                ctx.allocator.destroy(payload);
+                return;
+            },
+        };
+        postUserEvent(ctx, ue_done, payload);
+        return;
+    };
+
+    const payload = ctx.allocator.create(DonePayload) catch return;
+    const target_dup = ctx.allocator.dupe(u8, if (r.target_agent.len != 0) r.target_agent else ctx.session_id) catch {
+        ctx.allocator.destroy(payload);
+        return;
+    };
+    errdefer ctx.allocator.free(target_dup);
+    const output_dup = ctx.allocator.dupe(u8, r.output) catch {
+        ctx.allocator.free(target_dup);
+        ctx.allocator.destroy(payload);
+        return;
+    };
+    errdefer ctx.allocator.free(output_dup);
+    const invoker_dup: ?[]u8 = if (r.invoker) |s| (ctx.allocator.dupe(u8, s) catch null) else null;
+    payload.* = .{
+        .epoch = ctx.epoch,
+        .dispatch_kind = r.dispatch_kind,
+        .invoker = invoker_dup,
+        .target_agent = target_dup,
+        .mention_idx = r.mention_order_idx,
+        .output = output_dup,
+    };
     postUserEvent(ctx, ue_done, payload);
 }
 
@@ -1159,13 +1251,11 @@ pub fn appendSubturnMarker(
 }
 
 /// Spawn a worker thread that runs a sub-turn for `target`, framed
-/// as if `invoker` had asked it. Pure helper — does NOT scan for new
-/// mentions, does NOT echo a user pill, does NOT touch the budget
-/// counter (caller owns that). Increments `pending_subturns` so
+/// as if `invoker` had asked it. Increments `pending_subturns` so
 /// the auto-dispatch state machine knows when to fire the join.
-///
-/// Step 5a leaves this function callable but unwired from `ue_done`.
-/// Step 5b connects the scan-on-completion path that calls it.
+/// Also spawns a per-slot timeout watchdog that posts
+/// `ue_subturn_timeout` after `auto_dispatch_subturn_timeout_secs`
+/// — the handler ignores it if the slot already completed.
 pub fn dispatchSubturn(
     self: *Root,
     invoker: []const u8,
@@ -1222,6 +1312,167 @@ pub fn dispatchSubturn(
 
     var thread = try std.Thread.spawn(.{}, workerMain, .{ctx});
     thread.detach();
+
+    // Per-slot timeout watchdog. On its own thread so a stuck
+    // provider call can't hold up the timeout. Failure to spawn
+    // is non-fatal — the slot just runs without a wall-clock cap,
+    // which is what we had pre-watchdog.
+    self.spawnSubturnTimeout(invoker, target_canonical, mention_idx) catch {};
+}
+
+/// Heap-owned context the timeout watchdog carries. The watchdog
+/// owns every field; `timeoutWatchdog` frees the lot before exit.
+const SubturnTimeoutCtx = struct {
+    allocator: std.mem.Allocator,
+    app: *vxfw.App,
+    epoch: u64,
+    timeout_ns: u64,
+    invoker: []u8,
+    target: []u8,
+    mention_idx: u8,
+};
+
+fn spawnSubturnTimeout(
+    self: *Root,
+    invoker: []const u8,
+    target: []const u8,
+    mention_idx: u8,
+) !void {
+    const app = self.app orelse return error.NoApp;
+    const ctx = try self.allocator.create(SubturnTimeoutCtx);
+    errdefer self.allocator.destroy(ctx);
+    ctx.* = .{
+        .allocator = self.allocator,
+        .app = app,
+        .epoch = self.turn_epoch,
+        .timeout_ns = @as(u64, self.auto_dispatch_subturn_timeout_secs) * std.time.ns_per_s,
+        .invoker = try self.allocator.dupe(u8, invoker),
+        .target = try self.allocator.dupe(u8, target),
+        .mention_idx = mention_idx,
+    };
+    errdefer ctx.allocator.free(ctx.invoker);
+    errdefer ctx.allocator.free(ctx.target);
+
+    var thread = try std.Thread.spawn(.{}, timeoutWatchdog, .{ctx});
+    thread.detach();
+}
+
+fn timeoutWatchdog(ctx: *SubturnTimeoutCtx) void {
+    defer {
+        ctx.allocator.free(ctx.invoker);
+        ctx.allocator.free(ctx.target);
+        ctx.allocator.destroy(ctx);
+    }
+
+    // Sleep on the wall clock. `nanosleep` handles spurious wake;
+    // we don't bother because timeout precision here is "around
+    // 120 seconds", not microseconds.
+    var req: std.c.timespec = .{
+        .sec = @intCast(ctx.timeout_ns / std.time.ns_per_s),
+        .nsec = @intCast(ctx.timeout_ns % std.time.ns_per_s),
+    };
+    var rem: std.c.timespec = undefined;
+    _ = std.c.nanosleep(&req, &rem);
+
+    const loop = ctx.app.loop orelse return;
+    const payload = ctx.allocator.create(SubturnTimeoutPayload) catch return;
+    payload.* = .{
+        .epoch = ctx.epoch,
+        .invoker = ctx.allocator.dupe(u8, ctx.invoker) catch {
+            ctx.allocator.destroy(payload);
+            return;
+        },
+        .target = ctx.allocator.dupe(u8, ctx.target) catch {
+            ctx.allocator.free(payload.invoker);
+            ctx.allocator.destroy(payload);
+            return;
+        },
+        .mention_idx = ctx.mention_idx,
+    };
+    loop.postEvent(.{ .app = .{ .name = ue_subturn_timeout, .data = payload } });
+}
+
+/// Find the `.in_flight` sub-turn slot matching this completion
+/// triple. Returns null if no slot is in flight for that key —
+/// meaning either we never dispatched it (shouldn't happen), it was
+/// already marked terminal by the timeout watchdog (race), or the
+/// fan-out tree was reset by a fresh user submit (handled by the
+/// epoch gate before we reach here, so this branch is mostly defensive).
+fn findSubturnSlot(
+    self: *Root,
+    invoker: []const u8,
+    target: []const u8,
+    mention_idx: u8,
+) ?*SubturnSlot {
+    for (self.subturn_slots.items) |*slot| {
+        if (slot.state != .in_flight) continue;
+        if (slot.mention_idx != mention_idx) continue;
+        if (!std.ascii.eqlIgnoreCase(slot.target, target)) continue;
+        // The invoker is implicit — there's only one fan-out tree
+        // in flight per user-turn — but matching it explicitly
+        // makes the lookup robust against any future change that
+        // allows nested invocations.
+        if (self.invoker_to_resume) |inv| {
+            if (!std.ascii.eqlIgnoreCase(inv, invoker)) continue;
+        }
+        return slot;
+    }
+    return null;
+}
+
+/// Sub-turn completion: stash the reply, mark the slot done, and if
+/// no slots remain in-flight, the join+resume step (commit 6) takes
+/// over. Today we just record the state so the join has data to
+/// work with.
+fn onSubturnDone(self: *Root, p: *const DonePayload) !void {
+    const invoker = p.invoker orelse return; // sub-turn must have invoker
+    const slot = self.findSubturnSlot(invoker, p.target_agent, p.mention_idx) orelse return;
+    slot.reply = try self.allocator.dupe(u8, p.output);
+    slot.state = .done;
+    if (self.pending_subturns > 0) self.pending_subturns -= 1;
+    // Step 5b stops here. Step 6 will check `pending_subturns == 0`
+    // and dispatch the resume with a joined body. For now the user
+    // simply sees the sub-turn's reply land in history naturally
+    // (chunks already flowed through `chunkSink`); no resume yet.
+}
+
+/// Primary or resume completion: scan the assistant's final text
+/// for known agent mentions and fan out one sub-turn per mention.
+/// `output` is `TurnResult.output` straight from the runner — never
+/// reconstructed from transcript text (D4).
+fn scanAndFanOut(self: *Root, p: *const DonePayload) !void {
+    // No agent set, no mentions to scan against. Common in tests.
+    if (self.agent_names.len == 0) return;
+    if (p.output.len == 0) return;
+
+    // The invoker for the new fan-out is whichever agent just spoke.
+    const invoker = p.target_agent;
+    const matches = mention.findAll(self.allocator, p.output, self.agent_names, invoker) catch return;
+    defer self.allocator.free(matches);
+    if (matches.len == 0) return;
+
+    // Step 5b: dispatch every matched mention as an in-flight sub-turn.
+    // Step 7 will gate this on `auto_dispatch_max_calls`; today we
+    // dispatch all of them.
+    if (self.invoker_to_resume) |old| self.allocator.free(old);
+    self.invoker_to_resume = try self.allocator.dupe(u8, invoker);
+
+    for (matches, 0..) |m, idx| {
+        // `dispatchSubturn` increments `pending_subturns` and
+        // appends the slot before spawning so a fast worker can't
+        // race past us.
+        self.dispatchSubturn(invoker, m.name, @intCast(idx), p.output) catch |e| {
+            // Log via system row; keep going — partial fan-out is
+            // better than dropping the whole tree on one error.
+            var buf: [128]u8 = undefined;
+            const line = std.fmt.bufPrint(
+                &buf,
+                "! subturn dispatch failed for @{s}: {s}",
+                .{ m.name, @errorName(e) },
+            ) catch "! subturn dispatch failed";
+            self.appendLine(.system, line) catch {};
+        };
+    }
 }
 
 pub fn widget(self: *Root) vxfw.Widget {
@@ -1484,7 +1735,15 @@ fn dropStaleIfNeeded(self: *Root, ue: vxfw.UserEvent) bool {
         a.free(p.message);
         a.destroy(p);
     } else if (std.mem.eql(u8, ue.name, ue_done)) {
-        const p: *EmptyPayload = @ptrCast(@alignCast(@constCast(data)));
+        const p: *DonePayload = @ptrCast(@alignCast(@constCast(data)));
+        if (p.invoker) |s| a.free(s);
+        a.free(p.target_agent);
+        a.free(p.output);
+        a.destroy(p);
+    } else if (std.mem.eql(u8, ue.name, ue_subturn_timeout)) {
+        const p: *SubturnTimeoutPayload = @ptrCast(@alignCast(@constCast(data)));
+        a.free(p.invoker);
+        a.free(p.target);
         a.destroy(p);
     } else {
         // Unknown event with a payload — leak the bytes rather than
@@ -1728,12 +1987,24 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         try self.appendLine(.system, line);
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_done)) {
-        // Free the empty epoch-tagged payload posted by `postDone`.
         // Stale completions were already dropped by `dropStaleIfNeeded`
         // above, so reaching here means the epoch matched.
-        if (ue.data) |data| {
-            const p: *EmptyPayload = @ptrCast(@alignCast(@constCast(data)));
-            self.allocator.destroy(p);
+        const data = ue.data orelse return;
+        const p: *const DonePayload = @ptrCast(@alignCast(data));
+        // Defer the free so we can inspect fields below first.
+        defer {
+            if (p.invoker) |s| self.allocator.free(s);
+            self.allocator.free(p.target_agent);
+            self.allocator.free(p.output);
+            self.allocator.destroy(@as(*DonePayload, @constCast(p)));
+        }
+
+        // Branch on dispatch kind. Sub-turn completions slot in
+        // their reply and may trigger a join; primary/resume turns
+        // scan their output for fresh mentions and may fan out.
+        switch (p.dispatch_kind) {
+            .subturn => self.onSubturnDone(p) catch {},
+            .primary, .resume_ => self.scanAndFanOut(p) catch {},
         }
         // Re-parse every agent line we accumulated this turn as
         // markdown, swapping the raw text + null spans for the
@@ -1761,6 +2032,32 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         self.status_bar.turn_stopping = false;
         self.turn_started_ms = 0;
         self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
+        ctx.redraw = true;
+    } else if (std.mem.eql(u8, ue.name, ue_subturn_timeout)) {
+        const data = ue.data orelse return;
+        const p: *const SubturnTimeoutPayload = @ptrCast(@alignCast(data));
+        defer {
+            self.allocator.free(p.invoker);
+            self.allocator.free(p.target);
+            self.allocator.destroy(@as(*SubturnTimeoutPayload, @constCast(p)));
+        }
+
+        // Mark the slot timed-out only if it's still in_flight —
+        // a fast worker may have already posted ue_done. The
+        // resume step (commit 6) will treat `timed_out` slots as
+        // synthetic-error replies.
+        const slot = self.findSubturnSlot(p.invoker, p.target, p.mention_idx) orelse return;
+        slot.state = .timed_out;
+        slot.error_reason = "timeout";
+        if (self.pending_subturns > 0) self.pending_subturns -= 1;
+
+        var buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "! @{s} timed out (no reply within {d}s)",
+            .{ p.target, self.auto_dispatch_subturn_timeout_secs },
+        ) catch "! subturn timed out";
+        self.appendLine(.system, line) catch {};
         ctx.redraw = true;
     }
 }
@@ -2298,6 +2595,80 @@ test "appendSubturnMarker: writes the chain line as a system row" {
     try testing.expectEqual(tui.Line.Role.system, line.role);
     try testing.expect(std.mem.indexOf(u8, line.text.items, "@tiger") != null);
     try testing.expect(std.mem.indexOf(u8, line.text.items, "@sage") != null);
+}
+
+test "scanAndFanOut: empty output leaves state untouched" {
+    var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    defer root.deinit();
+    const known = [_][]const u8{ "tiger", "sage" };
+    root.agent_names = &known;
+
+    const p: DonePayload = .{
+        .epoch = 0,
+        .dispatch_kind = .primary,
+        .invoker = null,
+        .target_agent = try testing.allocator.dupe(u8, "tiger"),
+        .mention_idx = 0,
+        .output = try testing.allocator.dupe(u8, ""),
+    };
+    defer testing.allocator.free(p.target_agent);
+    defer testing.allocator.free(p.output);
+
+    try root.scanAndFanOut(&p);
+    try testing.expectEqual(@as(usize, 0), root.subturn_slots.items.len);
+    try testing.expectEqual(@as(usize, 0), root.pending_subturns);
+    try testing.expect(root.invoker_to_resume == null);
+}
+
+test "scanAndFanOut: no agent_names → no fan-out attempted" {
+    var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    defer root.deinit();
+    // agent_names left as default empty slice.
+
+    const p: DonePayload = .{
+        .epoch = 0,
+        .dispatch_kind = .primary,
+        .invoker = null,
+        .target_agent = try testing.allocator.dupe(u8, "tiger"),
+        .mention_idx = 0,
+        .output = try testing.allocator.dupe(u8, "ping @sage @bolt"),
+    };
+    defer testing.allocator.free(p.target_agent);
+    defer testing.allocator.free(p.output);
+
+    try root.scanAndFanOut(&p);
+    try testing.expectEqual(@as(usize, 0), root.subturn_slots.items.len);
+}
+
+test "onSubturnDone: marks slot done and decrements pending_subturns" {
+    var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    defer root.deinit();
+
+    // Seed a slot the way `dispatchSubturn` would have.
+    try root.subturn_slots.append(testing.allocator, .{
+        .target = try testing.allocator.dupe(u8, "sage"),
+        .mention_idx = 0,
+        .state = .in_flight,
+    });
+    root.pending_subturns = 1;
+    root.invoker_to_resume = try testing.allocator.dupe(u8, "tiger");
+
+    const p: DonePayload = .{
+        .epoch = 0,
+        .dispatch_kind = .subturn,
+        .invoker = try testing.allocator.dupe(u8, "tiger"),
+        .target_agent = try testing.allocator.dupe(u8, "sage"),
+        .mention_idx = 0,
+        .output = try testing.allocator.dupe(u8, "sage's reply"),
+    };
+    defer testing.allocator.free(p.invoker.?);
+    defer testing.allocator.free(p.target_agent);
+    defer testing.allocator.free(p.output);
+
+    try root.onSubturnDone(&p);
+    try testing.expectEqual(SubturnSlot.State.done, root.subturn_slots.items[0].state);
+    try testing.expectEqualStrings("sage's reply", root.subturn_slots.items[0].reply.?);
+    try testing.expectEqual(@as(usize, 0), root.pending_subturns);
 }
 
 test "clearSubturnState: drops in-flight slots and resets counters" {

@@ -66,8 +66,15 @@ fn postToolDone(root: *Root, ctx: *vxfw.EventContext, id: []const u8, name: []co
 }
 
 fn postDone(root: *Root, ctx: *vxfw.EventContext) !void {
-    const payload = try root.allocator.create(Root.EmptyPayload);
-    payload.* = .{ .epoch = root.turn_epoch };
+    const payload = try root.allocator.create(Root.DonePayload);
+    payload.* = .{
+        .epoch = root.turn_epoch,
+        .dispatch_kind = .primary,
+        .invoker = null,
+        .target_agent = try root.allocator.dupe(u8, "tiger"),
+        .mention_idx = 0,
+        .output = try root.allocator.dupe(u8, ""),
+    };
     try root.handleUserEvent(ctx, .{ .name = Root.ue_done, .data = payload });
 }
 
