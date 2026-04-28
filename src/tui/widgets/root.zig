@@ -30,6 +30,7 @@ const Thinking = @import("thinking.zig");
 const Hint = @import("hint.zig");
 const StatusBar = @import("status_bar.zig");
 const mention = @import("../mention.zig");
+const dispatch_log = std.log.scoped(.tui_dispatch);
 const CommandMenu = @import("command_menu.zig");
 const skills_mod = @import("../../skills/skills.zig");
 
@@ -1286,6 +1287,15 @@ pub fn dispatchSubturn(
     mention_idx: u8,
     invoker_reply: []const u8,
 ) !void {
+    dispatch_log.info("dispatchSubturn: invoker=@{s} target=@{s} idx={d} reply_bytes={d} app={s} runner={s}", .{
+        invoker,
+        target,
+        mention_idx,
+        invoker_reply.len,
+        if (self.app == null) "null" else "set",
+        if (self.runner == null) "null" else "set",
+    });
+
     // No marker line — the sub-turn agent's reply lands with its
     // own speaker pill, which is sufficient indication that another
     // agent is now contributing. Earlier prototypes emitted a
@@ -1583,11 +1593,24 @@ fn findSubturnSlot(
 /// over. Today we just record the state so the join has data to
 /// work with.
 fn onSubturnDone(self: *Root, p: *const DonePayload) !void {
-    const invoker = p.invoker orelse return; // sub-turn must have invoker
-    const slot = self.findSubturnSlot(invoker, p.target_agent, p.mention_idx) orelse return;
+    dispatch_log.info("onSubturnDone: target=@{s} invoker=@{s} idx={d} output_bytes={d}", .{
+        p.target_agent,
+        if (p.invoker) |s| s else "<null>",
+        p.mention_idx,
+        p.output.len,
+    });
+    const invoker = p.invoker orelse {
+        dispatch_log.warn("onSubturnDone: missing invoker — sub-turn metadata corrupt", .{});
+        return;
+    };
+    const slot = self.findSubturnSlot(invoker, p.target_agent, p.mention_idx) orelse {
+        dispatch_log.warn("onSubturnDone: no matching slot for (@{s},@{s},{d})", .{ invoker, p.target_agent, p.mention_idx });
+        return;
+    };
     slot.reply = try self.allocator.dupe(u8, p.output);
     slot.state = .done;
     if (self.pending_subturns > 0) self.pending_subturns -= 1;
+    dispatch_log.info("onSubturnDone: slot @{s} marked done; pending_subturns now {d}", .{ p.target_agent, self.pending_subturns });
     // If this was the last in-flight slot, fire the join + resume.
     // The invoker's resumed reply re-enters `scanAndFanOut` via the
     // normal `ue_done` path, so cascading mentions just keep looping
@@ -1617,14 +1640,30 @@ fn onSubturnDone(self: *Root, p: *const DonePayload) !void {
 /// to budget for the eventual resume, so the per-call check
 /// reserves one slot for it.
 fn scanAndFanOut(self: *Root, p: *const DonePayload) !void {
+    dispatch_log.info("scanAndFanOut: target=@{s} kind={s} output_bytes={d} agents={d} epoch={d}", .{
+        p.target_agent,
+        @tagName(p.dispatch_kind),
+        p.output.len,
+        self.agent_names.len,
+        p.epoch,
+    });
+
     // No agent set, no mentions to scan against. Common in tests.
-    if (self.agent_names.len == 0) return;
-    if (p.output.len == 0) return;
+    if (self.agent_names.len == 0) {
+        dispatch_log.info("scanAndFanOut: skip — no agent_names registered", .{});
+        return;
+    }
+    if (p.output.len == 0) {
+        dispatch_log.info("scanAndFanOut: skip — empty output", .{});
+        return;
+    }
 
     // The invoker for the new fan-out is whichever agent just spoke.
     const invoker = p.target_agent;
     const matches = mention.findAll(self.allocator, p.output, self.agent_names, invoker) catch return;
     defer self.allocator.free(matches);
+    dispatch_log.info("scanAndFanOut: invoker=@{s} matches={d}", .{ invoker, matches.len });
+    for (matches) |m| dispatch_log.info("  match @{s}", .{m.name});
     if (matches.len == 0) return;
 
     // Reserve one budget slot for the resume that will fire after
@@ -2027,6 +2066,7 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         // so chunks before + after tools each live on their own
         // line in the natural reading order.
         const idx = self.pending_agent_line orelse blk: {
+            dispatch_log.info("ue_chunk: opening new agent line for @{s} (epoch={d})", .{ p.agent, p.epoch });
             try self.appendLineWithSpeaker(.agent, "", p.agent);
             const new_idx = self.history.items.len - 1;
             self.pending_agent_line = new_idx;
