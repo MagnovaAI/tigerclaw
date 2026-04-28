@@ -23,7 +23,12 @@ const md = @import("../md.zig");
 const harness = @import("../../harness/root.zig");
 const llm_model_context = @import("../../llm/model_context.zig");
 const gateway_probe = @import("../../gateway/probe.zig");
-const Header = @import("header.zig");
+const build_options = @import("build_options");
+// `Header` (widgets/header.zig) was the old pinned wordmark
+// widget. The banner now scrolls with chat as `.banner` rows
+// emitted at startup, so the file is no longer imported. Keeping
+// it on disk as a reference until we're sure we don't want a
+// resurrected pinned-banner mode.
 const History = @import("history.zig");
 const Input = @import("input.zig");
 const Thinking = @import("thinking.zig");
@@ -97,7 +102,6 @@ const Root = @This();
 
 // --- state ---
 allocator: std.mem.Allocator,
-header: Header,
 /// Heap-allocated chat history. Owned by the Root widget; freed
 /// on deinit. Lines are appended by the event handler in
 /// response to key presses and runner events. The History
@@ -298,11 +302,6 @@ fn modelMaxContext(model_line: []const u8) u64 {
 pub fn init(allocator: std.mem.Allocator, opts: InitOptions) Root {
     return .{
         .allocator = allocator,
-        .header = .{
-            .agent_name = opts.agent_name,
-            .model_line = opts.model_line,
-            .workspace = opts.workspace,
-        },
         .input = Input.init(allocator),
         .history_cache = History.WrapCache.init(allocator),
         .session_id = opts.agent_name,
@@ -1117,7 +1116,6 @@ fn setActiveAgent(self: *Root, name: []const u8) void {
         break :blk name;
     };
     self.session_id = canonical;
-    self.header.agent_name = canonical;
     self.status_bar.agent_name = canonical;
 }
 
@@ -1494,6 +1492,47 @@ pub fn appendLineWithSpeaker(
 /// Convenience: append a `.user` line stamped with `self.user_name`.
 pub fn appendUserLine(self: *Root, text: []const u8) !void {
     return self.appendLineWithSpeaker(.user, text, self.user_name);
+}
+
+/// Embedded TIGERCLAW wordmark — same asset the old pinned Header
+/// widget used. Six visible rows; each row paints in the gradient
+/// band picked by `History.styleFor` from the line's `banner_row`
+/// index.
+const banner_wordmark = @embedFile("wordmark.txt");
+
+/// Emit the scrolling banner at the top of history. Six wordmark
+/// rows in gradient + a one-line tigerclaw info line tinted as
+/// `.system`. Idempotent — safe to call once after `init`. The
+/// banner scrolls along with the rest of the chat; once a real
+/// turn fills the pane, the banner moves out of view.
+pub fn appendBanner(self: *Root) !void {
+    var row_idx: u8 = 0;
+    var line_iter = std.mem.splitScalar(u8, banner_wordmark, '\n');
+    while (line_iter.next()) |line| {
+        if (line.len == 0) continue;
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        try buf.appendSlice(self.allocator, line);
+        try self.history.append(self.allocator, .{
+            .role = .banner,
+            .text = buf,
+            .banner_row = row_idx,
+        });
+        row_idx += 1;
+    }
+
+    // One-line info row beneath the wordmark: `tigerclaw <version> ·
+    // <agent>`. Painted via the `.system` palette (the banner
+    // gradient only covers wordmark rows). The user's first turn
+    // pushes both the wordmark and this line off-screen as the
+    // chat grows.
+    const info = try std.fmt.allocPrint(
+        self.allocator,
+        "tigerclaw {s} · {s}",
+        .{ build_options.version, self.session_id },
+    );
+    defer self.allocator.free(info);
+    try self.appendLine(.system, info);
 }
 
 /// Convenience: append a `.agent` line stamped with the active
@@ -2792,8 +2831,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     const height = ctx.max.height orelse 0;
 
     // Layout (top → bottom):
-    //   header                       Header.bannerRows(width)
-    //   history                      flex (whatever's left)
+    //   history                      flex (whatever's left, banner scrolls inside)
     //   thinking                     1 row when pending, else 0
     //   hint                         1 row when texts non-empty, else 0
     //   input panel                  3 rows tinted, text on middle row
@@ -2843,21 +2881,14 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     // edge.
     const trailing_rows: u16 = if (menu_rows > 0) menu_rows + bottom_pad_rows else bottom_pad_rows;
 
-    // Header collapses to zero rows when the terminal is too
-    // short to fit it alongside the bottom stack.
+    // The wordmark banner used to live in a pinned `Header` widget
+    // above the chat. It now scrolls with history as `.banner` rows
+    // injected once at startup, so the only top-stack row is the
+    // chat surface itself.
     const bottom_stack: u16 = thinking_rows + hint_rows + input_rows + status_rows + trailing_rows;
-    const requested_header: u16 = Header.bannerRows(width);
-    const header_rows: u16 = if (height > bottom_stack + requested_header)
-        requested_header
-    else if (height > bottom_stack)
-        height - bottom_stack
-    else
-        0;
+    const history_rows: u16 = if (height > bottom_stack) height - bottom_stack else 0;
 
-    const reserved: u16 = header_rows + bottom_stack;
-    const history_rows: u16 = if (height > reserved) height - reserved else 0;
-
-    const children = try ctx.arena.alloc(vxfw.SubSurface, 7);
+    const children = try ctx.arena.alloc(vxfw.SubSurface, 6);
     const surface = try vxfw.Surface.initWithChildren(
         ctx.arena,
         self.widget(),
@@ -2866,16 +2897,6 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     );
 
     var cur_row: u16 = 0;
-
-    // Header.
-    {
-        const s = try self.header.widget().draw(ctx.withConstraints(
-            .{ .width = 0, .height = 0 },
-            .{ .width = width, .height = header_rows },
-        ));
-        surface.children[0] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
-        cur_row += header_rows;
-    }
 
     // History at full width. Earlier we kept a 1-cell side margin
     // for visual breathing room, but that left a tiny untinted
@@ -2892,7 +2913,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
             .{ .width = 0, .height = 0 },
             .{ .width = width, .height = history_rows },
         ));
-        surface.children[1] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
+        surface.children[0] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
         cur_row += history_rows;
     }
 
@@ -2902,7 +2923,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
             .{ .width = 0, .height = 0 },
             .{ .width = width, .height = thinking_rows },
         ));
-        surface.children[2] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
+        surface.children[1] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
         cur_row += thinking_rows;
     }
 
@@ -2912,7 +2933,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
             .{ .width = 0, .height = 0 },
             .{ .width = width, .height = hint_rows },
         ));
-        surface.children[3] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
+        surface.children[2] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
         cur_row += hint_rows;
     }
 
@@ -2924,7 +2945,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
             .{ .width = 0, .height = 0 },
             .{ .width = width, .height = input_rows },
         ));
-        surface.children[4] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
+        surface.children[3] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
         cur_row += input_rows;
     }
 
@@ -2954,7 +2975,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
             .{ .width = 0, .height = 0 },
             .{ .width = width, .height = status_rows },
         ));
-        surface.children[5] = .{ .origin = .{ .row = status_origin, .col = 0 }, .surface = s, .z_index = 0 };
+        surface.children[4] = .{ .origin = .{ .row = status_origin, .col = 0 }, .surface = s, .z_index = 0 };
     }
 
     // Slash-command popup below the status bar. When the menu is
@@ -2965,7 +2986,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
             .{ .width = 0, .height = 0 },
             .{ .width = width, .height = menu_rows },
         ));
-        surface.children[6] = .{ .origin = .{ .row = status_origin + status_rows, .col = 0 }, .surface = s, .z_index = 0 };
+        surface.children[5] = .{ .origin = .{ .row = status_origin + status_rows, .col = 0 }, .surface = s, .z_index = 0 };
     }
 
     return surface;

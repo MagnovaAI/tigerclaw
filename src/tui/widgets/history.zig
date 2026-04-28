@@ -425,7 +425,7 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
             continue;
         }
 
-        const base_style = styleFor(line.role);
+        const base_style = styleFor(line);
         const parts = splitPrefix(line);
         const limb_bullet_cols = measureCols(parts.limb) + measureCols(parts.bullet);
         const pill_w = indent_pill_cols.items[r.line_idx];
@@ -536,6 +536,7 @@ fn shouldGapBefore(prev: ?tui.Line.Role, cur: tui.Line.Role) bool {
     if (cur == .tool) return false; // tool clings to the line above
     if (cur == .user) return false; // user_pad_top already separates
     if (p == .user) return false; // user_pad_bot already separates
+    if (cur == .banner) return false; // banner rows pack tight
     return true;
 }
 
@@ -692,6 +693,10 @@ fn prefixFor(line: *const tui.Line) []const u8 {
         .user => "› ",
         .agent => "⏺ ",
         .system => "∙ ",
+        // Banner rows scroll along with the rest of the chat and
+        // already carry their own painted glyphs (the wordmark
+        // shapes, the tigerclaw info line). No prefix.
+        .banner => "",
         // Tool rows: the visible prefix is the tree limb plus the
         // status-colored bullet. Limb selection drives sibling
         // grouping — `├─` for mid, `└─` for last (or unfinished —
@@ -717,8 +722,21 @@ fn splitPrefix(line: *const tui.Line) struct { limb: []const u8, bullet: []const
     return .{ .limb = "", .bullet = prefixFor(line) };
 }
 
-fn styleFor(role: tui.Line.Role) vaxis.Style {
-    return switch (role) {
+/// Six-band gradient for the scrolling tigerclaw wordmark. Index
+/// is the 0-based row of the line within the banner block; rows
+/// beyond the gradient (e.g. the trailing info line) fall through
+/// to the system tint via `styleFor`.
+const banner_gradient = [_]vaxis.Style{
+    .{ .fg = .{ .rgb = .{ 0xFF, 0xC8, 0x57 } }, .bold = true }, // gold
+    .{ .fg = .{ .rgb = .{ 0xFF, 0xC8, 0x57 } }, .bold = true }, // gold
+    .{ .fg = .{ .rgb = .{ 0xFF, 0x8C, 0x1A } }, .bold = false }, // tiger orange
+    .{ .fg = .{ .rgb = .{ 0xFF, 0x8C, 0x1A } }, .bold = false }, // tiger orange
+    .{ .fg = .{ .rgb = .{ 0xCC, 0x55, 0x00 } }, .bold = false }, // deep ember
+    .{ .fg = .{ .rgb = .{ 0xCC, 0x55, 0x00 } }, .bold = false }, // deep ember
+};
+
+fn styleFor(line: *const tui.Line) vaxis.Style {
+    return switch (line.role) {
         // User echo gets the input panel's bg tint + cream fg, so a
         // sent message looks like a frozen copy of the input row.
         // Bold keeps the prefix prompt glyph visually weighted.
@@ -726,6 +744,14 @@ fn styleFor(role: tui.Line.Role) vaxis.Style {
         .agent => tui.palette.agent,
         .system => tui.palette.system,
         .tool => tui.palette.tool,
+        // Banner rows: pick the gradient band for this row, or
+        // fall through to the system tint when the row index is
+        // past the gradient (used by the info/divider rows that
+        // follow the wordmark).
+        .banner => if (line.banner_row < banner_gradient.len)
+            banner_gradient[line.banner_row]
+        else
+            tui.palette.system,
     };
 }
 
@@ -740,7 +766,7 @@ fn prefixStyleFor(line: *const tui.Line) vaxis.Style {
             .err => tui.palette.tool_bullet_err,
         };
     }
-    return styleFor(line.role);
+    return styleFor(line);
 }
 
 /// Pick the style for byte `abs` in the full line: innermost

@@ -175,6 +175,11 @@ pub const Line = struct {
     /// (today: bash stdout/stderr). Owned heap slice; null until the
     /// first progress event lands. Cleared once the tool finishes.
     tool_progress_tail: ?[]u8 = null,
+    /// Banner-row index (0-based) for `.banner` lines. The history
+    /// renderer uses this to pick a gradient color from a fixed
+    /// palette so each wordmark row paints in its own band as the
+    /// banner scrolls. Ignored for every other role.
+    banner_row: u8 = 0,
 
     pub const ToolStatus = enum { running, ok, err };
 
@@ -212,7 +217,7 @@ pub const Line = struct {
         self.tool_progress_tail = null;
     }
 
-    pub const Role = enum { user, agent, system, tool };
+    pub const Role = enum { user, agent, system, tool, banner };
 };
 
 pub const Options = struct {
@@ -426,6 +431,12 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     defer root.deinit();
     root.wireSubmit();
     root.attachRunner(&agent_runner, &app);
+    // Emit the scrolling banner once at the top of history. It
+    // replaces the old pinned `Header` widget — same wordmark and
+    // gradient, but it scrolls along with the chat so the area
+    // above the input is clean for the upper status bar / live
+    // tool state once the conversation grows.
+    root.appendBanner() catch {};
     // Forward sandbox toggles (/lock, /unlock, /plan) through the
     // gateway HTTP runner so the daemon's in-process LiveAgentRunner
     // adopts the same policy. Without this bridge the TUI's status
@@ -1352,6 +1363,10 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
             .agent => "✦ ",
             .system => "∙ ",
             .tool => "↻ ",
+            // Legacy fallback path (non-vxfw). Banner rows render
+            // as bare wordmark text without a glyph prefix; the
+            // gradient styling lives only on the vxfw path.
+            .banner => "",
         };
 
         const width: usize = @intCast(pane.width);
@@ -1406,6 +1421,9 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
             .agent => palette.agent,
             .system => palette.system,
             .tool => palette.tool,
+            // Legacy path: banner rows fall back to the system tint;
+            // the wordmark gradient is vxfw-only.
+            .banner => palette.system,
         };
 
         var row = start_row;
