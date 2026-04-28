@@ -1732,6 +1732,14 @@ fn onSubturnDone(self: *Root, p: *const DonePayload) !void {
         ) catch "! resume dispatch failed";
         self.appendLine(.system, line) catch {};
     };
+
+    // Sub-turn replies can also mention peers — that's how the
+    // hand-off pattern (`@tiger over to you`) keeps the conversation
+    // bouncing. Scan the sub-turn's output the same way we scan a
+    // primary reply. The model-call budget bounds runaway cascades.
+    self.scanAndFanOut(p) catch |e| {
+        dispatch_log.warn("scanAndFanOut after subturn failed: {s}", .{@errorName(e)});
+    };
 }
 
 /// Primary or resume completion: scan the assistant's final text
