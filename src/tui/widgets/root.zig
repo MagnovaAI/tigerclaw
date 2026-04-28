@@ -152,9 +152,14 @@ pending_subturns: usize = 0,
 /// consume budget — only auto-dispatched calls do.
 auto_dispatch_calls: u8 = 0,
 auto_dispatch_max_calls: u8 = 8,
-/// Per-sub-turn wall-clock cap. After this many seconds a slot is
-/// marked `timed_out`; any later `ue_done` for it is discarded.
-auto_dispatch_subturn_timeout_secs: u32 = 120,
+/// Per-sub-turn wall-clock cap, in seconds. `0` (the default)
+/// disables the watchdog entirely — peers run as long as they
+/// need to. The 120s default we used to ship killed legitimate
+/// long tool runs (large `write_file`, slow `bash`, file uploads)
+/// and surfaced as `! @<peer> timed out` even when the peer was
+/// making real progress. Users can opt back in via config when a
+/// genuine ceiling is desired.
+auto_dispatch_subturn_timeout_secs: u32 = 0,
 /// Test-only inspection slot. When `app` is null (tests have not
 /// attached a real Vaxis loop), `dispatchResume` stashes the join
 /// body here instead of spawning a worker so the test harness can
@@ -1640,6 +1645,13 @@ fn spawnSubturnTimeout(
     target: []const u8,
     mention_idx: u8,
 ) !void {
+    // 0 means "no timeout" — skip the watchdog spawn entirely so a
+    // long-running peer (large file write, slow bash, upload) isn't
+    // marked timed_out mid-flight. The slot still resolves on the
+    // peer's natural `ue_done`, and the user can `/stop <agent>` at
+    // any point to abort manually.
+    if (self.auto_dispatch_subturn_timeout_secs == 0) return;
+
     const app = self.app orelse return error.NoApp;
     const ctx = try self.allocator.create(SubturnTimeoutCtx);
     errdefer self.allocator.destroy(ctx);
