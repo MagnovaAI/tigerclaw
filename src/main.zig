@@ -651,7 +651,15 @@ const tui = @import("tui/root.zig");
 
 fn runTuiLocal(arena: std.mem.Allocator, io: std.Io, init: std.process.Init) !u8 {
     const home = init.environ_map.get("HOME") orelse "";
-    tui.run(arena, io, .{ .home = home }) catch |err| {
+    // The user's pill name. Hardcoded to "Omkar" for now —
+    // config-driven `~/.tigerclaw/config.json:user_name` lands when
+    // the multi-user story actually requires it. `$USER` (e.g.
+    // `omkarbhad`) is technically resolvable here but reads as a
+    // login id rather than a name.
+    tui.run(arena, io, .{
+        .home = home,
+        .user_name = "Omkar",
+    }) catch |err| {
         // The tty is now in an undefined state if vaxis bailed
         // mid-render; print to stderr via libc write so we don't
         // re-enter the possibly-broken Io write path.

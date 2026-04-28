@@ -114,6 +114,11 @@ pub const widgets = struct {
 pub const Line = struct {
     role: Role,
     text: std.ArrayList(u8),
+    /// Speaker name for the leading `[ name ]` pill. Set on `.user`
+    /// and `.agent` lines (`"Omkar"` / `"tiger"` / `"sage"` etc).
+    /// Null on `.system` and `.tool` rows — those don't get a pill,
+    /// they live in their own visual class. Owned heap slice.
+    speaker: ?[]u8 = null,
     /// Style spans over `text`. Non-null only for agent replies
     /// that have finished streaming and been re-parsed as
     /// markdown; streaming in progress keeps this null so the
@@ -160,6 +165,10 @@ pub const Line = struct {
     /// Duration of the dispatch in milliseconds. Zero pre-finish; set
     /// on `turn_tool_done`. Rendered as `Completed in 1.0s`.
     tool_duration_ms: u64 = 0,
+    /// Most-recent line of live progress output emitted by the tool
+    /// (today: bash stdout/stderr). Owned heap slice; null until the
+    /// first progress event lands. Cleared once the tool finishes.
+    tool_progress_tail: ?[]u8 = null,
 
     pub const ToolStatus = enum { running, ok, err };
 
@@ -167,6 +176,13 @@ pub const Line = struct {
         if (self.spans) |s| {
             allocator.free(s);
             self.spans = null;
+        }
+    }
+
+    pub fn deinitSpeaker(self: *Line, allocator: std.mem.Allocator) void {
+        if (self.speaker) |s| {
+            allocator.free(s);
+            self.speaker = null;
         }
     }
 
@@ -182,10 +198,12 @@ pub const Line = struct {
         if (self.tool_args) |s| allocator.free(s);
         if (self.tool_summary) |s| allocator.free(s);
         if (self.tool_full) |s| allocator.free(s);
+        if (self.tool_progress_tail) |s| allocator.free(s);
         self.tool_name = null;
         self.tool_args = null;
         self.tool_summary = null;
         self.tool_full = null;
+        self.tool_progress_tail = null;
     }
 
     pub const Role = enum { user, agent, system, tool };
@@ -199,6 +217,10 @@ pub const Options = struct {
     /// Gateway base URL. TUI acts as a localhost client of the daemon.
     base_url: []const u8 = "http://127.0.0.1:8765",
     bearer: ?[]const u8 = null,
+    /// Display name on the user's `[ name ]` pill. Resolved by
+    /// `runTuiLocal` from `~/.tigerclaw/config.json:user_name`,
+    /// then `$USER`, then this fallback.
+    user_name: []const u8 = "Omkar",
 };
 
 const EventLoop = vaxis.Loop(Event);
@@ -379,6 +401,8 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
         .model_line = model_line,
         .workspace = cwd,
         .home = opts.home,
+        .user_name = opts.user_name,
+        .agent_names = agents.items(),
         .io = io,
     });
     defer root.deinit();

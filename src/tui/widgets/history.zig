@@ -98,13 +98,14 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
         // gap row -- the `▄` above the content already separates
         // them visually from whatever came before.
         if (line.role == .user) {
-            try rows.append(ctx.arena, .{ .kind = .user_pad_top });
+            try rows.append(ctx.arena, .{ .kind = .user_pad_top, .line_idx = @intCast(idx) });
         } else if (shouldGapBefore(prev_role, line.role)) {
             try rows.append(ctx.arena, .{ .kind = .blank });
         }
         prev_role = line.role;
 
-        const prefix_cols = measureCols(prefixFor(&line));
+        const pill_cols = pillCols(&line);
+        const prefix_cols = pill_cols + measureCols(prefixFor(&line));
         const avail: usize = if (width > prefix_cols) width - prefix_cols else 1;
 
         // Per-line cap mirrors the old renderer: a runaway tool
@@ -172,7 +173,7 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
 
         // Trailing half-block: closes the user-message tint band.
         if (line.role == .user) {
-            try rows.append(ctx.arena, .{ .kind = .user_pad_bot });
+            try rows.append(ctx.arena, .{ .kind = .user_pad_bot, .line_idx = @intCast(idx) });
         }
     }
 
@@ -217,6 +218,8 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
         // widget so the band's look (half-block glyphs, tint,
         // inset) lives in one place.
         if (r.kind == .user_pad_top or r.kind == .user_pad_bot) {
+            const pad_line = &self.lines[r.line_idx];
+            const pad_pill_w: u16 = @intCast(pillCols(pad_line));
             user_message.paintRow(
                 ctx,
                 surface,
@@ -226,7 +229,7 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
                 0,
                 null,
                 false,
-                0,
+                pad_pill_w,
                 0,
             );
             screen_row += 1;
@@ -238,6 +241,14 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
         // widget so the band's look (tinted bg, prompt glyph,
         // body text style) lives in one module.
         if (line.role == .user) {
+            const pill_w = pillCols(line);
+            // Paint the speaker pill on the first content row only
+            // (subsequent rows are wrapped continuations of the
+            // same line). Inset the user band by `pill_w` cols so
+            // the tinted shoulder doesn't overlap the pill.
+            if (r.is_first) {
+                _ = pillPaint(ctx, surface, screen_row, line);
+            }
             const body_user = line.text.items[r.bytes_offset..][0..r.bytes_len];
             user_message.paintRow(
                 ctx,
@@ -248,7 +259,7 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
                 r.bytes_offset,
                 line.spans,
                 r.is_first,
-                0,
+                @intCast(pill_w),
                 0,
             );
             screen_row += 1;
@@ -257,16 +268,19 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
 
         const base_style = styleFor(line.role);
         const parts = splitPrefix(line);
-        const prefix_cols = measureCols(parts.limb) + measureCols(parts.bullet);
+        const limb_bullet_cols = measureCols(parts.limb) + measureCols(parts.bullet);
+        const pill_w = pillCols(line);
+        const prefix_cols = pill_w + limb_bullet_cols;
 
-        // First physical row of the line gets the speaker glyph.
-        // Continuation rows indent under it so wrapped text aligns
-        // visually with the body of the first row. Limb is dimmed
-        // (it's structural scaffolding); the bullet picks up the
-        // status color so tool rows can show green/red/white.
+        // First physical row of the line gets the speaker pill +
+        // glyph. Continuation rows indent under the same pill width
+        // so wrapped body text aligns visually under the first
+        // row's body.
         if (r.is_first) {
-            writeGraphemes(ctx, surface, 0, screen_row, parts.limb, tui.palette.tool);
-            const bullet_col: u16 = @intCast(measureCols(parts.limb));
+            _ = pillPaint(ctx, surface, screen_row, line);
+            const limb_col: u16 = @intCast(pill_w);
+            writeGraphemes(ctx, surface, limb_col, screen_row, parts.limb, tui.palette.tool);
+            const bullet_col: u16 = @intCast(pill_w + measureCols(parts.limb));
             writeGraphemes(ctx, surface, bullet_col, screen_row, parts.bullet, prefixStyleFor(line));
         }
 
@@ -429,6 +443,82 @@ fn writeGraphemes(
         });
         col += if (w == 0) 1 else w;
     }
+}
+
+/// Number of display columns the speaker pill occupies. Format is
+/// ` name ` (one tinted pad cell, name, one tinted pad cell) plus
+/// one untinted trailing gap, so the cost is `name.len + 3`. Lines
+/// without a speaker (system / tool rows) return 0 — they don't
+/// get a pill.
+fn pillCols(line: *const tui.Line) usize {
+    const speaker = line.speaker orelse return 0;
+    if (speaker.len == 0) return 0;
+    // leading pad + name + trailing pad + outside gap
+    return speaker.len + 3;
+}
+
+/// Render the speaker pill at column 0 of `row`. No-op when the
+/// line has no speaker. The pill is just a tinted block with the
+/// name inside — no `[ ]` chrome — so the chat reads as
+/// `Omkar  message` rather than `[ Omkar ]  message`.
+/// Returns the column where the pill ended.
+fn pillPaint(
+    ctx: vxfw.DrawContext,
+    surface: vxfw.Surface,
+    row: u16,
+    line: *const tui.Line,
+) u16 {
+    const speaker = line.speaker orelse return 0;
+    if (speaker.len == 0) return 0;
+    const style = pillStyle(speaker);
+    var col: u16 = 0;
+
+    // Leading pad cell — gives the name one tinted column of
+    // breathing room on the left so glyphs don't kiss the edge.
+    writeGraphemes(ctx, surface, col, row, " ", style);
+    col += 1;
+
+    // Name body.
+    writeGraphemes(ctx, surface, col, row, speaker, style);
+    col += @intCast(measureCols(speaker));
+
+    // Trailing pad cell, same tint.
+    writeGraphemes(ctx, surface, col, row, " ", style);
+    col += 1;
+
+    // Outside gap — untinted so the pill reads as a separate block
+    // from the message body that follows.
+    writeGraphemes(ctx, surface, col, row, " ", tui.palette.system);
+    col += 1;
+    return col;
+}
+
+/// Deterministic pill style for `name`. Hashes the name into a
+/// fixed 8-color palette so each speaker keeps the same color
+/// across launches and lines without any config plumbing.
+fn pillStyle(name: []const u8) vaxis.Style {
+    const palette = [_]vaxis.Color{
+        .{ .rgb = .{ 0xf2, 0x7e, 0x37 } }, // amber
+        .{ .rgb = .{ 0x6e, 0xb5, 0xff } }, // sky
+        .{ .rgb = .{ 0x9d, 0xe8, 0xa1 } }, // mint
+        .{ .rgb = .{ 0xe8, 0x8b, 0xb6 } }, // rose
+        .{ .rgb = .{ 0xc6, 0xa1, 0xff } }, // lavender
+        .{ .rgb = .{ 0xff, 0xd6, 0x7d } }, // sand
+        .{ .rgb = .{ 0x7e, 0xd6, 0xc6 } }, // teal
+        .{ .rgb = .{ 0xff, 0xab, 0x70 } }, // peach
+    };
+    // FNV-1a 32-bit — small, branchless, no allocator.
+    var h: u32 = 0x811c9dc5;
+    for (name) |b| {
+        h ^= b;
+        h *%= 0x01000193;
+    }
+    const idx = h % palette.len;
+    return .{
+        .fg = .{ .rgb = .{ 0x10, 0x10, 0x10 } },
+        .bg = palette[idx],
+        .bold = true,
+    };
 }
 
 fn prefixFor(line: *const tui.Line) []const u8 {

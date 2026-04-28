@@ -128,7 +128,7 @@ test "tui: tool-done without a matching pending line is a noop" {
     try testing.expectEqual(@as(usize, 0), root.history.items.len);
 }
 
-test "tui: two tool calls in a row coalesce into one line" {
+test "tui: two tool calls with distinct ids each get their own row" {
     var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
     root.tool_output_enabled = true;
     defer root.deinit();
@@ -143,12 +143,37 @@ test "tui: two tool calls in a row coalesce into one line" {
     try postChunk(&root, &ctx, "done");
     try postDone(&root, &ctx);
 
-    // Consecutive same-name tool calls coalesce into a single row;
-    // the chunk that follows lands as a separate agent line.
-    try testing.expectEqual(@as(usize, 2), root.history.items.len);
+    // Each tool_use id keeps its own row — coalescing by name was
+    // wrong because it discarded the prior call's `tool_full` and
+    // made the bash/write_file output disappear from the screen
+    // when the model invoked the same tool twice in a turn.
+    try testing.expectEqual(@as(usize, 3), root.history.items.len);
     try testing.expectEqual(tigerclaw.tui.Line.Role.tool, root.history.items[0].role);
-    try testing.expectEqual(tigerclaw.tui.Line.Role.agent, root.history.items[1].role);
-    try testing.expectEqualStrings("done", root.history.items[1].text.items);
+    try testing.expect(std.mem.indexOf(u8, root.history.items[0].text.items, "T1") != null);
+    try testing.expectEqual(tigerclaw.tui.Line.Role.tool, root.history.items[1].role);
+    try testing.expect(std.mem.indexOf(u8, root.history.items[1].text.items, "T2") != null);
+    try testing.expectEqual(tigerclaw.tui.Line.Role.agent, root.history.items[2].role);
+    try testing.expectEqualStrings("done", root.history.items[2].text.items);
+}
+
+test "tui: duplicate tool_start with same id is idempotent" {
+    var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    root.tool_output_enabled = true;
+    defer root.deinit();
+
+    var ctx = makeCtx(testing.allocator);
+    defer ctx.cmds.deinit(testing.allocator);
+
+    // The provider fires `tool_start` early on content_block_start
+    // (id+name only), then the runner fires it again before
+    // dispatch (id+name+args). Same id must collapse onto one row.
+    try postToolStart(&root, &ctx, "a", "bash");
+    try postToolStart(&root, &ctx, "a", "bash");
+    try postToolDone(&root, &ctx, "a", "bash", "ok");
+    try postDone(&root, &ctx);
+
+    try testing.expectEqual(@as(usize, 1), root.history.items.len);
+    try testing.expectEqual(tigerclaw.tui.Line.Role.tool, root.history.items[0].role);
 }
 
 test "tui: empty turn (done with no chunks and no tools) leaves history empty" {

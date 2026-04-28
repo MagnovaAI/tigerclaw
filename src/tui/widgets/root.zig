@@ -29,6 +29,7 @@ const Input = @import("input.zig");
 const Thinking = @import("thinking.zig");
 const Hint = @import("hint.zig");
 const StatusBar = @import("status_bar.zig");
+const mention = @import("../mention.zig");
 const CommandMenu = @import("command_menu.zig");
 const skills_mod = @import("../../skills/skills.zig");
 
@@ -65,6 +66,13 @@ runner: ?*harness.AgentRunner = null,
 /// Agent session id — normally the agent name. Reused across
 /// turns so the context engine keeps continuity.
 session_id: []const u8 = "tiger",
+/// Speaker name for the user's pill (`[ Omkar ]`). Default
+/// matches the InitOptions default; overridden at construction.
+user_name: []const u8 = "Omkar",
+/// All loaded agents (borrowed from the driver's AgentList).
+/// `@<name>` mentions are validated against this set; unknown
+/// targets fall through to the system-error path.
+agent_names: []const []const u8 = &.{},
 /// Borrowed App pointer. Used by worker-thread sinks to post
 /// UserEvents back into the main loop via \`app.loop.?.postEvent\`.
 app: ?*vxfw.App = null,
@@ -139,6 +147,15 @@ pub const InitOptions = struct {
     model_line: []const u8 = "",
     workspace: []const u8 = "",
     home: []const u8 = "",
+    /// Display name shown on the user's `[ name ]` pill before each
+    /// message. Resolved by `tui.run` from
+    /// `~/.tigerclaw/config.json:user_name`, then `$USER`, then this
+    /// hardcoded fallback. Borrowed; the caller owns the storage.
+    user_name: []const u8 = "Omkar",
+    /// All loaded agents. Used to validate `@<name>` mentions and
+    /// switch the active agent on submit. Borrowed from the TUI
+    /// driver's `AgentList`; lifetime exceeds the widget's.
+    agent_names: []const []const u8 = &.{},
     io: ?std.Io = null,
 };
 
@@ -158,6 +175,8 @@ pub fn init(allocator: std.mem.Allocator, opts: InitOptions) Root {
         },
         .input = Input.init(allocator),
         .session_id = opts.agent_name,
+        .user_name = opts.user_name,
+        .agent_names = opts.agent_names,
         .home_dir = opts.home,
         .workspace_dir = opts.workspace,
         .io = opts.io,
@@ -206,6 +225,7 @@ pub fn deinit(self: *Root) void {
         l.deinitSpans(self.allocator);
         l.deinitToolId(self.allocator);
         l.deinitToolFields(self.allocator);
+        l.deinitSpeaker(self.allocator);
     }
     self.history.deinit(self.allocator);
     self.input.deinit();
@@ -233,7 +253,7 @@ fn onSubmit(ctx: ?*anyopaque, text: []const u8) void {
         if (self.pending_reply) |old| self.allocator.free(old);
         self.pending_reply = reply_copy;
         self.endPendingReply();
-        self.appendLine(.user, text) catch {};
+        self.appendUserLine(text) catch {};
         self.ask_user_pending.store(false, .seq_cst);
         self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
         return;
@@ -273,14 +293,46 @@ fn onSubmit(ctx: ?*anyopaque, text: []const u8) void {
         return;
     }
 
+    // Mention routing. If the message starts with `@<name>`, switch
+    // the active agent to that name and submit only the stripped
+    // body. Subsequent unprefixed messages stay with the new agent
+    // — same model as Slack/Discord channel focus.
+    const parsed = mention.parse(text);
+    if (parsed.target) |target| {
+        if (!self.knowsAgent(target)) {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "! unknown agent: @{s}", .{target}) catch "! unknown agent";
+            self.appendLine(.system, msg) catch {};
+            return;
+        }
+        // Switch the active agent. We point session_id and the
+        // header/status-bar at the matched agent name *out of the
+        // borrowed `agent_names` slice* so the slice's lifetime
+        // (the driver's AgentList) keeps it alive — no allocation,
+        // no ownership transfer.
+        self.setActiveAgent(target);
+        // Empty body (`@sage` alone) is a focus-switch only — we
+        // echo the user line so the chat shows the redirect, but
+        // we don't fire a turn until the user types something.
+        if (parsed.body.len == 0) {
+            self.appendUserLine(text) catch {};
+            return;
+        }
+    }
+
+    // From here on, `body_to_send` is what actually goes to the
+    // runner; the user's pill still shows the original `text`
+    // (with `@name` prefix) so the chat reads naturally.
+    const body_to_send = parsed.body;
+
     // Don't start a second turn while one is in flight. The user
     // can type the next message — it'll just queue up as another
     // history line but the runner won't fire.
     if (self.thinking.pending) {
-        self.appendLine(.user, text) catch {};
+        self.appendUserLine(text) catch {};
         return;
     }
-    self.beginTurn(text) catch |err| {
+    self.beginTurnWithEcho(text, body_to_send) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "! could not start turn: {s}", .{@errorName(err)}) catch "! turn failed";
         self.appendLine(.system, msg) catch {};
@@ -602,6 +654,7 @@ fn renderSkillDetail(self: *Root, s: skills_mod.Skill) !void {
 /// payload struct.
 pub const ue_chunk = "tui.chunk";
 pub const ue_tool_start = "tui.tool_start";
+pub const ue_tool_progress = "tui.tool_progress";
 pub const ue_tool_done = "tui.tool_done";
 pub const ue_done = "tui.done";
 pub const ue_error = "tui.error";
@@ -613,6 +666,13 @@ pub const ue_usage = "tui.usage";
 pub const ChunkPayload = struct { text: []u8 };
 pub const AskUserPayload = struct { question: []u8 };
 pub const ToolStartPayload = struct { id: []u8, name: []u8, args_summary: []u8 };
+pub const ToolProgressPayload = struct {
+    id: []u8,
+    /// stdout=0, stderr=1. We don't render the two streams differently
+    /// today, but the field is here so a future colour pass can use it.
+    stream: u8,
+    chunk: []u8,
+};
 pub const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8, is_error: bool };
 pub const ErrorPayload = struct { message: []u8 };
 pub const UsagePayload = struct { ctx_used: u64 };
@@ -627,11 +687,46 @@ const WorkerCtx = struct {
     session_id: []const u8,
 };
 
+/// Case-insensitive lookup against the registered agent set.
+fn knowsAgent(self: *const Root, name: []const u8) bool {
+    for (self.agent_names) |n| {
+        if (std.ascii.eqlIgnoreCase(n, name)) return true;
+    }
+    return false;
+}
+
+/// Switch the active agent. Updates session_id (drives the
+/// runner's request body), the header banner, and the status
+/// bar. Resolves the canonical-case name from `agent_names` so
+/// `@SAGE` and `@sage` both end up as `"sage"`.
+fn setActiveAgent(self: *Root, name: []const u8) void {
+    const canonical: []const u8 = blk: {
+        for (self.agent_names) |n| {
+            if (std.ascii.eqlIgnoreCase(n, name)) break :blk n;
+        }
+        // Fallback to the input slice — `knowsAgent` should have
+        // already gated this, so we shouldn't actually hit this
+        // branch in practice.
+        break :blk name;
+    };
+    self.session_id = canonical;
+    self.header.agent_name = canonical;
+    self.status_bar.agent_name = canonical;
+}
+
 fn beginTurn(self: *Root, typed: []const u8) !void {
+    return self.beginTurnWithEcho(typed, typed);
+}
+
+/// Same as `beginTurn` but with split `echo` (what we display in
+/// the user pill) and `body` (what we send to the runner). Used
+/// by the mention router so a `@sage hi` message echoes verbatim
+/// in history but ships only `hi` to sage's context.
+fn beginTurnWithEcho(self: *Root, echo: []const u8, body: []const u8) !void {
     const runner = self.runner orelse return error.NoRunner;
     const app = self.app orelse return error.NoApp;
 
-    try self.appendLine(.user, typed);
+    try self.appendUserLine(echo);
     // Submitting a new turn snaps the viewport back to the live
     // tail. If the user was reviewing scrollback, their fresh
     // message — and its incoming reply — should be visible.
@@ -665,7 +760,7 @@ fn beginTurn(self: *Root, typed: []const u8) !void {
 
     // Dup the message so the worker owns it independent of the
     // input buffer (which clears right after on_submit returns).
-    const message_copy = try self.allocator.dupe(u8, typed);
+    const message_copy = try self.allocator.dupe(u8, body);
     errdefer self.allocator.free(message_copy);
 
     const ctx = try self.allocator.create(WorkerCtx);
@@ -766,7 +861,25 @@ fn toolEventSink(
             };
             postUserEvent(ctx, ue_tool_start, payload);
         },
-        .progress => return,
+        .progress => |pr| {
+            const payload = ctx.allocator.create(ToolProgressPayload) catch return;
+            payload.* = .{
+                .id = ctx.allocator.dupe(u8, pr.id) catch {
+                    ctx.allocator.destroy(payload);
+                    return;
+                },
+                .stream = switch (pr.stream) {
+                    .stdout => 0,
+                    .stderr => 1,
+                },
+                .chunk = ctx.allocator.dupe(u8, pr.chunk) catch {
+                    ctx.allocator.free(payload.id);
+                    ctx.allocator.destroy(payload);
+                    return;
+                },
+            };
+            postUserEvent(ctx, ue_tool_progress, payload);
+        },
         .finished => |f| {
             const preview = tool_preview.render(ctx.allocator, f.name, f.kind) catch
                 ctx.allocator.dupe(u8, f.kind.flatText()) catch return;
@@ -820,13 +933,44 @@ fn postUserEvent(ctx: *WorkerCtx, name: []const u8, data: ?*const anyopaque) voi
 /// of a heap-allocated copy of `text`. Used to seed demo data
 /// while the runner integration is still in flight.
 pub fn appendLine(self: *Root, role: tui.Line.Role, text: []const u8) !void {
+    return self.appendLineWithSpeaker(role, text, null);
+}
+
+/// Append a line and stamp it with a speaker name. The name is
+/// duped onto the line; null leaves `speaker` unset (system / tool
+/// rows don't get pills).
+pub fn appendLineWithSpeaker(
+    self: *Root,
+    role: tui.Line.Role,
+    text: []const u8,
+    speaker: ?[]const u8,
+) !void {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(self.allocator);
     try buf.appendSlice(self.allocator, text);
+
+    const speaker_owned: ?[]u8 = if (speaker) |s|
+        try self.allocator.dupe(u8, s)
+    else
+        null;
+    errdefer if (speaker_owned) |s| self.allocator.free(s);
+
     try self.history.append(self.allocator, .{
         .role = role,
         .text = buf,
+        .speaker = speaker_owned,
     });
+}
+
+/// Convenience: append a `.user` line stamped with `self.user_name`.
+pub fn appendUserLine(self: *Root, text: []const u8) !void {
+    return self.appendLineWithSpeaker(.user, text, self.user_name);
+}
+
+/// Convenience: append a `.agent` line stamped with the active
+/// agent (today: `self.session_id`).
+pub fn appendAgentLine(self: *Root, text: []const u8) !void {
+    return self.appendLineWithSpeaker(.agent, text, self.session_id);
 }
 
 pub fn widget(self: *Root) vxfw.Widget {
@@ -1062,7 +1206,7 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         // so chunks before + after tools each live on their own
         // line in the natural reading order.
         const idx = self.pending_agent_line orelse blk: {
-            try self.appendLine(.agent, "");
+            try self.appendAgentLine("");
             const new_idx = self.history.items.len - 1;
             self.pending_agent_line = new_idx;
             break :blk new_idx;
@@ -1090,38 +1234,27 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
             return;
         }
 
-        // Coalesce same-tool calls within the current turn. When
-        // the model calls `edit_file` repeatedly while iterating,
-        // show a single row whose args swap to whatever the
-        // current call is editing instead of stacking N rows.
-        // Walk back through the most recent entries skipping
-        // agent prose (model commentary between calls); stop on
-        // any user line so prior turns don't accidentally
-        // collapse with the new one. Match by tool name only;
-        // the args reflect the most recent call.
+        // Idempotent on tool_use id: a `tool_start` may fire twice
+        // for the same call — once early from the provider on
+        // content_block_start (id+name only, args still streaming),
+        // once later from the runner before dispatch (id+name+full
+        // args_summary). On a repeat, just refresh the args and
+        // re-render in place; don't create a duplicate row.
         if (self.history.items.len > 0) {
             var i: usize = self.history.items.len;
             while (i > 0) {
                 i -= 1;
                 const entry = &self.history.items[i];
-                if (entry.role == .user) break;
                 if (entry.role != .tool) continue;
-                if (entry.tool_name == null) continue;
-                if (!std.mem.eql(u8, entry.tool_name.?, name_slice)) break;
-                // Match — take it over.
-                entry.tool_status = .running;
-                if (entry.tool_args) |old| self.allocator.free(old);
-                entry.tool_args = try self.allocator.dupe(u8, args_slice);
-                if (entry.tool_id) |old| self.allocator.free(old);
-                entry.tool_id = try self.allocator.dupe(u8, id_slice);
-                if (entry.tool_summary) |s| self.allocator.free(s);
-                if (entry.tool_full) |s| self.allocator.free(s);
-                entry.tool_summary = null;
-                entry.tool_full = null;
-                entry.tool_turn_id = self.current_turn_id;
-                entry.tool_is_last_in_turn = false;
-                entry.tool_started_ms = vxfw.milliTimestamp();
-                entry.tool_duration_ms = 0;
+                if (entry.tool_id == null) continue;
+                if (!std.mem.eql(u8, entry.tool_id.?, id_slice)) continue;
+                // Same id — second start. If this fire carries
+                // args (the runner's post-round one does, the
+                // provider's early one doesn't), use them.
+                if (args_slice.len > 0) {
+                    if (entry.tool_args) |old| self.allocator.free(old);
+                    entry.tool_args = try self.allocator.dupe(u8, args_slice);
+                }
                 try renderToolLine(self.allocator, entry);
                 ctx.redraw = true;
                 return;
@@ -1155,6 +1288,42 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         // with `├─` instead of `└─` now that a new sibling exists.
         try rerenderTurnTools(self, self.current_turn_id);
         ctx.redraw = true;
+    } else if (std.mem.eql(u8, ue.name, ue_tool_progress)) {
+        const p: *const ToolProgressPayload = @ptrCast(@alignCast(ue.data.?));
+        const id_slice = p.id;
+        const chunk_slice = p.chunk;
+        defer self.allocator.destroy(@as(*ToolProgressPayload, @constCast(p)));
+        defer self.allocator.free(id_slice);
+        defer self.allocator.free(chunk_slice);
+
+        // Find the running tool entry with this id and update its
+        // last-line tail. Live progress shows the bottom line of
+        // whatever the shell just wrote, dimmed under the tool's
+        // header — gives the user a real "git push origin main /
+        // counting objects: 42 / done" feel during long commands.
+        var i: usize = self.history.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = &self.history.items[i];
+            if (entry.role != .tool) continue;
+            if (entry.tool_id == null) continue;
+            if (!std.mem.eql(u8, entry.tool_id.?, id_slice)) continue;
+
+            // Take the last non-empty line of the chunk. Shells
+            // emit progress as "\rcounting objects: 42\r" or with
+            // bare newlines; we want one stable line, not a tower.
+            const tail = lastNonEmptyLine(chunk_slice);
+            if (tail.len > 0) {
+                if (entry.tool_progress_tail) |old| self.allocator.free(old);
+                // Cap at 200 chars so a runaway log line doesn't
+                // explode the row.
+                const capped = if (tail.len > 200) tail[0..200] else tail;
+                entry.tool_progress_tail = try self.allocator.dupe(u8, capped);
+                try renderToolLine(self.allocator, entry);
+                ctx.redraw = true;
+            }
+            break;
+        }
     } else if (std.mem.eql(u8, ue.name, ue_tool_done)) {
         const p: *const ToolDonePayload = @ptrCast(@alignCast(ue.data.?));
         const id_slice = p.id;
@@ -1540,6 +1709,23 @@ fn summarizeToolOutput(output: []const u8) []const u8 {
     return "(no output)";
 }
 
+/// Return the last non-empty line in `bytes`, trimmed of whitespace
+/// and CR. Used by the live tool-progress sink to surface the most
+/// recent shell-output line under a running bash row.
+///
+/// Splits on both '\n' and '\r' so progress bars that overwrite via
+/// CR (e.g. `git push` "Counting objects: 42%\r") show their newest
+/// state instead of the start-of-line.
+fn lastNonEmptyLine(bytes: []const u8) []const u8 {
+    var best: []const u8 = "";
+    var iter = std.mem.splitAny(u8, bytes, "\r\n");
+    while (iter.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t");
+        if (line.len > 0) best = line;
+    }
+    return best;
+}
+
 /// (Re)render `entry.text` from the tool's structured fields.
 /// Idempotent — call after every state change (done lands,
 /// expand toggles, args update from a coalesced retry).
@@ -1556,7 +1742,21 @@ fn renderToolLine(allocator: std.mem.Allocator, entry: *tui.Line) !void {
     const child_indent = "   \u{2514}\u{2500} ";
 
     const has_full = if (entry.tool_full) |f| f.len > 0 else false;
-    if (!has_full) return;
+    if (!has_full) {
+        // While the tool is still running we have no `tool_full`
+        // yet, but `tool_progress_tail` carries the most-recent
+        // shell-output line. Render it under the header so a long
+        // command (git push, cargo build) shows live signs of life
+        // instead of a frozen "working…".
+        if (entry.tool_progress_tail) |tail| {
+            if (tail.len > 0) {
+                try entry.text.append(allocator, '\n');
+                try entry.text.appendSlice(allocator, child_indent);
+                try entry.text.appendSlice(allocator, tail);
+            }
+        }
+        return;
+    }
 
     if (entry.tool_expanded) {
         // Expanded: every output line gets the same continuation
