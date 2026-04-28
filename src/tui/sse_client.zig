@@ -4,6 +4,7 @@
 //!
 //!     data: {"type":"chunk","text":"..."}\n\n
 //!     data: {"type":"tool_start","id":"...","name":"..."}\n\n
+//!     data: {"type":"tool_progress","id":"...","stream":"stdout|stderr","chunk":"..."}\n\n
 //!     data: {"type":"tool_done","id":"...","name":"...","output":"..."}\n\n
 //!     data: {"type":"done"}\n\n
 //!     data: {"type":"error","message":"..."}\n\n
@@ -20,9 +21,12 @@
 
 const std = @import("std");
 
+pub const StreamSide = enum { stdout, stderr };
+
 pub const Event = union(enum) {
     chunk: []const u8, // borrowed
     tool_start: struct { id: []const u8, name: []const u8 },
+    tool_progress: struct { id: []const u8, stream: StreamSide, chunk: []const u8 },
     tool_done: struct { id: []const u8, name: []const u8, output: []const u8 },
     done,
     err: []const u8,
@@ -127,6 +131,17 @@ pub const Parser = struct {
             const name = parsed.value.object.get("name") orelse return;
             if (id != .string or name != .string) return;
             sink(sink_ctx, .{ .tool_start = .{ .id = id.string, .name = name.string } });
+        } else if (std.mem.eql(u8, kind, "tool_progress")) {
+            const id = parsed.value.object.get("id") orelse return;
+            const stream_v = parsed.value.object.get("stream") orelse return;
+            const chunk = parsed.value.object.get("chunk") orelse return;
+            if (id != .string or stream_v != .string or chunk != .string) return;
+            const stream: StreamSide = if (std.mem.eql(u8, stream_v.string, "stderr")) .stderr else .stdout;
+            sink(sink_ctx, .{ .tool_progress = .{
+                .id = id.string,
+                .stream = stream,
+                .chunk = chunk.string,
+            } });
         } else if (std.mem.eql(u8, kind, "tool_done")) {
             const id = parsed.value.object.get("id") orelse return;
             const name = parsed.value.object.get("name") orelse return;
@@ -170,6 +185,16 @@ const Collector = struct {
             .tool_start => |ts| {
                 self.events.appendSlice(testing.allocator, "tool_start:") catch return;
                 self.events.appendSlice(testing.allocator, ts.name) catch return;
+                self.events.append(testing.allocator, '|') catch return;
+            },
+            .tool_progress => |tp| {
+                self.events.appendSlice(testing.allocator, "tool_progress:") catch return;
+                self.events.appendSlice(testing.allocator, switch (tp.stream) {
+                    .stdout => "out",
+                    .stderr => "err",
+                }) catch return;
+                self.events.append(testing.allocator, ':') catch return;
+                self.events.appendSlice(testing.allocator, tp.chunk) catch return;
                 self.events.append(testing.allocator, '|') catch return;
             },
             .tool_done => |td| {
@@ -232,6 +257,24 @@ test "Parser: tool_start and tool_done decode name + output" {
     );
     try testing.expectEqualStrings(
         "tool_start:get_current_time|tool_done:get_current_time:2026-04-24T00:00:00Z|",
+        c.events.items,
+    );
+}
+
+test "Parser: tool_progress decodes stream and chunk" {
+    var p = Parser.init(testing.allocator);
+    defer p.deinit();
+    var c: Collector = .{};
+    defer c.deinit();
+
+    try p.feed(
+        "data: {\"type\":\"tool_progress\",\"id\":\"t1\",\"stream\":\"stdout\",\"chunk\":\"hello\"}\n\n" ++
+            "data: {\"type\":\"tool_progress\",\"id\":\"t1\",\"stream\":\"stderr\",\"chunk\":\"oops\"}\n\n",
+        Collector.sink,
+        &c,
+    );
+    try testing.expectEqualStrings(
+        "tool_progress:out:hello|tool_progress:err:oops|",
         c.events.items,
     );
 }

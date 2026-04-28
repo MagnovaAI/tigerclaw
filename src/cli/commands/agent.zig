@@ -156,7 +156,10 @@ fn renderSseEvent(ctx: ?*anyopaque, event: sse_client.Event) void {
     const self: *SseRenderCtx = @ptrCast(@alignCast(ctx.?));
     switch (event) {
         .chunk => |text| self.out.writeAll(text) catch {},
-        .tool_start, .tool_done, .done => {},
+        // The CLI agent verb is a non-interactive pipe: tool events
+        // (start/progress/done) are noise on stdout. Drop them and
+        // render only the model's text. Done is the implicit EOS.
+        .tool_start, .tool_progress, .tool_done, .done => {},
         .err => |msg| self.out.writeAll(msg) catch {},
     }
 }

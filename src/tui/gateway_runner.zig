@@ -216,6 +216,18 @@ fn sinkEvent(ctx: ?*anyopaque, event: sse_client.Event) void {
                 .started = .{ .id = tool.id, .name = tool.name },
             });
         },
+        .tool_progress => |tp| {
+            if (self.req.tool_event_sink) |sink| sink(self.req.tool_event_sink_ctx, .{
+                .progress = .{
+                    .id = tp.id,
+                    .stream = switch (tp.stream) {
+                        .stdout => .stdout,
+                        .stderr => .stderr,
+                    },
+                    .chunk = tp.chunk,
+                },
+            });
+        },
         .tool_done => |tool| {
             if (self.req.tool_event_sink) |sink| sink(self.req.tool_event_sink_ctx, .{
                 .finished = .{

@@ -404,11 +404,15 @@ fn toolEventSink(
     const self: *StreamCtx = @ptrCast(@alignCast(ctx.?));
     switch (event) {
         .started => |s| writeToolStartFrame(self.body, s.id, s.name) catch {},
-        // SSE consumers don't yet ingest progress chunks -- the
-        // streaming format (text/event-stream) framing for partial
-        // tool output is a separate design conversation. Drop for
-        // now; the final tool_result lands on `.finished`.
-        .progress => {},
+        .progress => |p| writeToolProgressFrame(
+            self.body,
+            p.id,
+            switch (p.stream) {
+                .stdout => "stdout",
+                .stderr => "stderr",
+            },
+            p.chunk,
+        ) catch {},
         .finished => |f| writeToolDoneFrame(self.body, f.id, f.name, f.kind.flatText()) catch {},
     }
 }
@@ -434,6 +438,22 @@ fn writeToolStartFrame(body: *std.http.BodyWriter, id: []const u8, name: []const
     try std.json.Stringify.encodeJsonString(id, .{}, &body.writer);
     try body.writer.writeAll(",\"name\":");
     try std.json.Stringify.encodeJsonString(name, .{}, &body.writer);
+    try body.writer.writeAll("}\n\n");
+    try body.writer.flush();
+}
+
+fn writeToolProgressFrame(
+    body: *std.http.BodyWriter,
+    id: []const u8,
+    stream: []const u8,
+    chunk: []const u8,
+) !void {
+    try body.writer.writeAll("data: {\"type\":\"tool_progress\",\"id\":");
+    try std.json.Stringify.encodeJsonString(id, .{}, &body.writer);
+    try body.writer.writeAll(",\"stream\":");
+    try std.json.Stringify.encodeJsonString(stream, .{}, &body.writer);
+    try body.writer.writeAll(",\"chunk\":");
+    try std.json.Stringify.encodeJsonString(chunk, .{}, &body.writer);
     try body.writer.writeAll("}\n\n");
     try body.writer.flush();
 }
