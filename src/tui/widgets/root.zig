@@ -1494,20 +1494,34 @@ pub fn appendUserLine(self: *Root, text: []const u8) !void {
     return self.appendLineWithSpeaker(.user, text, self.user_name);
 }
 
-/// Embedded TIGERCLAW wordmark — same asset the old pinned Header
-/// widget used. Six visible rows; each row paints in the gradient
-/// band picked by `History.styleFor` from the line's `banner_row`
-/// index.
-const banner_wordmark = @embedFile("wordmark.txt");
+/// Embedded TIGERCLAW wordmarks — wide and compact variants
+/// inherited from the old pinned Header widget. Both are six
+/// rows tall; the wide form is ~71 display columns, the compact
+/// "TC" form is ~17. `appendBanner` picks based on terminal
+/// width so a narrow pane doesn't paint a wordmark that wraps.
+const banner_wordmark_wide = @embedFile("wordmark.txt");
+const banner_wordmark_tc = @embedFile("wordmark_tc.txt");
+
+/// Minimum terminal width that triggers the wide wordmark. Below
+/// this we fall back to the compact "TC" form. Matches the old
+/// `Header.wide_min_width` (72 wordmark cols + 4 cells of margin).
+const banner_wide_min_width: u16 = 76;
 
 /// Emit the scrolling banner at the top of history. Six wordmark
 /// rows in gradient + a one-line tigerclaw info line tinted as
 /// `.system`. Idempotent — safe to call once after `init`. The
 /// banner scrolls along with the rest of the chat; once a real
-/// turn fills the pane, the banner moves out of view.
-pub fn appendBanner(self: *Root) !void {
+/// turn fills the pane, the banner moves out of view. `width` is
+/// the launch-time terminal column count; pass 0 to default to
+/// the wide variant.
+pub fn appendBanner(self: *Root, width: u16) !void {
+    const wordmark = if (width == 0 or width >= banner_wide_min_width)
+        banner_wordmark_wide
+    else
+        banner_wordmark_tc;
+
     var row_idx: u8 = 0;
-    var line_iter = std.mem.splitScalar(u8, banner_wordmark, '\n');
+    var line_iter = std.mem.splitScalar(u8, wordmark, '\n');
     while (line_iter.next()) |line| {
         if (line.len == 0) continue;
         var buf: std.ArrayList(u8) = .empty;

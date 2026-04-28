@@ -435,8 +435,16 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     // replaces the old pinned `Header` widget — same wordmark and
     // gradient, but it scrolls along with the chat so the area
     // above the input is clean for the upper status bar / live
-    // tool state once the conversation grows.
-    root.appendBanner() catch {};
+    // tool state once the conversation grows. Query the winsize
+    // directly here so a narrow terminal gets the compact "TC"
+    // wordmark instead of a wrapping wide one. vaxis hasn't yet
+    // sized its screen at this point — the App.run loop is what
+    // fires the first resize event — so we go to the kernel.
+    const launch_width: u16 = blk: {
+        const ws = vaxis.Tty.getWinsize(app.tty.fd) catch break :blk 0;
+        break :blk ws.cols;
+    };
+    root.appendBanner(launch_width) catch {};
     // Forward sandbox toggles (/lock, /unlock, /plan) through the
     // gateway HTTP runner so the daemon's in-process LiveAgentRunner
     // adopts the same policy. Without this bridge the TUI's status
