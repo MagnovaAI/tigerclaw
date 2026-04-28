@@ -3,7 +3,7 @@
 //! The gateway emits v1-compatible JSON-envelope frames:
 //!
 //!     data: {"type":"chunk","text":"..."}\n\n
-//!     data: {"type":"tool_start","id":"...","name":"..."}\n\n
+//!     data: {"type":"tool_start","id":"...","name":"...","args_summary":"..."}\n\n
 //!     data: {"type":"tool_progress","id":"...","stream":"stdout|stderr","chunk":"..."}\n\n
 //!     data: {"type":"tool_done","id":"...","name":"...","output":"..."}\n\n
 //!     data: {"type":"done"}\n\n
@@ -25,7 +25,7 @@ pub const StreamSide = enum { stdout, stderr };
 
 pub const Event = union(enum) {
     chunk: []const u8, // borrowed
-    tool_start: struct { id: []const u8, name: []const u8 },
+    tool_start: struct { id: []const u8, name: []const u8, args_summary: []const u8 = "" },
     tool_progress: struct { id: []const u8, stream: StreamSide, chunk: []const u8 },
     tool_done: struct { id: []const u8, name: []const u8, output: []const u8 },
     done,
@@ -130,7 +130,15 @@ pub const Parser = struct {
             const id = parsed.value.object.get("id") orelse return;
             const name = parsed.value.object.get("name") orelse return;
             if (id != .string or name != .string) return;
-            sink(sink_ctx, .{ .tool_start = .{ .id = id.string, .name = name.string } });
+            // `args_summary` is optional — emitted by the gateway only
+            // for the runner's post-round `.started` fire (which has
+            // the parsed argument). The provider's earlier
+            // content-block-start fire omits it; the field stays
+            // empty in that case and the TUI later refreshes the
+            // tool row when the second event lands.
+            const args_v = parsed.value.object.get("args_summary");
+            const args: []const u8 = if (args_v) |v| (if (v == .string) v.string else "") else "";
+            sink(sink_ctx, .{ .tool_start = .{ .id = id.string, .name = name.string, .args_summary = args } });
         } else if (std.mem.eql(u8, kind, "tool_progress")) {
             const id = parsed.value.object.get("id") orelse return;
             const stream_v = parsed.value.object.get("stream") orelse return;

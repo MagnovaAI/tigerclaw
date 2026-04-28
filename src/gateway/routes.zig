@@ -318,7 +318,7 @@ fn sessionsTurnHandler(
 ///
 /// Emits v1-compatible JSON-envelope frames:
 /// * `data: {"type":"chunk","text":"..."}\n\n` per provider text delta
-/// * `data: {"type":"tool_start","id":"...","name":"..."}\n\n` per dispatch
+/// * `data: {"type":"tool_start","id":"...","name":"...","args_summary":"..."}\n\n` per dispatch
 /// * `data: {"type":"tool_done","id":"...","name":"...","output":"..."}\n\n`
 /// * `data: {"type":"done"}\n\n` terminal frame
 /// * `data: {"type":"error","message":"..."}\n\n` on failure (followed by done)
@@ -405,7 +405,7 @@ fn toolEventSink(
 ) void {
     const self: *StreamCtx = @ptrCast(@alignCast(ctx.?));
     switch (event) {
-        .started => |s| writeToolStartFrame(self.body, s.id, s.name) catch {},
+        .started => |s| writeToolStartFrame(self.body, s.id, s.name, s.args_summary) catch {},
         .progress => |p| writeToolProgressFrame(
             self.body,
             p.id,
@@ -435,11 +435,20 @@ fn writeChunkFrame(body: *std.http.BodyWriter, text: []const u8) !void {
     try body.writer.flush();
 }
 
-fn writeToolStartFrame(body: *std.http.BodyWriter, id: []const u8, name: []const u8) !void {
+fn writeToolStartFrame(
+    body: *std.http.BodyWriter,
+    id: []const u8,
+    name: []const u8,
+    args_summary: []const u8,
+) !void {
     try body.writer.writeAll("data: {\"type\":\"tool_start\",\"id\":");
     try std.json.Stringify.encodeJsonString(id, .{}, &body.writer);
     try body.writer.writeAll(",\"name\":");
     try std.json.Stringify.encodeJsonString(name, .{}, &body.writer);
+    if (args_summary.len > 0) {
+        try body.writer.writeAll(",\"args_summary\":");
+        try std.json.Stringify.encodeJsonString(args_summary, .{}, &body.writer);
+    }
     try body.writer.writeAll("}\n\n");
     try body.writer.flush();
 }

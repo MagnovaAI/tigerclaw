@@ -292,7 +292,7 @@ fn sinkEvent(ctx: ?*anyopaque, event: sse_client.Event) void {
         },
         .tool_start => |tool| {
             if (self.req.tool_event_sink) |sink| sink(self.req.tool_event_sink_ctx, .{
-                .started = .{ .id = tool.id, .name = tool.name },
+                .started = .{ .id = tool.id, .name = tool.name, .args_summary = tool.args_summary },
             });
         },
         .tool_progress => |tp| {
