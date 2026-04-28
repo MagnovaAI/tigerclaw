@@ -273,7 +273,17 @@ pub const LiveAgentRunner = struct {
         };
         defer skills_list.deinit();
 
-        const system_prompt = try buildSystemPrompt(allocator, soul, skills_list.items);
+        // Discover sibling agents so the system prompt can teach this
+        // agent its name and the @-mention syntax for routing back to
+        // peers. Scan failures collapse to "no siblings" — single-agent
+        // setups still get a working prompt.
+        const peers = listSiblingAgents(allocator, io, home, agent_name) catch &[_][]u8{};
+        defer {
+            for (peers) |p| allocator.free(p);
+            allocator.free(peers);
+        }
+
+        const system_prompt = try buildSystemPrompt(allocator, soul, skills_list.items, agent_name, peers);
 
         // Resolve the file-tool sandbox root: prefer the workspace
         // copy (per-project scratch dir) with fallback to the home
@@ -311,9 +321,48 @@ pub const LiveAgentRunner = struct {
         allocator: std.mem.Allocator,
         soul: ?[]const u8,
         skills: []const skills_mod.Skill,
+        self_name: []const u8,
+        peers: []const []const u8,
     ) LoadError!?[]u8 {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
+
+        // Multi-agent header. Prepended before SOUL so the model
+        // sees the routing primitive first — the persona-specific
+        // SOUL.md content reads downstream of "you are <name> in a
+        // multi-agent chat with <peers>". When `peers.len == 0` we
+        // skip the section entirely so single-agent setups stay clean.
+        if (peers.len > 0) {
+            try buf.appendSlice(allocator, "# Multi-agent chat\n\nYou are **");
+            try buf.appendSlice(allocator, self_name);
+            try buf.appendSlice(allocator, "**. You share this chat with: ");
+            for (peers, 0..) |p, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                try buf.appendSlice(allocator, "@");
+                try buf.appendSlice(allocator, p);
+            }
+            try buf.appendSlice(allocator,
+                \\.
+                \\
+                \\To bring another agent in, write `@<name>` anywhere in your reply
+                \\(e.g. one of the names listed above). The runtime detects the
+                \\mention, runs that agent, and their reply lands in the chat under
+                \\their own pill — they speak as a peer to the user, not back to
+                \\you. You do NOT need to summarise or follow up; once another
+                \\agent is invoked, the conversational floor passes to them.
+                \\
+                \\Self-mentions (`@
+            );
+            try buf.appendSlice(allocator, self_name);
+            try buf.appendSlice(allocator,
+                \\`) are ignored. Mentions inside fenced code blocks
+                \\(``` ... ```) are ignored, so you can quote `@`-strings safely.
+                \\Pull peers in only when their angle helps; don't @mention to look
+                \\thorough. If the question is squarely in your lane, just answer.
+                \\
+                \\
+            );
+        }
 
         if (soul) |s| {
             try buf.appendSlice(allocator, s);
@@ -2666,6 +2715,52 @@ fn readRootCascade(
 
 /// Resolve the sandbox directory for file tools. Prefers the
 /// workspace-scoped copy (`<workspace>/.tigerclaw/agents/<name>/workspace`)
+/// Discover sibling agent names by scanning the agents directory.
+/// `<home>/.tigerclaw/agents/` is the canonical location; the
+/// workspace copy is not used here (peer roster is per-installation,
+/// not per-project). Returns owned strings excluding `self_name`,
+/// sorted ascending so the prompt order is stable across launches.
+/// Failures collapse to an empty list — the caller handles that as
+/// "no peers, single-agent prompt".
+fn listSiblingAgents(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    self_name: []const u8,
+) LoadError![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |n| allocator.free(n);
+        out.deinit(allocator);
+    }
+    if (home.len == 0) return out.toOwnedSlice(allocator) catch error.OutOfMemory;
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.tigerclaw/agents", .{home}) catch
+        return out.toOwnedSlice(allocator) catch error.OutOfMemory;
+
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch
+        return out.toOwnedSlice(allocator) catch error.OutOfMemory;
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (std.mem.eql(u8, entry.name, self_name)) continue;
+        const owned = allocator.dupe(u8, entry.name) catch return error.OutOfMemory;
+        errdefer allocator.free(owned);
+        out.append(allocator, owned) catch return error.OutOfMemory;
+    }
+
+    std.mem.sort([]u8, out.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return out.toOwnedSlice(allocator) catch error.OutOfMemory;
+}
+
 /// so agents scratched in-project don't spill into the user's
 /// home dir; falls back to the home copy. Caller owns the slice.
 fn resolveAgentWorkspaceRoot(
