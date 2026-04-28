@@ -1392,6 +1392,144 @@ fn timeoutWatchdog(ctx: *SubturnTimeoutCtx) void {
     loop.postEvent(.{ .app = .{ .name = ue_subturn_timeout, .data = payload } });
 }
 
+/// Build the join body sent back to the invoker on resume. Slots are
+/// already in mention-order because `scanAndFanOut` appends them
+/// left-to-right; the body preserves that order regardless of which
+/// sub-turn finished first. Per D6: each slot becomes a paragraph
+/// led by `@<target> replied:` so the resume re-scan (D4) can
+/// recognize the synthetic header and skip it. Slots that ended in
+/// a non-`.done` terminal state contribute a synthetic error line
+/// instead, so the invoker still sees something for every mention.
+///
+/// Caller owns the returned heap slice.
+pub fn buildResumeBody(
+    allocator: std.mem.Allocator,
+    slots: []const SubturnSlot,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    for (slots, 0..) |slot, i| {
+        if (i > 0) try buf.appendSlice(allocator, "\n\n");
+        try buf.appendSlice(allocator, "@");
+        try buf.appendSlice(allocator, slot.target);
+        try buf.appendSlice(allocator, " replied:\n");
+
+        switch (slot.state) {
+            .done => {
+                if (slot.reply) |r| {
+                    try buf.appendSlice(allocator, r);
+                } else {
+                    // `done` without a reply shouldn't happen in
+                    // practice; treat as empty rather than crash.
+                    try buf.appendSlice(allocator, "");
+                }
+            },
+            .timed_out, .errored, .cancelled => {
+                const reason = slot.error_reason orelse "unknown error";
+                var rbuf: [128]u8 = undefined;
+                const line = std.fmt.bufPrint(
+                    &rbuf,
+                    "Error: @{s} did not respond ({s})",
+                    .{ slot.target, reason },
+                ) catch "Error: subturn failed";
+                try buf.appendSlice(allocator, line);
+            },
+            .in_flight => {
+                // Reaching here means the join fired with slots
+                // still pending — a logic bug. Fall back to a
+                // synthetic message so the invoker isn't lied to.
+                var rbuf: [128]u8 = undefined;
+                const line = std.fmt.bufPrint(
+                    &rbuf,
+                    "Error: @{s} reply not received",
+                    .{slot.target},
+                ) catch "Error: missing subturn reply";
+                try buf.appendSlice(allocator, line);
+            },
+        }
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Spawn a `.resume_` worker that delivers the join body to the
+/// paused invoker. Similar shape to `dispatchSubturn` minus the
+/// slot bookkeeping — resume is a singleton turn, not a fan-out
+/// member. Increments `auto_dispatch_calls` for budget accounting
+/// (step 7 will enforce the cap; for now the field just tracks).
+fn dispatchResume(self: *Root, invoker: []const u8, body: []u8) !void {
+    const app = self.app orelse return error.NoApp;
+
+    // Resolve canonical invoker casing from the registered set so
+    // the gateway routes to the right runner.
+    const invoker_canonical: []const u8 = blk: {
+        for (self.agent_names) |n| {
+            if (std.ascii.eqlIgnoreCase(n, invoker)) break :blk n;
+        }
+        break :blk invoker;
+    };
+
+    self.auto_dispatch_calls +%= 1;
+
+    // Take ownership of `body` unconditionally — even on the
+    // spawn-failure path. `maybeResume` cannot tell from outside
+    // whether the worker started; centralizing the free here keeps
+    // the lifecycle one-sided.
+    errdefer self.allocator.free(body);
+
+    const ctx = try self.allocator.create(WorkerCtx);
+    errdefer self.allocator.destroy(ctx);
+    ctx.* = .{
+        .allocator = self.allocator,
+        .root = self,
+        .app = app,
+        .message = body,
+        .session_id = invoker_canonical,
+        .epoch = self.turn_epoch,
+        .dispatch_kind = .resume_,
+        .invoker = null,
+        .mention_order_idx = 0,
+    };
+
+    // Worker now owns `body` (via `ctx.message`); cancel the
+    // errdefer by exiting through the success path.
+    var thread = try std.Thread.spawn(.{}, workerMain, .{ctx});
+    thread.detach();
+}
+
+/// Trigger the join+resume step if the current fan-out has
+/// drained. Idempotent — safe to call after every slot transition.
+/// Slot allocations are freed once the body is built; further
+/// transitions on the cleared slots are impossible because slot
+/// lookups go through `findSubturnSlot` which only matches
+/// `.in_flight`.
+fn maybeResume(self: *Root) !void {
+    if (self.pending_subturns != 0) return;
+    const invoker_owned = self.invoker_to_resume orelse return;
+
+    // Snapshot what we need before clearing slot state. The body
+    // borrows from slot replies, so we build it before freeing.
+    const body = try buildResumeBody(self.allocator, self.subturn_slots.items);
+
+    // Free slot allocations now that the body is built. Leave
+    // `invoker_to_resume` populated until dispatch succeeds so a
+    // failure here doesn't strand the invoker silently.
+    for (self.subturn_slots.items) |*slot| slot.deinit(self.allocator);
+    self.subturn_slots.clearRetainingCapacity();
+
+    // `dispatchResume` takes ownership of `body` unconditionally —
+    // success path threads it into the worker, failure path frees
+    // it. So we must not touch `body` after this call regardless
+    // of outcome.
+    try self.dispatchResume(invoker_owned, body);
+
+    // Worker now owns `body` and `invoker_owned` lifetime is
+    // managed by the resume cycle. Clear our pointer.
+    self.allocator.free(invoker_owned);
+    self.invoker_to_resume = null;
+}
+
 /// Find the `.in_flight` sub-turn slot matching this completion
 /// triple. Returns null if no slot is in flight for that key —
 /// meaning either we never dispatched it (shouldn't happen), it was
@@ -1430,10 +1568,19 @@ fn onSubturnDone(self: *Root, p: *const DonePayload) !void {
     slot.reply = try self.allocator.dupe(u8, p.output);
     slot.state = .done;
     if (self.pending_subturns > 0) self.pending_subturns -= 1;
-    // Step 5b stops here. Step 6 will check `pending_subturns == 0`
-    // and dispatch the resume with a joined body. For now the user
-    // simply sees the sub-turn's reply land in history naturally
-    // (chunks already flowed through `chunkSink`); no resume yet.
+    // If this was the last in-flight slot, fire the join + resume.
+    // The invoker's resumed reply re-enters `scanAndFanOut` via the
+    // normal `ue_done` path, so cascading mentions just keep looping
+    // until either no fresh mentions appear or the budget halts it.
+    self.maybeResume() catch |e| {
+        var buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "! resume dispatch failed: {s}",
+            .{@errorName(e)},
+        ) catch "! resume dispatch failed";
+        self.appendLine(.system, line) catch {};
+    };
 }
 
 /// Primary or resume completion: scan the assistant's final text
@@ -2058,6 +2205,12 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
             .{ p.target, self.auto_dispatch_subturn_timeout_secs },
         ) catch "! subturn timed out";
         self.appendLine(.system, line) catch {};
+
+        // Timeout decremented `pending_subturns`; if this was the
+        // last one, the join+resume fires with a synthetic error
+        // for the timed-out slot and any successful replies for the
+        // others.
+        self.maybeResume() catch {};
         ctx.redraw = true;
     }
 }
@@ -2597,6 +2750,61 @@ test "appendSubturnMarker: writes the chain line as a system row" {
     try testing.expect(std.mem.indexOf(u8, line.text.items, "@sage") != null);
 }
 
+test "buildResumeBody: two done slots in mention order" {
+    var slots = [_]SubturnSlot{
+        .{
+            .target = try testing.allocator.dupe(u8, "sage"),
+            .mention_idx = 0,
+            .state = .done,
+            .reply = try testing.allocator.dupe(u8, "sage's take"),
+        },
+        .{
+            .target = try testing.allocator.dupe(u8, "bolt"),
+            .mention_idx = 1,
+            .state = .done,
+            .reply = try testing.allocator.dupe(u8, "bolt's take"),
+        },
+    };
+    defer for (&slots) |*s| s.deinit(testing.allocator);
+
+    const body = try buildResumeBody(testing.allocator, &slots);
+    defer testing.allocator.free(body);
+    const expected =
+        "@sage replied:\nsage's take\n\n" ++
+        "@bolt replied:\nbolt's take";
+    try testing.expectEqualStrings(expected, body);
+}
+
+test "buildResumeBody: timed-out slot becomes synthetic error line" {
+    var slots = [_]SubturnSlot{
+        .{
+            .target = try testing.allocator.dupe(u8, "sage"),
+            .mention_idx = 0,
+            .state = .done,
+            .reply = try testing.allocator.dupe(u8, "ok"),
+        },
+        .{
+            .target = try testing.allocator.dupe(u8, "bolt"),
+            .mention_idx = 1,
+            .state = .timed_out,
+            .error_reason = "timeout",
+        },
+    };
+    defer for (&slots) |*s| s.deinit(testing.allocator);
+
+    const body = try buildResumeBody(testing.allocator, &slots);
+    defer testing.allocator.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "@sage replied:\nok") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "@bolt replied:\nError: @bolt did not respond (timeout)") != null);
+}
+
+test "buildResumeBody: empty slot list yields empty body" {
+    const slots = [_]SubturnSlot{};
+    const body = try buildResumeBody(testing.allocator, &slots);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("", body);
+}
+
 test "scanAndFanOut: empty output leaves state untouched" {
     var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
     defer root.deinit();
@@ -2644,13 +2852,21 @@ test "onSubturnDone: marks slot done and decrements pending_subturns" {
     var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
     defer root.deinit();
 
-    // Seed a slot the way `dispatchSubturn` would have.
+    // Seed two slots so `pending_subturns` decrements to 1 — that
+    // keeps `maybeResume` from firing, leaving the just-completed
+    // slot inspectable. End-to-end resume behavior is exercised
+    // separately via `buildResumeBody` / e2e tests.
     try root.subturn_slots.append(testing.allocator, .{
         .target = try testing.allocator.dupe(u8, "sage"),
         .mention_idx = 0,
         .state = .in_flight,
     });
-    root.pending_subturns = 1;
+    try root.subturn_slots.append(testing.allocator, .{
+        .target = try testing.allocator.dupe(u8, "bolt"),
+        .mention_idx = 1,
+        .state = .in_flight,
+    });
+    root.pending_subturns = 2;
     root.invoker_to_resume = try testing.allocator.dupe(u8, "tiger");
 
     const p: DonePayload = .{
@@ -2668,7 +2884,7 @@ test "onSubturnDone: marks slot done and decrements pending_subturns" {
     try root.onSubturnDone(&p);
     try testing.expectEqual(SubturnSlot.State.done, root.subturn_slots.items[0].state);
     try testing.expectEqualStrings("sage's reply", root.subturn_slots.items[0].reply.?);
-    try testing.expectEqual(@as(usize, 0), root.pending_subturns);
+    try testing.expectEqual(@as(usize, 1), root.pending_subturns);
 }
 
 test "clearSubturnState: drops in-flight slots and resets counters" {
