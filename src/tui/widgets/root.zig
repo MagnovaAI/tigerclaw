@@ -103,6 +103,11 @@ header: Header,
 /// response to key presses and runner events. The History
 /// widget borrows a slice of this list per frame.
 history: std.ArrayList(tui.Line) = .empty,
+/// Wrap-layout cache for the History widget. Memoises per-line
+/// row breakdowns so a re-layout doesn't walk the entire
+/// transcript through `gwidth` on every frame. Initialised in
+/// `init`, freed in `deinit`.
+history_cache: History.WrapCache,
 input: Input,
 thinking: Thinking = .{},
 /// Hint strip above the input. Texts are short borrowed slices
@@ -294,6 +299,7 @@ pub fn init(allocator: std.mem.Allocator, opts: InitOptions) Root {
             .workspace = opts.workspace,
         },
         .input = Input.init(allocator),
+        .history_cache = History.WrapCache.init(allocator),
         .session_id = opts.agent_name,
         .user_name = opts.user_name,
         .agent_names = opts.agent_names,
@@ -366,6 +372,7 @@ pub fn deinit(self: *Root) void {
         l.deinitSpeaker(self.allocator);
     }
     self.history.deinit(self.allocator);
+    self.history_cache.deinit();
     self.clearSubturnState();
     self.subturn_slots.deinit(self.allocator);
     self.clearAllPendingAgentLines();
@@ -2445,8 +2452,7 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         // without a pill on the tool row itself, a glance at the
         // chat reads as if the tool had no owner — especially
         // when a tool fires immediately after the prompt with no
-        // preceding text from that agent (the common case for
-        // `stay_silent`).
+        // preceding text from that agent.
         const speaker_owned = try self.allocator.dupe(u8, p.agent);
         errdefer self.allocator.free(speaker_owned);
 
@@ -2784,6 +2790,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
         const view: History = .{
             .lines = self.history.items,
             .scroll_offset = self.scroll_offset,
+            .cache = &self.history_cache,
         };
         const s = try view.widget().draw(ctx.withConstraints(
             .{ .width = 0, .height = 0 },

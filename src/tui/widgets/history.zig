@@ -31,6 +31,168 @@ lines: []const tui.Line,
 /// the last row); larger values shift the viewport upward into
 /// older content. Clamped at draw time.
 scroll_offset: u32 = 0,
+/// Optional wrap-layout cache owned by the parent widget. When
+/// non-null the draw pass reuses pre-computed wrap segments
+/// instead of walking the entire transcript through `gwidth` on
+/// every frame. Null falls back to the uncached path so unit tests
+/// and ad-hoc callers don't have to thread state through.
+cache: ?*WrapCache = null,
+
+/// Per-line wrap layout cache. The expensive part of `draw` is
+/// converting a line's bytes into a list of physical rows under a
+/// given panel width — it walks every grapheme through
+/// `vaxis.gwidth` and accumulates display columns. That work is
+/// pure of `(text bytes, width, prefix_cols)`, so we memoise it.
+///
+/// Lifetime: owned by the parent widget (RootWidget). Init once,
+/// deinit on shutdown. Entries are reused across frames; a stale
+/// entry is detected by comparing `(ptr, len, width, prefix_cols)`
+/// against the cached key on lookup.
+pub const WrapCache = struct {
+    allocator: std.mem.Allocator,
+    /// Indexed by line position in `lines`. Resized lazily so the
+    /// owner doesn't have to mirror history mutations.
+    entries: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct {
+        /// Identity of the cached input. A miss happens when any
+        /// field differs from the live line/width.
+        text_ptr: [*]const u8 = undefined,
+        text_len: usize = 0,
+        width: u16 = 0,
+        prefix_cols: u16 = 0,
+        valid: bool = false,
+        /// Each segment is one wrapped physical row inside one
+        /// `\n`-delimited segment of the source text. Stored as
+        /// `(byte_offset_in_line, byte_len)` so the draw pass can
+        /// slice back into `line.text.items` without re-walking.
+        rows: std.ArrayList(Row) = .empty,
+    };
+
+    pub const Row = struct {
+        bytes_offset: u32,
+        bytes_len: u32,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) WrapCache {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *WrapCache) void {
+        for (self.entries.items) |*e| e.rows.deinit(self.allocator);
+        self.entries.deinit(self.allocator);
+    }
+
+    /// Drop every entry. Called when the history is rebuilt from
+    /// scratch (e.g. session reset) so we don't hand back rows
+    /// that point into freed memory.
+    pub fn clear(self: *WrapCache) void {
+        for (self.entries.items) |*e| {
+            e.rows.clearRetainingCapacity();
+            e.valid = false;
+        }
+    }
+
+    /// Look up (or compute) the wrap layout for `line` at `width`
+    /// with `prefix_cols` reserved for the speaker pill + glyph.
+    /// Returns a borrowed slice of rows valid until the next call
+    /// that mutates the same entry (i.e. next miss for this index).
+    fn rowsFor(
+        self: *WrapCache,
+        idx: usize,
+        line: *const tui.Line,
+        width: u16,
+        prefix_cols: u16,
+    ) ![]const Row {
+        // Grow the entry table so `idx` is addressable. Newly
+        // created slots start invalid, forcing a recompute.
+        if (idx >= self.entries.items.len) {
+            const old_len = self.entries.items.len;
+            try self.entries.resize(self.allocator, idx + 1);
+            for (self.entries.items[old_len..]) |*e| e.* = .{};
+        }
+        const entry = &self.entries.items[idx];
+
+        const text = line.text.items;
+        const ptr: [*]const u8 = if (text.len == 0) undefined else text.ptr;
+        const text_ptr_eq = if (text.len == 0) entry.text_len == 0 else entry.text_ptr == ptr;
+
+        if (entry.valid and
+            text_ptr_eq and
+            entry.text_len == text.len and
+            entry.width == width and
+            entry.prefix_cols == prefix_cols)
+        {
+            return entry.rows.items;
+        }
+
+        // Miss — recompute. Reuse the row list's capacity to keep
+        // allocator pressure flat under streaming.
+        entry.rows.clearRetainingCapacity();
+        try wrapLineInto(&entry.rows, self.allocator, text, width, prefix_cols);
+        entry.text_ptr = ptr;
+        entry.text_len = text.len;
+        entry.width = width;
+        entry.prefix_cols = prefix_cols;
+        entry.valid = true;
+        return entry.rows.items;
+    }
+};
+
+/// Pure wrap routine. Splits `text` into `\n`-delimited segments
+/// and soft-wraps each by display columns, capped at 32 rows
+/// (mirrors the per-line guard in the draw loop).
+fn wrapLineInto(
+    out: *std.ArrayList(WrapCache.Row),
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    width: u16,
+    prefix_cols: u16,
+) !void {
+    const max_rows_per_line: u32 = 32;
+    const avail: usize = if (width > prefix_cols) width - prefix_cols else 1;
+
+    var rows_in_line: u32 = 0;
+    var seg_start: usize = 0;
+    while (seg_start <= text.len and rows_in_line < max_rows_per_line) {
+        const nl_pos = std.mem.indexOfScalarPos(u8, text, seg_start, '\n');
+        const seg_end = nl_pos orelse text.len;
+        const segment = text[seg_start..seg_end];
+
+        if (segment.len == 0) {
+            try out.append(allocator, .{
+                .bytes_offset = @intCast(seg_start),
+                .bytes_len = 0,
+            });
+            rows_in_line += 1;
+        } else {
+            var off: usize = 0;
+            while (off < segment.len and rows_in_line < max_rows_per_line) {
+                const taken = takeCols(segment[off..], avail);
+                const take = if (taken.bytes == 0) safeUtf8Take(segment[off..], 1) else taken.bytes;
+                if (take == 0) break;
+                try out.append(allocator, .{
+                    .bytes_offset = @intCast(seg_start + off),
+                    .bytes_len = @intCast(take),
+                });
+                rows_in_line += 1;
+                off += take;
+            }
+        }
+
+        if (nl_pos) |p| {
+            seg_start = p + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Mirror the "empty line still gets one row so the pill paints"
+    // edge case the draw loop maintained pre-cache.
+    if (rows_in_line == 0) {
+        try out.append(allocator, .{ .bytes_offset = 0, .bytes_len = 0 });
+    }
+}
 
 pub fn widget(self: *const History) vxfw.Widget {
     return .{
@@ -131,69 +293,41 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
 
         const pill_cols = indent_pill_cols.items[idx];
         const prefix_cols = pill_cols + measureCols(prefixFor(&line));
-        const avail: usize = if (width > prefix_cols) width - prefix_cols else 1;
 
-        // Per-line cap mirrors the old renderer: a runaway tool
-        // dump shouldn't be able to fill the whole buffer with one
-        // entry. The remainder is silently truncated.
-        var rows_in_line: u32 = 0;
-        const max_rows_per_line: u32 = 32;
-
-        var seg_start: usize = 0;
-        while (seg_start <= line.text.items.len and rows_in_line < max_rows_per_line) {
-            const nl_pos = std.mem.indexOfScalarPos(u8, line.text.items, seg_start, '\n');
-            const seg_end = nl_pos orelse line.text.items.len;
-            const segment = line.text.items[seg_start..seg_end];
-
-            // Empty segment (a literal blank line) still occupies
-            // one row.
-            if (segment.len == 0) {
+        // Resolve the line's wrap layout. The cached path memoises
+        // `(text, width, prefix_cols)` so we don't re-walk every
+        // grapheme through `gwidth` on each frame; the fallback
+        // path keeps unit tests and ad-hoc callers working without
+        // having to wire in a cache instance.
+        if (self.cache) |cache_ptr| {
+            const cached_rows = try cache_ptr.rowsFor(
+                idx,
+                &line,
+                @intCast(width),
+                @intCast(prefix_cols),
+            );
+            for (cached_rows, 0..) |cr, ri| {
                 try rows.append(ctx.arena, .{
                     .kind = .content,
                     .line_idx = @intCast(idx),
-                    .bytes_offset = @intCast(seg_start),
-                    .bytes_len = 0,
-                    .is_first = (rows_in_line == 0),
+                    .bytes_offset = cr.bytes_offset,
+                    .bytes_len = cr.bytes_len,
+                    .is_first = (ri == 0),
                 });
-                rows_in_line += 1;
-            } else {
-                // Soft-wrap by display columns.
-                var off: usize = 0;
-                while (off < segment.len and rows_in_line < max_rows_per_line) {
-                    const taken = takeCols(segment[off..], avail);
-                    const take = if (taken.bytes == 0) safeUtf8Take(segment[off..], 1) else taken.bytes;
-                    if (take == 0) break;
-                    try rows.append(ctx.arena, .{
-                        .kind = .content,
-                        .line_idx = @intCast(idx),
-                        .bytes_offset = @intCast(seg_start + off),
-                        .bytes_len = @intCast(take),
-                        .is_first = (rows_in_line == 0),
-                    });
-                    rows_in_line += 1;
-                    off += take;
-                }
             }
-
-            // Move past the newline if any. When we ran out at the
-            // end of the buffer (no newline) this exits the loop.
-            if (nl_pos) |p| {
-                seg_start = p + 1;
-            } else {
-                break;
+        } else {
+            var tmp: std.ArrayList(WrapCache.Row) = .empty;
+            defer tmp.deinit(ctx.arena);
+            try wrapLineInto(&tmp, ctx.arena, line.text.items, @intCast(width), @intCast(prefix_cols));
+            for (tmp.items, 0..) |cr, ri| {
+                try rows.append(ctx.arena, .{
+                    .kind = .content,
+                    .line_idx = @intCast(idx),
+                    .bytes_offset = cr.bytes_offset,
+                    .bytes_len = cr.bytes_len,
+                    .is_first = (ri == 0),
+                });
             }
-        }
-
-        // Edge case: a line with empty text and no newline still
-        // wants a row so the speaker glyph is visible.
-        if (rows_in_line == 0) {
-            try rows.append(ctx.arena, .{
-                .kind = .content,
-                .line_idx = @intCast(idx),
-                .bytes_offset = 0,
-                .bytes_len = 0,
-                .is_first = true,
-            });
         }
 
         // Trailing half-block: closes the user-message tint band.
@@ -677,4 +811,101 @@ test "totalRowsFor: per-line cap at 32 rows" {
     try text.appendNTimes(allocator, 'x', 10_000);
     const lines = [_]tui.Line{.{ .role = .agent, .text = text }};
     try testing.expectEqual(@as(u32, 32), totalRowsFor(&lines, 21));
+}
+
+// --- WrapCache --------------------------------------------------------------
+
+test "WrapCache: cold lookup populates entry and returns wrap rows" {
+    const allocator = testing.allocator;
+    var cache = WrapCache.init(allocator);
+    defer cache.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendNTimes(allocator, 'x', 100);
+    const line: tui.Line = .{ .role = .agent, .text = text };
+
+    // 100 cols at width 50 with prefix 2 → avail 48 → ceil(100/48)=3.
+    const rows = try cache.rowsFor(0, &line, 50, 2);
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try testing.expectEqual(@as(u32, 0), rows[0].bytes_offset);
+    try testing.expect(cache.entries.items[0].valid);
+}
+
+test "WrapCache: identical inputs reuse the cached row slice" {
+    const allocator = testing.allocator;
+    var cache = WrapCache.init(allocator);
+    defer cache.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendNTimes(allocator, 'x', 100);
+    const line: tui.Line = .{ .role = .agent, .text = text };
+
+    const first = try cache.rowsFor(0, &line, 50, 2);
+    const first_ptr = first.ptr;
+    const first_len = first.len;
+    const second = try cache.rowsFor(0, &line, 50, 2);
+    // Same backing array, no reallocation, no recompute.
+    try testing.expectEqual(first_ptr, second.ptr);
+    try testing.expectEqual(first_len, second.len);
+}
+
+test "WrapCache: width change invalidates the cached layout" {
+    const allocator = testing.allocator;
+    var cache = WrapCache.init(allocator);
+    defer cache.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendNTimes(allocator, 'x', 100);
+    const line: tui.Line = .{ .role = .agent, .text = text };
+
+    const narrow = try cache.rowsFor(0, &line, 50, 2);
+    try testing.expectEqual(@as(usize, 3), narrow.len);
+    const wide = try cache.rowsFor(0, &line, 200, 2);
+    // 100 cols at width 200 with prefix 2 → avail 198 → 1 row.
+    try testing.expectEqual(@as(usize, 1), wide.len);
+}
+
+test "WrapCache: text growth invalidates the cached layout" {
+    const allocator = testing.allocator;
+    var cache = WrapCache.init(allocator);
+    defer cache.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendNTimes(allocator, 'x', 50);
+    var line: tui.Line = .{ .role = .agent, .text = text };
+
+    const before = try cache.rowsFor(0, &line, 50, 2);
+    try testing.expectEqual(@as(usize, 2), before.len);
+
+    // Stream more bytes onto the same line — common during agent
+    // replies. Length change must trigger a recompute.
+    try text.appendNTimes(allocator, 'x', 50);
+    line.text = text;
+    const after = try cache.rowsFor(0, &line, 50, 2);
+    try testing.expectEqual(@as(usize, 3), after.len);
+}
+
+test "WrapCache: clear marks every entry stale without freeing capacity" {
+    const allocator = testing.allocator;
+    var cache = WrapCache.init(allocator);
+    defer cache.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, "hello");
+    const line: tui.Line = .{ .role = .agent, .text = text };
+
+    _ = try cache.rowsFor(0, &line, 50, 2);
+    try testing.expect(cache.entries.items[0].valid);
+
+    cache.clear();
+    try testing.expect(!cache.entries.items[0].valid);
+
+    // A subsequent lookup repopulates the same slot.
+    _ = try cache.rowsFor(0, &line, 50, 2);
+    try testing.expect(cache.entries.items[0].valid);
 }
