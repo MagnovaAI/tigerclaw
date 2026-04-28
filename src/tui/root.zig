@@ -1375,9 +1375,10 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
         // (1 cell, warm amber in context) so the agent still reads
         // distinctly without the width hazard.
         const prefix = switch (line.role) {
-            .user => "❯ ",
-            // Agent rows used to carry `✦ ` here; the speaker pill
-            // already names the agent so the bullet was redundant.
+            // Both user and agent rows let the speaker pill carry
+            // the identity. Their old `❯ ` / `✦ ` glyphs doubled
+            // up with the pill on every row.
+            .user => "",
             .agent => "",
             .system => "∙ ",
             .tool => "↻ ",

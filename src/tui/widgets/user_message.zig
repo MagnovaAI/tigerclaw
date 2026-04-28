@@ -121,22 +121,18 @@ fn paintContent(
         });
     }
 
-    // Step 2: prompt glyph on the first content row only. Skip
-    // band_start (the `▐` corner) and band_start+1 (breathing
-    // room); land at band_start+2.
-    if (is_first_content and band_start + 4 <= band_end) {
-        const prompt_style: vaxis.Style = tui.palette.input_prompt;
-        surface.writeCell(band_start + 2, screen_row, .{
-            .char = .{ .grapheme = "›", .width = 1 },
-            .style = prompt_style,
-        });
-    }
+    // The `›` prompt glyph that used to sit at band_start+2 has
+    // been retired — the speaker pill (`Omkar`, `User`, …) to the
+    // left of the band already names who's talking, so the prompt
+    // glyph was redundant noise. Continuation rows already left
+    // their prompt cell blank, so the only difference is one less
+    // glyph on the first content row.
+    _ = is_first_content;
 
-    // Step 3: body text. Reserve band_start (`▐` corner),
-    // band_start+1 (gap), band_start+2 (prompt), band_start+3
-    // (gap before body). Reserve the last two cells too for the
-    // gap and the `▌` corner on the right.
-    const body_col: u16 = band_start + 4;
+    // Body text. Reserve band_start (`▐` corner) + band_start+1
+    // (breathing room before body). Reserve the last two cells
+    // too for the gap and the `▌` corner on the right.
+    const body_col: u16 = band_start + 2;
     const body_end: u16 = if (band_end >= 2) band_end - 2 else band_end;
     if (body_col >= body_end) return;
     const text_style: vaxis.Style = tui.palette.input_text;

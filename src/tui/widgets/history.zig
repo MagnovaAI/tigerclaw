@@ -718,7 +718,11 @@ fn prefixFor(line: *const tui.Line) []const u8 {
     // already names the agent (`tiger`, `sage`, …) so the bullet
     // was duplicated visual weight. Dropped to a clean blank.
     return switch (line.role) {
-        .user => "› ",
+        // User and agent rows both let the speaker pill carry the
+        // identity. The `›` we used on user rows was a hangover
+        // from when the chat had no pills — now it just doubles
+        // up with the `Omkar` (or whoever's name) tile to the left.
+        .user => "",
         .agent => "",
         .system => "∙ ",
         // Banner rows scroll along with the rest of the chat and
