@@ -136,19 +136,14 @@ fn eventHandler(
         },
         .paste => |text| {
             // OSC52 paste payload, allocated by vaxis's Parser via
-            // the system_clipboard_allocator (the App's allocator,
-            // which is the process arena in tigerclaw's case).
-            // We deliberately do NOT free it: in an arena `free` is
-            // a no-op, and forwarding through to the arena's free
-            // path on a corrupt slice (observed once during a giant
-            // multi-paste storm) is what the segfault crawled out
-            // of. The arena reclaims everything at process exit.
-            //
-            // We also guard handlePaste against obviously-bogus
-            // slices — the queue's tag should keep them clean, but
-            // a sanity check costs nothing and avoids dragging the
-            // whole TUI down on a one-in-a-thousand event-union
-            // mishap.
+            // the system_clipboard_allocator (we hand vxfw the
+            // smp_allocator from main, the same one Input uses).
+            // The vxfw event docs explicitly say "caller must free,"
+            // so leaking it would slowly bleed the heap on every
+            // paste. We guard handlePaste with a length sanity
+            // check before walking the slice, then free regardless
+            // of whether the inline/stash path succeeded.
+            defer self.allocator.free(text);
             self.handlePaste(ctx, text) catch |err| {
                 std.log.scoped(.tui_paste).warn(
                     "paste handler failed: {s}",
