@@ -391,11 +391,13 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     app.vx.sgr = .legacy;
     app.vx.caps.rgb = true;
 
-    const model_line = try std.fmt.allocPrint(
-        allocator,
-        "gateway {s}",
-        .{opts.base_url},
-    );
+    // Read the active agent's model from disk so the status bar
+    // shows something the user can recognise (e.g. `claude-haiku-4-5`)
+    // and so `modelMaxContext` in RootWidget.init can populate the
+    // context-window cap. Falls back to the gateway URL when the
+    // manifest is missing — keeps boot working in unconfigured envs.
+    const model_line = readActiveAgentModel(allocator, io, opts.home, default_agent) catch null orelse
+        try std.fmt.allocPrint(allocator, "gateway {s}", .{opts.base_url});
     defer allocator.free(model_line);
 
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1830,6 +1832,51 @@ fn readAutoDispatchMaxCalls(allocator: std.mem.Allocator, io: std.Io, home: []co
     };
     if (n_i64 < 1 or n_i64 > 64) return null;
     return @intCast(n_i64);
+}
+
+/// Read the `model` field from `<home>/.tigerclaw/agents/<agent>/agent.json`.
+/// Returns an owned slice on success, null when the manifest is missing,
+/// unreadable, malformed, or doesn't carry a `model` key. The status bar
+/// uses this so it can show the actual provider model (e.g.
+/// `claude-haiku-4-5-20251001`) — `modelMaxContext` then matches that
+/// against the known-window table to populate the context bar's max.
+fn readActiveAgentModel(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    agent_name: []const u8,
+) !?[]u8 {
+    if (home.len == 0 or agent_name.len == 0) return null;
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(
+        &path_buf,
+        "{s}/.tigerclaw/agents/{s}/agent.json",
+        .{ home, agent_name },
+    ) catch return null;
+
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+
+    var raw_buf: [4096]u8 = undefined;
+    var io_reader_buf: [256]u8 = undefined;
+    var reader = file.reader(io, &io_reader_buf);
+    const n = reader.interface.readSliceShort(&raw_buf) catch return null;
+    if (n == 0) return null;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_buf[0..n], .{}) catch return null;
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const v = obj.get("model") orelse return null;
+    const s = switch (v) {
+        .string => |str| str,
+        else => return null,
+    };
+    return try allocator.dupe(u8, s);
 }
 
 // --- tests -----------------------------------------------------------------
