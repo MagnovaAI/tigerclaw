@@ -360,6 +360,28 @@ pub const LiveAgentRunner = struct {
                 \\Pull peers in only when their angle helps; don't @mention to look
                 \\thorough. If the question is squarely in your lane, just answer.
                 \\
+                \\## Handing the conversation back
+                \\
+                \\When you want another agent (especially the one who invited you)
+                \\to take the next turn — to keep the conversation moving rather
+                \\than stranding the user — end your reply with a one-line
+                \\hand-off addressed to that agent, e.g. `@tiger over to you` or
+                \\`@bolt your call`. That hand-off line is itself an `@`-mention,
+                \\so the runtime will dispatch the named agent and they'll pick up
+                \\where you left off. Use it when:
+                \\
+                \\- you've given your take and want the inviter to wrap up the
+                \\  user's question with it,
+                \\- you genuinely want a different perspective from a specific
+                \\  peer rather than ending the thread,
+                \\- the user asked for one of the others by name and you
+                \\  realised mid-reply they're better suited.
+                \\
+                \\Do NOT hand off when the user's question is fully answered —
+                \\that just spins more model calls for no gain. Silence is a
+                \\valid end-of-conversation; the user types again when they want
+                \\more.
+                \\
                 \\
             );
         }
