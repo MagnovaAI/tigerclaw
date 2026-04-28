@@ -140,6 +140,14 @@ auto_dispatch_subturn_timeout_secs: u32 = 120,
 /// assert on its contents. Production runs always have `app` set
 /// before any sub-turn dispatch fires; this field stays null.
 last_resume_body: ?[]u8 = null,
+/// Accumulator for peer replies the active agent hasn't seen yet.
+/// Each sub-turn that completes appends a `[<agent> said: ...]`
+/// block here. On the next user submit, the contents are prepended
+/// to the runner's message body so the active agent sees what its
+/// peers said as part of the user's prompt — no extra model call,
+/// no per-agent persistence layer needed. Cleared as soon as it
+/// ships. Owned heap slice; null when empty.
+peer_chatter: ?[]u8 = null,
 /// Borrowed runner. Set by \`attachRunner\` before \`App.run\`;
 /// null during tests that don't spin up a real runner.
 runner: ?*harness.AgentRunner = null,
@@ -316,6 +324,7 @@ pub fn deinit(self: *Root) void {
     self.clearSubturnState();
     self.subturn_slots.deinit(self.allocator);
     if (self.last_resume_body) |b| self.allocator.free(b);
+    if (self.peer_chatter) |b| self.allocator.free(b);
     self.input.deinit();
 }
 
@@ -986,7 +995,21 @@ fn beginTurnWithEcho(self: *Root, echo: []const u8, body: []const u8) !void {
 
     // Dup the message so the worker owns it independent of the
     // input buffer (which clears right after on_submit returns).
-    const message_copy = try self.allocator.dupe(u8, body);
+    // If peers replied since the last user message, prepend their
+    // text so the active agent has full context. The chatter buffer
+    // owns the slice we drained — we move it into `message_copy`
+    // by concatenation, then free the original.
+    const message_copy = blk: {
+        if (self.drainPeerChatter()) |chatter| {
+            defer self.allocator.free(chatter);
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "{s}\n\n---\n{s}",
+                .{ chatter, body },
+            );
+        }
+        break :blk try self.allocator.dupe(u8, body);
+    };
     errdefer self.allocator.free(message_copy);
 
     const ctx = try self.allocator.create(WorkerCtx);
@@ -1593,6 +1616,39 @@ fn dispatchResume(self: *Root, invoker: []const u8, body: []u8) !void {
 /// `dispatchResume` and `buildResumeBody` are kept around (currently
 /// dead at runtime) in case a future "synthesize for me" UX flag
 /// wants the old behavior back.
+/// Add a sub-turn reply to the pending peer-chatter buffer. Format
+/// each block as `[<agent> said]\n<text>` separated by a blank line.
+/// The buffer is consumed and cleared on the next user submit
+/// (`drainPeerChatter`).
+fn appendPeerChatter(self: *Root, agent: []const u8, text: []const u8) !void {
+    if (text.len == 0) return;
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(self.allocator);
+
+    if (self.peer_chatter) |existing| {
+        try buf.appendSlice(self.allocator, existing);
+        try buf.appendSlice(self.allocator, "\n\n");
+    }
+
+    try buf.appendSlice(self.allocator, "[");
+    try buf.appendSlice(self.allocator, agent);
+    try buf.appendSlice(self.allocator, " said]\n");
+    try buf.appendSlice(self.allocator, text);
+
+    if (self.peer_chatter) |old| self.allocator.free(old);
+    self.peer_chatter = try buf.toOwnedSlice(self.allocator);
+}
+
+/// Take ownership of any buffered peer chatter. Returns null when
+/// no peers have spoken since the last drain. The returned slice is
+/// caller-owned; the buffer is cleared.
+fn drainPeerChatter(self: *Root) ?[]u8 {
+    const out = self.peer_chatter orelse return null;
+    self.peer_chatter = null;
+    return out;
+}
+
 fn maybeResume(self: *Root) !void {
     if (self.pending_subturns != 0) return;
     if (self.invoker_to_resume == null) return;
@@ -1654,6 +1710,15 @@ fn onSubturnDone(self: *Root, p: *const DonePayload) !void {
     slot.state = .done;
     if (self.pending_subturns > 0) self.pending_subturns -= 1;
     dispatch_log.info("onSubturnDone: slot @{s} marked done; pending_subturns now {d}", .{ p.target_agent, self.pending_subturns });
+
+    // Append this sub-turn's reply to `peer_chatter` so the next
+    // user submit prepends it to the runner body — that's how the
+    // active agent finds out what its peers said. No new model call
+    // and no per-agent persistence layer; the user's next message
+    // carries the context as plain text.
+    self.appendPeerChatter(p.target_agent, p.output) catch |e| {
+        dispatch_log.warn("appendPeerChatter failed: {s}", .{@errorName(e)});
+    };
     // If this was the last in-flight slot, fire the join + resume.
     // The invoker's resumed reply re-enters `scanAndFanOut` via the
     // normal `ue_done` path, so cascading mentions just keep looping
