@@ -679,6 +679,10 @@ pub const LiveAgentRunner = struct {
         var round: u32 = 0;
         var final_text: []u8 = &.{};
         errdefer self.allocator.free(final_text);
+        // Set when the model invokes the `stay_silent` tool this turn.
+        // If the model produces no text after the tool round, we
+        // surface a "watching" marker instead of the empty-reply hint.
+        var stay_silent_called = false;
         var last_stop: types.StopReason = .end_turn;
         // Track the most recent provider call's token usage. Each
         // round resends the cumulative prompt + tool results, so
@@ -985,6 +989,9 @@ pub const LiveAgentRunner = struct {
                     ) catch return error.OutOfMemory;
                 };
                 self.tool_running.store(false, .release);
+                if (!tool_failed and std.mem.eql(u8, tc.name, "stay_silent")) {
+                    stay_silent_called = true;
+                }
                 // Tool finished. If ESC fired *during* the tool, the
                 // tool either honored it (long-running tools poll
                 // the flag) or completed naturally before the press
@@ -1057,11 +1064,23 @@ pub const LiveAgentRunner = struct {
         // an empty turn (refusal, content filter, or transcript
         // problem). The round count helps debugging.
         if (final_text.len == 0) {
-            final_text = try std.fmt.allocPrint(
-                self.allocator,
-                "(no reply after {d} tool round(s) — try rephrasing)",
-                .{round},
-            );
+            if (stay_silent_called) {
+                // The model chose silence intentionally via `stay_silent`.
+                // Push the marker through the stream sink so the TUI's
+                // chunk-built agent line shows "👀 watching" rather than
+                // staying blank, and mirror it into final_text so the
+                // ue_done payload (which feeds peer_chatter and any
+                // outbox consumer) carries the same visible signal.
+                const watching = "👀 watching";
+                if (req.stream_sink) |s| s(req.stream_sink_ctx, watching);
+                final_text = try self.allocator.dupe(u8, watching);
+            } else {
+                final_text = try std.fmt.allocPrint(
+                    self.allocator,
+                    "(no reply after {d} tool round(s) — try rephrasing)",
+                    .{round},
+                );
+            }
         }
 
         self.last_output = final_text;
@@ -1271,6 +1290,11 @@ const builtin_tools = [_]types.Tool{
         .name = "ask_user",
         .description = "Pause the turn and ask the user a clarifying question. Use sparingly: only when you cannot reasonably proceed without an answer (e.g. truly ambiguous instruction, missing critical info). The tool returns the user's reply as a plain string. If the user is unavailable (autonomous mode), the tool returns immediately with a 'user unavailable' marker; do not retry — make the best decision yourself and explain it.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"question\":{\"type\":\"string\",\"minLength\":1}},\"required\":[\"question\"]}",
+    },
+    .{
+        .name = "stay_silent",
+        .description = "Call this when you have nothing meaningful to add to the conversation — you've been mentioned or invoked but the right move is silence (a peer already answered, the question wasn't for you, the topic isn't yours, or you're just observing). Surfaces a `👀 watching` indicator in the chat instead of leaving an empty turn or producing filler text. Takes no arguments. Prefer this over saying things like 'I have nothing to add' or 'no comment'.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
     },
     .{
         .name = "use_skill",
@@ -1522,6 +1546,9 @@ fn dispatchBuiltinTool(
     }
     if (std.mem.eql(u8, name, "use_skill")) {
         return runUseSkill(allocator, arguments_json);
+    }
+    if (std.mem.eql(u8, name, "stay_silent")) {
+        return allocator.dupe(u8, "stay_silent: acknowledged");
     }
     return error.UnknownTool;
 }
