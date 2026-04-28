@@ -1072,21 +1072,33 @@ pub const LiveAgentRunner = struct {
         // an empty turn (refusal, content filter, or transcript
         // problem). The round count helps debugging.
         if (final_text.len == 0) {
-            // Treat empty turns as implicit silence in three cases:
-            //   1. The model called `stay_silent` (explicit opt-in).
-            //   2. The model produced no text and made no tool calls
-            //      (`round == 0`) — common in multi-agent dispatch
-            //      when an agent is mentioned but has nothing to add.
-            //   3. The provider returned a refusal / content-filter
-            //      / transcript-error payload after tool rounds. We
-            //      can't tell that apart from "nothing to say," and
-            //      surfacing `(no reply after N tool round(s))` to
-            //      the user reads as a bug, not a deliberate choice.
-            // Either way, the TUI shows `👀 watching` and the
-            // peer_chatter/outbox consumers carry the same signal.
+            // Discriminate an empty turn by `last_stop`. Provider
+            // refusal (content filter, transcript shape error after
+            // a corrupted prior turn, prompt rejection) needs to
+            // surface as a real failure so the user can act —
+            // historically we masked all of these as `👀 watching`,
+            // which made a poisoned transcript look like the agent
+            // just had nothing to say and the user kept retrying
+            // forever. Only treat `.end_turn` and `.cancelled` as
+            // intentional silence. Everything else is an error
+            // worth showing.
             const watching = "👀 watching";
-            if (req.stream_sink) |s| s(req.stream_sink_ctx, watching);
-            final_text = try self.allocator.dupe(u8, watching);
+            const is_intentional_silence =
+                last_stop == .end_turn or last_stop == .cancelled;
+            if (is_intentional_silence) {
+                if (req.stream_sink) |s| s(req.stream_sink_ctx, watching);
+                final_text = try self.allocator.dupe(u8, watching);
+            } else {
+                // Surface the stop reason inline so the user sees
+                // why the turn produced nothing. The runner doesn't
+                // get a richer error from the provider in this
+                // path, so the tag is the best we have.
+                final_text = try std.fmt.allocPrint(
+                    self.allocator,
+                    "(no reply — provider stop_reason={s}; the transcript may be corrupted, try /clear or restart the gateway)",
+                    .{@tagName(last_stop)},
+                );
+            }
         }
 
         self.last_output = final_text;
