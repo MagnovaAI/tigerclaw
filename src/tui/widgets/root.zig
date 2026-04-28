@@ -90,6 +90,12 @@ auto_dispatch_max_calls: u8 = 8,
 /// Per-sub-turn wall-clock cap. After this many seconds a slot is
 /// marked `timed_out`; any later `ue_done` for it is discarded.
 auto_dispatch_subturn_timeout_secs: u32 = 120,
+/// Test-only inspection slot. When `app` is null (tests have not
+/// attached a real Vaxis loop), `dispatchResume` stashes the join
+/// body here instead of spawning a worker so the test harness can
+/// assert on its contents. Production runs always have `app` set
+/// before any sub-turn dispatch fires; this field stays null.
+last_resume_body: ?[]u8 = null,
 /// Borrowed runner. Set by \`attachRunner\` before \`App.run\`;
 /// null during tests that don't spin up a real runner.
 runner: ?*harness.AgentRunner = null,
@@ -265,6 +271,7 @@ pub fn deinit(self: *Root) void {
     self.history.deinit(self.allocator);
     self.clearSubturnState();
     self.subturn_slots.deinit(self.allocator);
+    if (self.last_resume_body) |b| self.allocator.free(b);
     self.input.deinit();
 }
 
@@ -1268,10 +1275,6 @@ pub fn dispatchSubturn(
     mention_idx: u8,
     invoker_reply: []const u8,
 ) !void {
-    const runner = self.runner orelse return error.NoRunner;
-    const app = self.app orelse return error.NoApp;
-    _ = runner;
-
     // Marker line so the user sees the escalation. Failures here
     // are non-fatal — the dispatch should still go through.
     self.appendSubturnMarker(invoker, target) catch {};
@@ -1285,21 +1288,26 @@ pub fn dispatchSubturn(
         break :blk target;
     };
 
-    const body = try subturnFrame(self.allocator, invoker, invoker_reply);
-    errdefer self.allocator.free(body);
-
-    const invoker_owned = try self.allocator.dupe(u8, invoker);
-    errdefer self.allocator.free(invoker_owned);
-
-    // Track the slot before spawning so a fast-completing worker
-    // can't post `ue_done` and underflow `pending_subturns` before
-    // we record the slot.
+    // Record the slot first so a fast-completing worker can't post
+    // `ue_done` and underflow `pending_subturns` before we track it.
+    // Tests rely on this happening even when `app`/`runner` are null;
+    // they drive completions synthetically through `handleUserEvent`.
     try self.subturn_slots.append(self.allocator, .{
         .target = try self.allocator.dupe(u8, target_canonical),
         .mention_idx = mention_idx,
         .state = .in_flight,
     });
     self.pending_subturns += 1;
+
+    // No app/runner attached → bookkeeping-only mode. Tests path.
+    const app = self.app orelse return;
+    if (self.runner == null) return;
+
+    const body = try subturnFrame(self.allocator, invoker, invoker_reply);
+    errdefer self.allocator.free(body);
+
+    const invoker_owned = try self.allocator.dupe(u8, invoker);
+    errdefer self.allocator.free(invoker_owned);
 
     const ctx = try self.allocator.create(WorkerCtx);
     errdefer self.allocator.destroy(ctx);
@@ -1464,8 +1472,6 @@ pub fn buildResumeBody(
 /// member. Increments `auto_dispatch_calls` for budget accounting
 /// (step 7 will enforce the cap; for now the field just tracks).
 fn dispatchResume(self: *Root, invoker: []const u8, body: []u8) !void {
-    const app = self.app orelse return error.NoApp;
-
     // Resolve canonical invoker casing from the registered set so
     // the gateway routes to the right runner.
     const invoker_canonical: []const u8 = blk: {
@@ -1476,6 +1482,14 @@ fn dispatchResume(self: *Root, invoker: []const u8, body: []u8) !void {
     };
 
     self.auto_dispatch_calls +%= 1;
+
+    // No app attached → tests path. Stash the body on `Root` so
+    // the test harness can inspect it; production never hits this.
+    const app = self.app orelse {
+        if (self.last_resume_body) |old| self.allocator.free(old);
+        self.last_resume_body = body;
+        return;
+    };
 
     // Take ownership of `body` unconditionally — even on the
     // spawn-failure path. `maybeResume` cannot tell from outside
@@ -2889,6 +2903,77 @@ test "scanAndFanOut: empty output leaves state untouched" {
     try testing.expectEqual(@as(usize, 0), root.subturn_slots.items.len);
     try testing.expectEqual(@as(usize, 0), root.pending_subturns);
     try testing.expect(root.invoker_to_resume == null);
+}
+
+test "e2e: tiger fans out to @sage @bolt, joins replies, resumes invoker" {
+    var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    defer root.deinit();
+    const known = [_][]const u8{ "tiger", "sage", "bolt" };
+    root.agent_names = &known;
+
+    // Step 1: tiger's primary turn finishes with a reply mentioning
+    // both other agents. `scanAndFanOut` records two slots and sets
+    // `invoker_to_resume`.
+    const tiger_done: DonePayload = .{
+        .epoch = 0,
+        .dispatch_kind = .primary,
+        .invoker = null,
+        .target_agent = try testing.allocator.dupe(u8, "tiger"),
+        .mention_idx = 0,
+        .output = try testing.allocator.dupe(u8, "let me ask @sage and @bolt"),
+    };
+    defer testing.allocator.free(tiger_done.target_agent);
+    defer testing.allocator.free(tiger_done.output);
+
+    try root.scanAndFanOut(&tiger_done);
+    try testing.expectEqual(@as(usize, 2), root.subturn_slots.items.len);
+    try testing.expectEqual(@as(usize, 2), root.pending_subturns);
+    try testing.expectEqualStrings("tiger", root.invoker_to_resume.?);
+    // Two model calls reserved (one per sub-turn dispatch).
+    try testing.expectEqual(@as(u8, 2), root.auto_dispatch_calls);
+
+    // Step 2: sage replies. `pending_subturns` decrements; resume
+    // not yet (bolt still in flight).
+    const sage_done: DonePayload = .{
+        .epoch = 0,
+        .dispatch_kind = .subturn,
+        .invoker = try testing.allocator.dupe(u8, "tiger"),
+        .target_agent = try testing.allocator.dupe(u8, "sage"),
+        .mention_idx = 0,
+        .output = try testing.allocator.dupe(u8, "sage's view"),
+    };
+    defer testing.allocator.free(sage_done.invoker.?);
+    defer testing.allocator.free(sage_done.target_agent);
+    defer testing.allocator.free(sage_done.output);
+    try root.onSubturnDone(&sage_done);
+    try testing.expectEqual(@as(usize, 1), root.pending_subturns);
+    try testing.expect(root.last_resume_body == null);
+
+    // Step 3: bolt replies. Last sub-turn → join + resume fires.
+    const bolt_done: DonePayload = .{
+        .epoch = 0,
+        .dispatch_kind = .subturn,
+        .invoker = try testing.allocator.dupe(u8, "tiger"),
+        .target_agent = try testing.allocator.dupe(u8, "bolt"),
+        .mention_idx = 1,
+        .output = try testing.allocator.dupe(u8, "bolt's view"),
+    };
+    defer testing.allocator.free(bolt_done.invoker.?);
+    defer testing.allocator.free(bolt_done.target_agent);
+    defer testing.allocator.free(bolt_done.output);
+    try root.onSubturnDone(&bolt_done);
+
+    // Slots cleared, invoker pointer cleared, resume body stashed.
+    try testing.expectEqual(@as(usize, 0), root.subturn_slots.items.len);
+    try testing.expectEqual(@as(usize, 0), root.pending_subturns);
+    try testing.expect(root.invoker_to_resume == null);
+    const body = root.last_resume_body orelse return error.MissingResumeBody;
+    try testing.expectEqualStrings(
+        "@sage replied:\nsage's view\n\n@bolt replied:\nbolt's view",
+        body,
+    );
+    // Resume consumed one more model call: 2 sub-turns + 1 resume.
+    try testing.expectEqual(@as(u8, 3), root.auto_dispatch_calls);
 }
 
 test "scanAndFanOut: budget halt skips dispatch when reserve exhausted" {
