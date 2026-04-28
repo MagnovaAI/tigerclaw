@@ -2444,11 +2444,22 @@ fn eventHandler(
             ctx.redraw = true;
         },
         .tick => {
+            const peers_in_flight = self.pending_subturns > 0;
             if (self.thinking.pending) {
                 self.thinking.spinner_tick +%= 1;
                 self.thinking.elapsed_ms = @intCast(@max(0, vxfw.milliTimestamp() - self.turn_started_ms));
                 ctx.redraw = true;
-                // Reschedule tick only while a turn is pending.
+            } else if (peers_in_flight) {
+                // Foreground turn is idle but peer subturns are
+                // still running — keep redrawing so the upper
+                // status bar's wall-clock spinner stays alive.
+                ctx.redraw = true;
+            }
+            // Reschedule the tick whenever any work is pending
+            // (foreground thinking OR peer subturns). Without this,
+            // the upper bar's spinner freezes after the foreground
+            // turn finishes even though peers are still streaming.
+            if (self.thinking.pending or peers_in_flight) {
                 try ctx.tick(80, self.widget());
             }
         },
@@ -2965,7 +2976,14 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     };
     const upper_status_rows: u16 = UpperStatusBar.rowsFor(upper_status_entries.len);
     self.upper_status_bar.entries = upper_status_entries;
-    self.upper_status_bar.spinner_tick = self.thinking.spinner_tick;
+    // Drive the spinner off wall-clock ms instead of
+    // `self.thinking.spinner_tick`. The thinking ticker only
+    // advances while the foreground turn's thinking row is
+    // pending; during cascading fan-outs the thinking row can
+    // pause between rounds, freezing the upper-bar spinner even
+    // though peers are still running. Frame counts derived from
+    // milliseconds tick smoothly regardless of foreground state.
+    self.upper_status_bar.spinner_tick = @as(u64, @intCast(@max(0, vxfw.milliTimestamp()))) / 80;
 
     // Slash-command popup. Visible whenever the input buffer
     // starts with `/`. Items computed once per frame from the

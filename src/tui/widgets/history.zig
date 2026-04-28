@@ -713,9 +713,13 @@ fn prefixFor(line: *const tui.Line) []const u8 {
     // structured pipeline (tool_name set) get a status bullet —
     // the legacy `⎿ ` continuation glyph is reserved for plain
     // tool result lines that don't carry their own header.
+    //
+    // Agent rows used to carry a `⏺ ` prefix; the speaker pill
+    // already names the agent (`tiger`, `sage`, …) so the bullet
+    // was duplicated visual weight. Dropped to a clean blank.
     return switch (line.role) {
         .user => "› ",
-        .agent => "⏺ ",
+        .agent => "",
         .system => "∙ ",
         // Banner rows scroll along with the rest of the chat and
         // already carry their own painted glyphs (the wordmark
@@ -822,13 +826,14 @@ test "totalRowsFor: single short agent line counts as one row" {
 
 test "totalRowsFor: wraps long agent line by available columns" {
     const allocator = testing.allocator;
-    // 200 cols of content at width 50 (less the 2-col agent prefix
-    // = 48 avail) wraps to 5 rows: ceil(200 / 48).
+    // 200 cols of content at width 50 (no agent prefix anymore —
+    // the speaker pill carries the agent name, the row body gets
+    // the full pane width). 200 / 50 = 4 rows.
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     try text.appendNTimes(allocator, 'x', 200);
     const lines = [_]tui.Line{.{ .role = .agent, .text = text }};
-    try testing.expectEqual(@as(u32, 5), totalRowsFor(&lines, 50));
+    try testing.expectEqual(@as(u32, 4), totalRowsFor(&lines, 50));
 }
 
 test "totalRowsFor: user line gets half-block pads above and below" {

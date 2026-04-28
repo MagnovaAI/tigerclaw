@@ -1376,7 +1376,9 @@ fn drawHistory(pane: vaxis.Window, history: []const Line) void {
         // distinctly without the width hazard.
         const prefix = switch (line.role) {
             .user => "❯ ",
-            .agent => "✦ ",
+            // Agent rows used to carry `✦ ` here; the speaker pill
+            // already names the agent so the bullet was redundant.
+            .agent => "",
             .system => "∙ ",
             .tool => "↻ ",
             // Legacy fallback path (non-vxfw). Banner rows render
