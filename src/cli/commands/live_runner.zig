@@ -1501,12 +1501,12 @@ fn dispatchBuiltinTool(
                 },
             }
         }
-        const out = try runWriteFile(allocator, io, workspace_root, arguments_json);
+        const out = try runWriteFile(allocator, io, workspace_root, runner, arguments_json);
         invalidateRead(runner, session_id, workspace_root, arguments_json);
         return out;
     }
     if (std.mem.eql(u8, name, "list_files")) {
-        return runListFiles(allocator, io, workspace_root, arguments_json);
+        return runListFiles(allocator, io, workspace_root, runner, arguments_json);
     }
     if (std.mem.eql(u8, name, "glob")) {
         return runGlob(allocator, io, workspace_root, arguments_json);
@@ -1528,7 +1528,7 @@ fn dispatchBuiltinTool(
                 },
             }
         }
-        const out = try runEditFile(allocator, io, workspace_root, arguments_json);
+        const out = try runEditFile(allocator, io, workspace_root, runner, arguments_json);
         invalidateRead(runner, session_id, workspace_root, arguments_json);
         return out;
     }
@@ -1683,8 +1683,10 @@ fn checkLockedPath(
     defer parsed.deinit();
 
     // Lexical pre-check: refuse `..` / absolute paths up front
-    // before realpath has a chance to normalise them away.
-    _ = ensureSafeRelPath(parsed.value.path) catch {
+    // before realpath has a chance to normalise them away. We're
+    // already inside the locked-mode branch, so always treat the
+    // path as locked here regardless of any racing sandbox flip.
+    _ = ensureSafeRelPath(parsed.value.path, false) catch {
         return try refuseSandbox(allocator, tool_name, .locked, parsed.value.path);
     };
 
@@ -2403,13 +2405,18 @@ fn runGrep(
 // root is created by tigerclaw itself on first write, so the agent
 // can't pre-plant one that points elsewhere.
 
-/// Enforce the file-tool path policy: path must be non-empty, not
-/// absolute, must not contain any `..` component, and must not
-/// contain NUL. Empty string and `.` are normalised to `.` so
-/// callers can use them to refer to the workspace root itself.
-fn ensureSafeRelPath(path: []const u8) ![]const u8 {
+/// Enforce the file-tool path policy: path must be non-empty and
+/// not contain NUL. In `.locked` and `.plan` modes also reject
+/// absolute paths and `..` components — they'd let the agent
+/// escape the workspace root. In `.unlocked` mode the user has
+/// explicitly opted into wide-open filesystem access, so we let
+/// absolute paths and `..` through. Empty string and `.` are
+/// normalised to `.` so callers can use them to refer to the
+/// workspace root itself.
+fn ensureSafeRelPath(path: []const u8, unlocked: bool) ![]const u8 {
     if (path.len == 0) return ".";
     if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+    if (unlocked) return path;
     if (std.fs.path.isAbsolute(path)) return error.PathEscapesWorkspace;
 
     var it = std.mem.splitScalar(u8, path, '/');
@@ -2418,6 +2425,16 @@ fn ensureSafeRelPath(path: []const u8) ![]const u8 {
         if (std.mem.eql(u8, comp, "..")) return error.PathEscapesWorkspace;
     }
     return path;
+}
+
+/// True when the runner is in `.unlocked` mode (or no runner is
+/// attached, e.g. unit-test paths that don't construct one). The
+/// no-runner branch keeps existing tests working and matches the
+/// historical behaviour — those tests don't exercise sandbox
+/// enforcement, just path mechanics.
+fn sandboxUnlocked(runner: ?*LiveAgentRunner) bool {
+    const r = runner orelse return true;
+    return r.getSandboxMode() == .unlocked;
 }
 
 /// Open (and lazily create) the workspace root directory, then
@@ -2452,7 +2469,8 @@ fn runReadFile(
     }) catch return error.InvalidArgs;
     defer parsed.deinit();
 
-    const rel = try ensureSafeRelPath(parsed.value.path);
+    const unlocked = sandboxUnlocked(runner);
+    const rel = try ensureSafeRelPath(parsed.value.path, unlocked);
 
     // Make sure the workspace root itself exists so a fresh runner
     // doesn't error on a not-yet-created path.
@@ -2517,6 +2535,7 @@ fn runWriteFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     workspace_root: []const u8,
+    runner: ?*LiveAgentRunner,
     arguments_json: []const u8,
 ) ![]u8 {
     const Args = struct { path: []const u8, content: []const u8 };
@@ -2525,7 +2544,8 @@ fn runWriteFile(
     });
     defer parsed.deinit();
 
-    const rel = try ensureSafeRelPath(parsed.value.path);
+    const unlocked = sandboxUnlocked(runner);
+    const rel = try ensureSafeRelPath(parsed.value.path, unlocked);
     if (std.mem.eql(u8, rel, ".")) return error.InvalidPath;
     if (parsed.value.content.len > 64 * 1024) return error.TooLarge;
 
@@ -2552,6 +2572,7 @@ fn runListFiles(
     allocator: std.mem.Allocator,
     io: std.Io,
     workspace_root: []const u8,
+    runner: ?*LiveAgentRunner,
     arguments_json: []const u8,
 ) ![]u8 {
     // path is optional — missing or empty means the workspace root.
@@ -2560,7 +2581,8 @@ fn runListFiles(
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
-    const rel = try ensureSafeRelPath(parsed.value.path);
+    const unlocked = sandboxUnlocked(runner);
+    const rel = try ensureSafeRelPath(parsed.value.path, unlocked);
 
     var root = try openWorkspaceDir(io, workspace_root);
     defer root.close(io);
@@ -2595,6 +2617,7 @@ fn runEditFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     workspace_root: []const u8,
+    runner: ?*LiveAgentRunner,
     arguments_json: []const u8,
 ) ![]u8 {
     const Args = struct {
@@ -2607,7 +2630,8 @@ fn runEditFile(
     });
     defer parsed.deinit();
 
-    const rel = try ensureSafeRelPath(parsed.value.path);
+    const unlocked = sandboxUnlocked(runner);
+    const rel = try ensureSafeRelPath(parsed.value.path, unlocked);
     if (std.mem.eql(u8, rel, ".")) return error.InvalidPath;
     if (parsed.value.old_text.len == 0) return error.EmptyOldText;
 
