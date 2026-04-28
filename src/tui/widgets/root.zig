@@ -2912,11 +2912,18 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     const thinking_rows: u16 = if (self.thinking.pending) 1 else 0;
     const hint_rows: u16 = if (self.hint.left.len > 0 or self.hint.right.len > 0) 1 else 0;
 
-    // Upper status bar — one entry per running tool. Built per
-    // frame from the live history so it stays in sync without
-    // duplicating bookkeeping. Hidden when nothing is in flight.
+    // Upper status bar — one entry per agent currently doing work,
+    // either a running tool (`.tool` history row with status
+    // `.running`) or an in-flight subturn slot whose tool hasn't
+    // fired yet. Tool entries win when both are present so the
+    // user gets the more-detailed `<verb> <target>` line whenever
+    // possible; the slot fallback covers the gap between dispatch
+    // and the first tool_start event (or peers that reply with
+    // text-only content). Hidden when nothing is in flight.
     const upper_status_entries: []UpperStatusBar.Entry = blk: {
         var collected: std.ArrayList(UpperStatusBar.Entry) = .empty;
+        // First pass: running tool rows. These carry the agent
+        // pill name, tool verb, and args summary.
         for (self.history.items) |*line| {
             if (line.role != .tool) continue;
             if (line.tool_status != .running) continue;
@@ -2926,6 +2933,28 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
                 .agent = speaker,
                 .verb = UpperStatusBar.verbFor(name),
                 .target = line.tool_args orelse "",
+            });
+        }
+        // Second pass: in-flight subturn slots whose agent isn't
+        // already covered by a running tool row. Show them as
+        // `<agent>: thinking` so the user sees a peer is busy
+        // even before its first tool call lands (or never lands,
+        // for text-only replies).
+        for (self.subturn_slots.items) |*slot| {
+            if (slot.state != .in_flight) continue;
+            // Skip if a tool entry above already has this agent.
+            var already_covered = false;
+            for (collected.items) |existing| {
+                if (std.mem.eql(u8, existing.agent, slot.target)) {
+                    already_covered = true;
+                    break;
+                }
+            }
+            if (already_covered) continue;
+            try collected.append(ctx.arena, .{
+                .agent = slot.target,
+                .verb = "thinking",
+                .target = "",
             });
         }
         break :blk collected.items;
