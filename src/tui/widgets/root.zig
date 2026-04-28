@@ -2439,10 +2439,21 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         errdefer self.allocator.free(name_owned);
         const args_owned = try self.allocator.dupe(u8, p.args_summary);
         errdefer self.allocator.free(args_owned);
+        // Stamp the owning agent on the tool row so the renderer
+        // can paint the speaker pill alongside the tool limb. In
+        // multi-agent dispatch the chain is "@bolt called X" but
+        // without a pill on the tool row itself, a glance at the
+        // chat reads as if the tool had no owner — especially
+        // when a tool fires immediately after the prompt with no
+        // preceding text from that agent (the common case for
+        // `stay_silent`).
+        const speaker_owned = try self.allocator.dupe(u8, p.agent);
+        errdefer self.allocator.free(speaker_owned);
 
         try self.history.append(self.allocator, .{
             .role = .tool,
             .text = text,
+            .speaker = speaker_owned,
             .tool_id = id_owned,
             .tool_name = name_owned,
             .tool_args = args_owned,

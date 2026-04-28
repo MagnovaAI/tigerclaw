@@ -91,13 +91,16 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
     // every fresh user/agent turn following a tool block) so the
     // chat doesn't read as one dense wall. Tool lines stay tight
     // under the agent line they belong to.
-    // Precompute per-line indent. Tool rows have no speaker of
-    // their own; they hang under the agent (or user) line they
-    // belong to. Inherit that line's pill width as the indent so
-    // the limb (`└─ ●`) sits under the body column rather than at
-    // column 0. Walk forward, carrying the most recent pill width
-    // from any speaker'd line; reset on user lines (a fresh turn
-    // shouldn't inherit indent from a previous agent).
+    // Precompute per-line indent. Most rows just use their own
+    // pill width (tool rows now stamp the owning agent's name as
+    // their speaker, so `pillCols` returns a positive value and
+    // the limb (`└─ ●`) lines up after the pill). Tool *result*
+    // continuation rows (`tool_name == null`) and any other line
+    // without a speaker fall back to inheriting the most recent
+    // speaker'd line's pill width so they hang under the body
+    // column instead of at column 0. The inherit chain resets on
+    // user lines so a fresh turn doesn't pick up indent from the
+    // previous agent.
     var indent_pill_cols: std.ArrayList(usize) = .empty;
     try indent_pill_cols.resize(ctx.arena, self.lines.len);
     var carry_pill_w: usize = 0;
