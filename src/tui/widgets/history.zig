@@ -280,6 +280,15 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
 
     var prev_role: ?tui.Line.Role = null;
     for (self.lines, 0..) |line, idx| {
+        // Banner rows carry width gates so wide and compact wordmarks
+        // can coexist in history; the renderer picks whichever fits
+        // the live pane. Skip rows whose pane is outside the gated
+        // range — no surface allocation, no row buffer entry, no
+        // visual trace at all when the gate is closed.
+        if (line.role == .banner) {
+            if (line.banner_min_width != 0 and width < line.banner_min_width) continue;
+            if (line.banner_max_width != 0 and width > line.banner_max_width) continue;
+        }
         // Inter-role gap. User lines bracket themselves with
         // half-block pad rows below, so they don't take a regular
         // gap row -- the `▄` above the content already separates

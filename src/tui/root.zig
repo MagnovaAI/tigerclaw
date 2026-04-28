@@ -180,6 +180,18 @@ pub const Line = struct {
     /// palette so each wordmark row paints in its own band as the
     /// banner scrolls. Ignored for every other role.
     banner_row: u8 = 0,
+    /// Minimum pane width (in display columns) at which a `.banner`
+    /// row should render. Rows whose pane is narrower are skipped
+    /// at draw time, so the wide TIGERCLAW wordmark and the compact
+    /// "TC" wordmark can both live in history; the renderer picks
+    /// whichever fits the current pane width without us having to
+    /// rebuild the line list on resize.
+    banner_min_width: u16 = 0,
+    /// Maximum pane width above which a `.banner` row should NOT
+    /// render. Used to hide the compact "TC" rows once the pane is
+    /// wide enough to show the full wordmark. 0 means "no upper
+    /// bound" — the row renders at every width past `banner_min_width`.
+    banner_max_width: u16 = 0,
 
     pub const ToolStatus = enum { running, ok, err };
 
@@ -435,16 +447,12 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     // replaces the old pinned `Header` widget — same wordmark and
     // gradient, but it scrolls along with the chat so the area
     // above the input is clean for the upper status bar / live
-    // tool state once the conversation grows. Query the winsize
-    // directly here so a narrow terminal gets the compact "TC"
-    // wordmark instead of a wrapping wide one. vaxis hasn't yet
-    // sized its screen at this point — the App.run loop is what
-    // fires the first resize event — so we go to the kernel.
-    const launch_width: u16 = blk: {
-        const ws = vaxis.Tty.getWinsize(app.tty.fd) catch break :blk 0;
-        break :blk ws.cols;
-    };
-    root.appendBanner(launch_width) catch {};
+    // tool state once the conversation grows. Both wordmark
+    // variants (wide TIGERCLAW + compact TC) are appended with
+    // width gates so the renderer picks whichever fits the actual
+    // pane on every redraw — no width queries here, no rebuild
+    // on resize.
+    root.appendBanner() catch {};
     // Forward sandbox toggles (/lock, /unlock, /plan) through the
     // gateway HTTP runner so the daemon's in-process LiveAgentRunner
     // adopts the same policy. Without this bridge the TUI's status
