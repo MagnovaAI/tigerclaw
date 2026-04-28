@@ -24,6 +24,12 @@ buffer: [1024]u8,
 /// (typically `.{ .app = UserEvent{...} }`) back into the main
 /// loop. Null before `run()` and after it returns.
 loop: ?*EventLoop = null,
+/// Set by external producers (e.g. an SSE worker thread) when a
+/// new event has been pushed onto the loop queue and the next
+/// frame should render immediately instead of waiting out the
+/// remainder of the tick interval. The render loop checks this
+/// flag and skips its sleep when set.
+frame_due: std.atomic.Value(bool) = .init(false),
 
 /// Runtime options
 pub const Options = struct {
@@ -139,11 +145,15 @@ pub fn run(self: *App, widget: vxfw.Widget, opts: Options) anyerror!void {
             // Deadline exceeded. Schedule the next frame
             next_frame_ms = now_ms + tick_ms;
         } else {
-            // Sleep until the deadline. 0.16 moved the sleep primitive
-            // onto `std.Io` — use the app's io handle.
-            const sleep_ns: u64 = (next_frame_ms - now_ms) * 1_000_000;
-            std.Io.sleep(self.io, std.Io.Duration.fromNanoseconds(sleep_ns), .awake) catch {};
-            next_frame_ms += tick_ms;
+            // Wait for the next frame deadline OR an incoming event,
+            // whichever comes first. Posting an event from a worker
+            // thread (e.g. an SSE chunk sink) wakes us immediately
+            // through the queue's `not_empty` condvar, so streaming
+            // chunks render the same frame they arrive in instead of
+            // sitting idle until the next 16ms tick.
+            const wait_ns: u64 = (next_frame_ms - now_ms) * 1_000_000;
+            loop.pollEventTimeout(wait_ns);
+            next_frame_ms = @as(u64, @intCast(vxfw.milliTimestamp())) + tick_ms;
         }
 
         try self.checkTimers(&ctx);

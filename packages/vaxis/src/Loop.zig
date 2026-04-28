@@ -80,6 +80,14 @@ pub fn Loop(comptime T: type) type {
             return self.queue.tryPop();
         }
 
+        /// Wait up to `timeout_ns` nanoseconds for an event to be
+        /// posted. Returns when the queue becomes non-empty OR the
+        /// timeout fires (whichever comes first). Spurious wakes are
+        /// possible — caller should always re-check the queue.
+        pub fn pollEventTimeout(self: *Self, timeout_ns: u64) void {
+            self.queue.pollTimeout(timeout_ns);
+        }
+
         /// posts an event into the event queue. Will block if there is not
         /// capacity for the event
         pub fn postEvent(self: *Self, event: T) void {

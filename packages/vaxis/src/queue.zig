@@ -100,6 +100,32 @@ pub fn Queue(
             std.debug.assert(!self.isEmptyLH());
         }
 
+        /// Wait up to `timeout_ns` nanoseconds for the queue to become
+        /// non-empty. Returns immediately if it already is. Used by
+        /// frame-driven render loops that want to wake on the next
+        /// posted event instead of sleeping out a fixed tick.
+        ///
+        /// Spurious wakes are possible (the underlying condvar may
+        /// return early); callers should treat the return value as
+        /// "go check the queue" rather than a guarantee.
+        pub fn pollTimeout(self: *Self, timeout_ns: u64) void {
+            self.mLock();
+            defer self.mUnlock();
+            if (!self.isEmptyLH()) return;
+
+            var ts: std.c.timespec = undefined;
+            // pthread_cond_timedwait wants an absolute CLOCK_REALTIME
+            // deadline; build it from now + timeout.
+            _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+            const ns_per_s: u64 = std.time.ns_per_s;
+            const total_ns: u64 = @as(u64, @intCast(ts.nsec)) + timeout_ns;
+            const sec_add: u64 = total_ns / ns_per_s;
+            const nsec_rem: u64 = total_ns % ns_per_s;
+            ts.sec = @intCast(@as(u64, @intCast(ts.sec)) + sec_add);
+            ts.nsec = @intCast(nsec_rem);
+            _ = std.c.pthread_cond_timedwait(&self.not_empty, &self.mutex, &ts);
+        }
+
         pub fn lock(self: *Self) void {
             self.mLock();
         }
