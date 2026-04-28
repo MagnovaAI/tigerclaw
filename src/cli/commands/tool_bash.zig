@@ -29,12 +29,13 @@ pub const BashOptions = struct {
     cwd: []const u8,
     /// Wall-clock timeout in ms. Clamped at MAX_TIMEOUT_MS.
     timeout_ms: u64 = 120_000,
-    /// Optional sink invoked on the captured stdout/stderr. Today
-    /// the runner buffers both streams and surfaces them only on
-    /// completion -- so we fire the sink once with the full buffer at
-    /// the end of the call rather than chunk-by-chunk. Honest
-    /// semantics: consumers see the data, but they don't see it
-    /// incrementally.
+    /// Optional sink invoked with each freshly-read slice of the
+    /// child's stdout/stderr, fired live during the read loop. The
+    /// runner uses this to surface long-running shell output (e.g.
+    /// `git push`, `cargo build`) to the TUI as it arrives instead
+    /// of waiting for the whole command to finish. Each invocation
+    /// borrows the bytes for the duration of the call; sinks that
+    /// need to keep the data must dupe.
     progress_sink: ?ProgressSink = null,
     progress_ctx: ?*anyopaque = null,
     /// Shared turn cancel flag. When set, the shell and its children
@@ -103,6 +104,14 @@ pub fn run(
         .clock = .awake,
     } };
 
+    // Track how many bytes of each stream have already been
+    // forwarded through `progress_sink` so we never double-emit on
+    // the next loop iteration. `MultiReader.reader(idx).end` grows
+    // monotonically as `fill` accumulates bytes; the slice
+    // `[emitted..end]` is the freshly-arrived chunk.
+    var emitted_stdout: usize = 0;
+    var emitted_stderr: usize = 0;
+
     while (true) {
         if (options.cancel_token) |token| {
             if (token.load(.acquire)) {
@@ -123,12 +132,31 @@ pub fn run(
             return interruptedResultOwned(allocator, io, start_ts, stderr);
         }
 
-        while (multi_reader.fill(64, poll_timeout)) |_| {} else |err| switch (err) {
+        const fill_result = multi_reader.fill(64, poll_timeout);
+
+        // Drain freshly-arrived bytes through the live progress
+        // sink BEFORE handling fill's terminal states. On EOF we
+        // still want the tail of the buffer to surface as a chunk.
+        if (options.progress_sink) |sink| {
+            const stdout_r = multi_reader.reader(0);
+            if (stdout_r.end > emitted_stdout) {
+                sink(options.progress_ctx, .stdout_chunk, stdout_r.buffer[emitted_stdout..stdout_r.end]);
+                emitted_stdout = stdout_r.end;
+            }
+            const stderr_r = multi_reader.reader(1);
+            if (stderr_r.end > emitted_stderr) {
+                sink(options.progress_ctx, .stderr_chunk, stderr_r.buffer[emitted_stderr..stderr_r.end]);
+                emitted_stderr = stderr_r.end;
+            }
+        }
+
+        fill_result catch |err| switch (err) {
             error.EndOfStream => break,
             error.Timeout => continue,
             else => return error.SpawnFailed,
-        }
-        break;
+        };
+        // Fill returned without error before either stream EOF'd —
+        // keep looping to read more.
     }
 
     multi_reader.checkAnyError() catch return error.SpawnFailed;
@@ -149,25 +177,18 @@ pub fn run(
 
     // result owns stdout/stderr — we may need to trim or replace, so
     // be careful about ownership.
-    return finishResult(allocator, io, start_ts, options, result);
+    return finishResult(allocator, io, start_ts, result);
 }
 
 fn finishResult(
     allocator: std.mem.Allocator,
     io: std.Io,
     start_ts: std.Io.Clock.Timestamp,
-    options: BashOptions,
     result: std.process.RunResult,
 ) BashError!BashResult {
     const owned = result;
-
-    // Fire the progress sink with the full captured buffers before
-    // we trim. Listeners that pipe to a TUI widget see the same data
-    // they would get through a streamed spawn -- just all at once.
-    if (options.progress_sink) |sink| {
-        if (owned.stdout.len > 0) sink(options.progress_ctx, .stdout_chunk, owned.stdout);
-        if (owned.stderr.len > 0) sink(options.progress_ctx, .stderr_chunk, owned.stderr);
-    }
+    // Progress is streamed live during the read loop; nothing to
+    // emit here.
 
     const stdout_trimmed = trimWithMarker(allocator, owned.stdout, "stdout") catch |e| {
         allocator.free(owned.stdout);
