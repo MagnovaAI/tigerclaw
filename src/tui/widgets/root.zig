@@ -67,6 +67,29 @@ current_turn_id: u32 = 0,
 /// provider reply, sub-turn timeout race) would mutate transcript
 /// state belonging to a fresh turn.
 turn_epoch: u64 = 0,
+/// Cross-agent auto-dispatch state. When an agent's reply mentions
+/// other known agents, each mention spawns a sub-turn; once they
+/// all complete the invoker is resumed with a join body. This
+/// block tracks the in-flight tree per user-turn. All slots reset
+/// at `beginTurn`; sub-turn dispatch is wired in step 5b.
+subturn_slots: std.ArrayList(SubturnSlot) = .empty,
+/// The agent whose reply triggered the current fan-out and is now
+/// waiting on `pending_subturns` to drain. Null when no fan-out is
+/// in flight. Owned heap slice (duped from `agent_names`).
+invoker_to_resume: ?[]u8 = null,
+/// Number of sub-turns still in flight for the current fan-out.
+/// Decremented on each sub-turn `ue_done`; resume fires when this
+/// hits zero.
+pending_subturns: usize = 0,
+/// Auto-dispatch model-call budget. Counts every sub-turn dispatch
+/// plus every invoker resume against `auto_dispatch_max_calls`.
+/// Resets on `beginTurn`. The primary user-triggered turn does NOT
+/// consume budget — only auto-dispatched calls do.
+auto_dispatch_calls: u8 = 0,
+auto_dispatch_max_calls: u8 = 8,
+/// Per-sub-turn wall-clock cap. After this many seconds a slot is
+/// marked `timed_out`; any later `ue_done` for it is discarded.
+auto_dispatch_subturn_timeout_secs: u32 = 120,
 /// Borrowed runner. Set by \`attachRunner\` before \`App.run\`;
 /// null during tests that don't spin up a real runner.
 runner: ?*harness.AgentRunner = null,
@@ -235,7 +258,21 @@ pub fn deinit(self: *Root) void {
         l.deinitSpeaker(self.allocator);
     }
     self.history.deinit(self.allocator);
+    self.clearSubturnState();
+    self.subturn_slots.deinit(self.allocator);
     self.input.deinit();
+}
+
+/// Drop every slot's allocations and clear `invoker_to_resume`.
+/// Called at `deinit` and on every fresh user submit so a previous
+/// fan-out tree never leaks state into a new turn.
+fn clearSubturnState(self: *Root) void {
+    for (self.subturn_slots.items) |*slot| slot.deinit(self.allocator);
+    self.subturn_slots.clearRetainingCapacity();
+    if (self.invoker_to_resume) |s| self.allocator.free(s);
+    self.invoker_to_resume = null;
+    self.pending_subturns = 0;
+    self.auto_dispatch_calls = 0;
 }
 
 /// Install the Input's submit callback. Called from runVxfw
@@ -706,6 +743,42 @@ pub const UsagePayload = struct { epoch: u64, ctx_used: u64 };
 /// drop stale completions the same way it drops stale chunks.
 pub const EmptyPayload = struct { epoch: u64 };
 
+/// One in-flight sub-turn under the cross-agent auto-dispatch tree.
+/// The invoker fans out one slot per known mention in its reply;
+/// each slot independently transitions through the lifecycle below
+/// before the invoker resume fires.
+pub const SubturnSlot = struct {
+    /// The agent running the sub-turn (e.g. `"sage"`). Owned heap
+    /// slice — the canonical form looked up from `agent_names`.
+    target: []u8,
+    /// Position of this mention in the invoker's reply (left-to-
+    /// right). Replies are joined back to the invoker in this order
+    /// so the resume body is deterministic regardless of completion
+    /// order.
+    mention_idx: u8,
+    /// Lifecycle stage. `in_flight` until the runner posts a
+    /// matching `ue_done`; transitions to a terminal state once the
+    /// reply lands or the watchdog times out. Late events for
+    /// non-`in_flight` slots are dropped.
+    state: State,
+    /// Reply text from the sub-turn, owned heap slice. Null until
+    /// `state` transitions to `done`. Used at join time.
+    reply: ?[]u8 = null,
+    /// Synthetic-error reason for non-`done` terminal states. Null
+    /// for `in_flight` and `done`. Static string — `"timeout"`,
+    /// `"runner_error"`, etc.
+    error_reason: ?[]const u8 = null,
+
+    pub const State = enum { in_flight, done, errored, cancelled, timed_out };
+
+    /// Free `target` and `reply`. `error_reason` is a static string
+    /// and must NOT be freed.
+    pub fn deinit(self: *SubturnSlot, allocator: std.mem.Allocator) void {
+        allocator.free(self.target);
+        if (self.reply) |r| allocator.free(r);
+    }
+};
+
 /// Context the worker thread carries. Allocated on heap;
 /// worker frees on exit.
 const WorkerCtx = struct {
@@ -719,6 +792,17 @@ const WorkerCtx = struct {
     /// cancelled or superseded turn can be discarded by the
     /// main-loop handler without touching transcript state.
     epoch: u64,
+    /// What kind of turn this worker is running. `primary` for a
+    /// user submit, `subturn` for an auto-dispatched fan-out child,
+    /// `resume_` for the invoker's resumption after join. Forwarded
+    /// to the runner so the completion event echoes it back.
+    dispatch_kind: harness.agent_runner.DispatchKind = .primary,
+    /// For `subturn`: the inviting agent. Owned heap slice — freed
+    /// by `workerMain` on exit. Null for primary/resume.
+    invoker: ?[]u8 = null,
+    /// For `subturn`: position of this mention in the invoker's
+    /// reply. Used by the join step to order replies. 0 otherwise.
+    mention_order_idx: u8 = 0,
 };
 
 /// Case-insensitive lookup against the registered agent set.
@@ -785,6 +869,11 @@ fn beginTurnWithEcho(self: *Root, echo: []const u8, body: []const u8) !void {
     self.turn_started_ms = vxfw.milliTimestamp();
     self.current_turn_id +%= 1;
     self.turn_epoch +%= 1;
+    // Fresh user submit clobbers any in-flight auto-dispatch tree.
+    // Stale sub-turns from the previous fan-out — if any were still
+    // running — will be dropped by the epoch gate when their
+    // `ue_done` lands; their slot state is gone.
+    self.clearSubturnState();
 
     // Note: we do NOT kick the tick chain via `app.loop.postEvent(.tick)`
     // here — App.run holds the queue mutex while iterating drained events,
@@ -817,6 +906,7 @@ fn beginTurnWithEcho(self: *Root, echo: []const u8, body: []const u8) !void {
 fn workerMain(ctx: *WorkerCtx) void {
     defer {
         ctx.allocator.free(ctx.message);
+        if (ctx.invoker) |s| ctx.allocator.free(s);
         ctx.allocator.destroy(ctx);
     }
 
@@ -831,6 +921,9 @@ fn workerMain(ctx: *WorkerCtx) void {
         .target_agent = ctx.session_id,
         .input = ctx.message,
         .turn_epoch = ctx.epoch,
+        .dispatch_kind = ctx.dispatch_kind,
+        .invoker = ctx.invoker,
+        .mention_order_idx = ctx.mention_order_idx,
         .stream_sink = chunkSink,
         .stream_sink_ctx = @ptrCast(ctx),
         .tool_event_sink = toolEventSink,
@@ -1020,6 +1113,115 @@ pub fn appendUserLine(self: *Root, text: []const u8) !void {
 /// agent (today: `self.session_id`).
 pub fn appendAgentLine(self: *Root, text: []const u8) !void {
     return self.appendLineWithSpeaker(.agent, text, self.session_id);
+}
+
+/// Build the framed body sent to a sub-turn agent. Tells the callee
+/// who invited it and pastes the invoker's reply verbatim. Caller
+/// owns the returned heap slice.
+///
+/// Format (D5):
+///
+///     @<invoker> mentioned you in their reply to the user. Their full
+///     reply follows. Respond to <invoker>; the user will see your reply.
+///
+///     ---
+///     <verbatim invoker reply>
+pub fn subturnFrame(
+    allocator: std.mem.Allocator,
+    invoker: []const u8,
+    invoker_reply: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "@{s} mentioned you in their reply to the user. " ++
+            "Their full reply follows. Respond to {s}; the user " ++
+            "will see your reply.\n\n---\n{s}",
+        .{ invoker, invoker, invoker_reply },
+    );
+}
+
+/// Append a one-line system marker showing the dispatch chain so
+/// the user sees the escalation in real time:
+///
+///     ↳ @tiger → @sage
+pub fn appendSubturnMarker(
+    self: *Root,
+    invoker: []const u8,
+    target: []const u8,
+) !void {
+    var buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        "↳ @{s} → @{s}",
+        .{ invoker, target },
+    ) catch "↳ subturn dispatch";
+    try self.appendLine(.system, line);
+}
+
+/// Spawn a worker thread that runs a sub-turn for `target`, framed
+/// as if `invoker` had asked it. Pure helper — does NOT scan for new
+/// mentions, does NOT echo a user pill, does NOT touch the budget
+/// counter (caller owns that). Increments `pending_subturns` so
+/// the auto-dispatch state machine knows when to fire the join.
+///
+/// Step 5a leaves this function callable but unwired from `ue_done`.
+/// Step 5b connects the scan-on-completion path that calls it.
+pub fn dispatchSubturn(
+    self: *Root,
+    invoker: []const u8,
+    target: []const u8,
+    mention_idx: u8,
+    invoker_reply: []const u8,
+) !void {
+    const runner = self.runner orelse return error.NoRunner;
+    const app = self.app orelse return error.NoApp;
+    _ = runner;
+
+    // Marker line so the user sees the escalation. Failures here
+    // are non-fatal — the dispatch should still go through.
+    self.appendSubturnMarker(invoker, target) catch {};
+
+    // Resolve canonical target casing from the registered set so
+    // routing matches `agent_registry`'s lookup key.
+    const target_canonical: []const u8 = blk: {
+        for (self.agent_names) |n| {
+            if (std.ascii.eqlIgnoreCase(n, target)) break :blk n;
+        }
+        break :blk target;
+    };
+
+    const body = try subturnFrame(self.allocator, invoker, invoker_reply);
+    errdefer self.allocator.free(body);
+
+    const invoker_owned = try self.allocator.dupe(u8, invoker);
+    errdefer self.allocator.free(invoker_owned);
+
+    // Track the slot before spawning so a fast-completing worker
+    // can't post `ue_done` and underflow `pending_subturns` before
+    // we record the slot.
+    try self.subturn_slots.append(self.allocator, .{
+        .target = try self.allocator.dupe(u8, target_canonical),
+        .mention_idx = mention_idx,
+        .state = .in_flight,
+    });
+    self.pending_subturns += 1;
+
+    const ctx = try self.allocator.create(WorkerCtx);
+    errdefer self.allocator.destroy(ctx);
+    ctx.* = .{
+        .allocator = self.allocator,
+        .root = self,
+        .app = app,
+        .message = body,
+        .session_id = target_canonical,
+        .epoch = self.turn_epoch,
+        .dispatch_kind = .subturn,
+        .invoker = invoker_owned,
+        .mention_order_idx = mention_idx,
+    };
+
+    var thread = try std.Thread.spawn(.{}, workerMain, .{ctx});
+    thread.detach();
 }
 
 pub fn widget(self: *Root) vxfw.Widget {
@@ -2067,6 +2269,61 @@ test "root: tool output defaults on" {
     defer root.deinit();
 
     try testing.expect(root.tool_output_enabled);
+}
+
+test "subturnFrame: includes invoker name twice and the verbatim reply" {
+    const body = try subturnFrame(testing.allocator, "tiger", "let's ask sage");
+    defer testing.allocator.free(body);
+    // Both the address and the imperative reference the invoker.
+    try testing.expect(std.mem.indexOf(u8, body, "@tiger mentioned you") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "Respond to tiger") != null);
+    // Reply is appended verbatim after the separator.
+    try testing.expect(std.mem.indexOf(u8, body, "---\nlet's ask sage") != null);
+}
+
+test "subturnFrame: empty reply still produces a well-formed frame" {
+    const body = try subturnFrame(testing.allocator, "tiger", "");
+    defer testing.allocator.free(body);
+    // Must end with the separator + empty body — no trailing junk.
+    try testing.expect(std.mem.endsWith(u8, body, "---\n"));
+}
+
+test "appendSubturnMarker: writes the chain line as a system row" {
+    var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    defer root.deinit();
+
+    try root.appendSubturnMarker("tiger", "sage");
+    try testing.expectEqual(@as(usize, 1), root.history.items.len);
+    const line = root.history.items[0];
+    try testing.expectEqual(tui.Line.Role.system, line.role);
+    try testing.expect(std.mem.indexOf(u8, line.text.items, "@tiger") != null);
+    try testing.expect(std.mem.indexOf(u8, line.text.items, "@sage") != null);
+}
+
+test "clearSubturnState: drops in-flight slots and resets counters" {
+    var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    defer root.deinit();
+
+    // Fake an in-flight fan-out: two slots, an invoker, a budget tick.
+    try root.subturn_slots.append(testing.allocator, .{
+        .target = try testing.allocator.dupe(u8, "sage"),
+        .mention_idx = 0,
+        .state = .in_flight,
+    });
+    try root.subturn_slots.append(testing.allocator, .{
+        .target = try testing.allocator.dupe(u8, "bolt"),
+        .mention_idx = 1,
+        .state = .in_flight,
+    });
+    root.invoker_to_resume = try testing.allocator.dupe(u8, "tiger");
+    root.pending_subturns = 2;
+    root.auto_dispatch_calls = 2;
+
+    root.clearSubturnState();
+    try testing.expectEqual(@as(usize, 0), root.subturn_slots.items.len);
+    try testing.expect(root.invoker_to_resume == null);
+    try testing.expectEqual(@as(usize, 0), root.pending_subturns);
+    try testing.expectEqual(@as(u8, 0), root.auto_dispatch_calls);
 }
 
 test "root: /tools without args enables output" {

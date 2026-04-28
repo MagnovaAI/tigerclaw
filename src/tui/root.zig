@@ -54,6 +54,12 @@ test {
     std.testing.refAllDecls(ansi);
     std.testing.refAllDecls(tool_preview);
     std.testing.refAllDecls(@import("widgets/history.zig"));
+    // Pull in tests from the RootWidget surface and the mention
+    // parser. Both files have unit tests that the package-level
+    // discovery would otherwise skip — `tui/root.zig` doesn't
+    // import them at decl level today.
+    std.testing.refAllDecls(@import("widgets/root.zig"));
+    std.testing.refAllDecls(@import("mention.zig"));
     // Force body compilation of every vxfw widget in the subset
     // we plan to migrate onto, so any 0.16 API regression in
     // packages/vaxis/src/vxfw surfaces here at build time instead
