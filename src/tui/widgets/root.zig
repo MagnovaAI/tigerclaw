@@ -530,6 +530,46 @@ fn dispatchCommand(self: *Root, cmd: []const u8) void {
         self.runConfigCommand() catch {};
         return;
     }
+    if (std.mem.eql(u8, name, "stop")) {
+        // /stop           -> cancel the active agent's current turn
+        //                    (same as Esc)
+        // /stop <agent>   -> cancel that named agent's in-flight turn,
+        //                    even if it's a fan-out peer rather than
+        //                    the active foreground agent
+        const runner = self.runner orelse {
+            self.appendLine(.system, "stop: no runner attached") catch {};
+            return;
+        };
+        if (args.len == 0) {
+            if (self.turn_started_ms == 0) {
+                self.appendLine(.system, "stop: no turn in flight") catch {};
+                return;
+            }
+            if (!self.thinking.stopping) {
+                self.thinking.stopping = true;
+                self.status_bar.turn_stopping = true;
+                self.hint.left = "stopping turn  ·  waiting for gateway cancel";
+                self.appendLine(.system, "∙ stopping turn…") catch {};
+                runner.cancel(0);
+            }
+            return;
+        }
+        if (!self.knowsAgent(args)) {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "stop: unknown agent `{s}`", .{args}) catch "stop: unknown agent";
+            self.appendLine(.system, msg) catch {};
+            return;
+        }
+        const accepted = runner.cancelByName(args);
+        if (!accepted) {
+            self.appendLine(.system, "stop: targeted cancel not supported by this runner") catch {};
+            return;
+        }
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "∙ stopping {s}…", .{args}) catch "∙ stopping…";
+        self.appendLine(.system, msg) catch {};
+        return;
+    }
     if (std.mem.eql(u8, name, "skills") or std.mem.eql(u8, name, "skill")) {
         // `/skills` lists every skill; `/skills <name>` or
         // `/skill <name>` zooms in on a single one with its full
@@ -3564,6 +3604,32 @@ test "root: /tools without args enables output" {
     try testing.expect(root.tool_output_enabled);
     try testing.expect(root.history.items.len == 1);
     try testing.expectEqualStrings("tool output: on", root.history.items[0].text.items);
+}
+
+test "/stop with no runner: surfaces a system error and returns" {
+    var root = Root.init(testing.allocator, .{});
+    defer root.deinit();
+
+    root.dispatchCommand("stop");
+
+    try testing.expect(root.history.items.len == 1);
+    try testing.expectEqualStrings("stop: no runner attached", root.history.items[0].text.items);
+}
+
+test "/stop <unknown agent> with runner attached: surfaces unknown-agent error" {
+    var root = Root.init(testing.allocator, .{});
+    defer root.deinit();
+
+    // Wire a mock runner so the no-runner branch doesn't short-circuit.
+    var mock = harness.agent_runner.MockAgentRunner.init();
+    var runner = mock.runner();
+    root.runner = &runner;
+    root.agent_names = &[_][]const u8{ "tiger", "sage", "bolt" };
+
+    root.dispatchCommand("stop nobody");
+
+    try testing.expect(root.history.items.len == 1);
+    try testing.expectEqualStrings("stop: unknown agent `nobody`", root.history.items[0].text.items);
 }
 
 test "appendPeerChatter: small replies accumulate verbatim" {

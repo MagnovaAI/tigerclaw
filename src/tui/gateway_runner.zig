@@ -60,7 +60,13 @@ pub const GatewayRunner = struct {
         .cancel = cancelFn,
         .counter = counterFn,
         .set_sandbox = setSandboxFn,
+        .cancel_by_name = cancelByNameFn,
     };
+
+    fn cancelByNameFn(ctx: *anyopaque, agent: []const u8) void {
+        const self: *GatewayRunner = @ptrCast(@alignCast(ctx));
+        self.cancelByName(agent);
+    }
 
     fn setSandboxFn(
         ctx: *anyopaque,
@@ -230,6 +236,51 @@ pub const GatewayRunner = struct {
         const session_id = self.current_session orelse return null;
         return self.allocator.dupe(u8, session_id) catch null;
     }
+
+    /// Cancel any in-flight turn for the given agent name, regardless
+    /// of whether it's the runner's `current_session`. Used by the
+    /// `/stop <agent>` slash command so the TUI can stop a fan-out
+    /// peer without disturbing the active agent's own turn.
+    /// Bypasses the `cancel_in_flight` CAS guard so multiple targeted
+    /// cancels can run in parallel.
+    pub fn cancelByName(self: *GatewayRunner, agent: []const u8) void {
+        const session_id = self.allocator.dupe(u8, agent) catch return;
+        const base_url = self.allocator.dupe(u8, self.base_url) catch {
+            self.allocator.free(session_id);
+            return;
+        };
+        const bearer = if (self.bearer) |token|
+            self.allocator.dupe(u8, token) catch {
+                self.allocator.free(base_url);
+                self.allocator.free(session_id);
+                return;
+            }
+        else
+            null;
+
+        const job = self.allocator.create(CancelJob) catch {
+            if (bearer) |token| self.allocator.free(token);
+            self.allocator.free(base_url);
+            self.allocator.free(session_id);
+            return;
+        };
+        job.* = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .base_url = base_url,
+            .session_id = session_id,
+            .bearer = bearer,
+            // Targeted cancels don't gate the per-runner CAS — they
+            // can interleave freely with the active-turn Esc path.
+            .runner = null,
+        };
+
+        const thread = std.Thread.spawn(.{}, cancelThreadMain, .{job}) catch {
+            job.deinit();
+            return;
+        };
+        thread.detach();
+    }
 };
 
 const CancelJob = struct {
@@ -238,12 +289,13 @@ const CancelJob = struct {
     base_url: []u8,
     session_id: []u8,
     bearer: ?[]u8,
-    /// Owning runner. The cancel thread clears
-    /// `runner.cancel_in_flight` once the DELETE has settled so the
-    /// next user cancel can fire. Borrowed pointer; the runner
-    /// outlives every cancel job by construction (jobs only spawn
-    /// from inside the runner's `cancelCurrent`).
-    runner: *GatewayRunner,
+    /// Owning runner — set for active-turn cancels (Esc), null for
+    /// targeted `/stop <agent>` cancels. The cancel thread clears
+    /// `runner.cancel_in_flight` only when the field is non-null,
+    /// so targeted cancels don't fight the active-turn CAS guard.
+    /// Borrowed pointer; the runner outlives every cancel job by
+    /// construction.
+    runner: ?*GatewayRunner,
 
     fn deinit(self: *CancelJob) void {
         self.allocator.free(self.base_url);
@@ -255,7 +307,7 @@ const CancelJob = struct {
 
 fn cancelThreadMain(job: *CancelJob) void {
     defer job.deinit();
-    defer job.runner.cancel_in_flight.store(false, .release);
+    defer if (job.runner) |r| r.cancel_in_flight.store(false, .release);
     cancelTurn(job.allocator, job.io, job.base_url, job.session_id, job.bearer) catch {};
 }
 

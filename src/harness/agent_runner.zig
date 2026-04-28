@@ -347,6 +347,12 @@ pub const VTable = struct {
     /// instance lives in a different process. Optional — impls
     /// without sandbox semantics (mock, echo) leave it null.
     set_sandbox: ?*const fn (ctx: *anyopaque, mode: SandboxMode, path: []const u8) anyerror!void = null,
+    /// Targeted cancel of an agent's in-flight turn by name. Used by
+    /// the `/stop <agent>` slash command so the TUI can cancel a
+    /// fan-out peer without going through the active-turn Esc path.
+    /// Optional — impls that only have one session at a time (mock,
+    /// echo) leave it null and the TUI falls back to `cancel`.
+    cancel_by_name: ?*const fn (ctx: *anyopaque, agent: []const u8) void = null,
 };
 
 pub const AgentRunner = struct {
@@ -372,6 +378,16 @@ pub const AgentRunner = struct {
     pub fn setSandbox(self: AgentRunner, mode: SandboxMode, path: []const u8) !void {
         const fn_ptr = self.vtable.set_sandbox orelse return;
         return fn_ptr(self.ctx, mode, path);
+    }
+
+    /// Cancel a named agent's in-flight turn. Returns `true` when the
+    /// runner accepted the request (the cancel itself is async),
+    /// `false` when the impl doesn't support targeted cancels and the
+    /// caller should fall back to the active-turn `cancel`.
+    pub fn cancelByName(self: AgentRunner, agent: []const u8) bool {
+        const fn_ptr = self.vtable.cancel_by_name orelse return false;
+        fn_ptr(self.ctx, agent);
+        return true;
     }
 };
 

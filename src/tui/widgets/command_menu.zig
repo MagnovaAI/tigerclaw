@@ -32,6 +32,7 @@ pub const items: []const Item = &.{
     .{ .name = "unlock", .description = "Unlock workspace" },
     .{ .name = "plan", .description = "Plan mode (read-only)" },
     .{ .name = "ask", .description = "Toggle ask_user gate (on|off)" },
+    .{ .name = "stop", .description = "Cancel a turn: /stop or /stop <agent>" },
     .{ .name = "quit", .description = "Exit tigerclaw" },
 };
 
