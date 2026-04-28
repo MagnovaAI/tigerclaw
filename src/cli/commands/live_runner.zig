@@ -1067,32 +1067,17 @@ pub const LiveAgentRunner = struct {
         }
 
         // The loop exited via the no-tool-calls break, but the
-        // final response had no text. Surface a hint so the user
-        // isn't staring at nothing — likely the provider returned
-        // an empty turn (refusal, content filter, or transcript
-        // problem). The round count helps debugging.
+        // final response had no text. Intentional silence
+        // (`.end_turn`/`.cancelled`) leaves the turn empty — the
+        // renderer skips opening an agent line when no chunks
+        // arrived, so the chat just shows the next user prompt.
+        // Provider refusals (content filter, transcript shape
+        // error after a corrupted prior turn, prompt rejection)
+        // surface inline so the user can act on them.
         if (final_text.len == 0) {
-            // Discriminate an empty turn by `last_stop`. Provider
-            // refusal (content filter, transcript shape error after
-            // a corrupted prior turn, prompt rejection) needs to
-            // surface as a real failure so the user can act —
-            // historically we masked all of these as `👀 watching`,
-            // which made a poisoned transcript look like the agent
-            // just had nothing to say and the user kept retrying
-            // forever. Only treat `.end_turn` and `.cancelled` as
-            // intentional silence. Everything else is an error
-            // worth showing.
-            const watching = "👀 watching";
             const is_intentional_silence =
                 last_stop == .end_turn or last_stop == .cancelled;
-            if (is_intentional_silence) {
-                if (req.stream_sink) |s| s(req.stream_sink_ctx, watching);
-                final_text = try self.allocator.dupe(u8, watching);
-            } else {
-                // Surface the stop reason inline so the user sees
-                // why the turn produced nothing. The runner doesn't
-                // get a richer error from the provider in this
-                // path, so the tag is the best we have.
+            if (!is_intentional_silence) {
                 final_text = try std.fmt.allocPrint(
                     self.allocator,
                     "(no reply — provider stop_reason={s}; the transcript may be corrupted, try /clear or restart the gateway)",
@@ -1308,11 +1293,6 @@ const builtin_tools = [_]types.Tool{
         .name = "ask_user",
         .description = "Pause the turn and ask the user a clarifying question. Use sparingly: only when you cannot reasonably proceed without an answer (e.g. truly ambiguous instruction, missing critical info). The tool returns the user's reply as a plain string. If the user is unavailable (autonomous mode), the tool returns immediately with a 'user unavailable' marker; do not retry — make the best decision yourself and explain it.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"question\":{\"type\":\"string\",\"minLength\":1}},\"required\":[\"question\"]}",
-    },
-    .{
-        .name = "stay_silent",
-        .description = "Call this when you have nothing meaningful to add to the conversation — you've been mentioned or invoked but the right move is silence (a peer already answered, the question wasn't for you, the topic isn't yours, or you're just observing). Surfaces a `👀 watching` indicator in the chat instead of leaving an empty turn or producing filler text. Takes no arguments. Prefer this over saying things like 'I have nothing to add' or 'no comment'.",
-        .input_schema_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
     },
     .{
         .name = "use_skill",
@@ -1564,9 +1544,6 @@ fn dispatchBuiltinTool(
     }
     if (std.mem.eql(u8, name, "use_skill")) {
         return runUseSkill(allocator, arguments_json);
-    }
-    if (std.mem.eql(u8, name, "stay_silent")) {
-        return allocator.dupe(u8, "stay_silent: acknowledged");
     }
     return error.UnknownTool;
 }
