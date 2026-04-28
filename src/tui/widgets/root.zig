@@ -1909,13 +1909,19 @@ fn eventHandler(
                 !(self.input.buf.items.len > 0 and self.input.buf.items[0] == '/') and
                 key.matches(vaxis.Key.escape, .{});
             if (esc_pending_turn) {
+                // Cancel-storm guard: only the first ESC of a turn
+                // fires the runner cancel hook. Subsequent ESC
+                // presses (or held-key auto-repeat) are absorbed —
+                // without this, every keystroke spawns a fresh
+                // DELETE /sessions/:id/turns/current thread on the
+                // gateway runner and floods the wire.
                 if (!self.thinking.stopping) {
                     self.thinking.stopping = true;
                     self.status_bar.turn_stopping = true;
                     self.hint.left = "stopping turn  ·  waiting for gateway cancel";
                     try self.appendLine(.system, "∙ stopping turn…");
+                    self.runner.?.cancel(0);
                 }
-                self.runner.?.cancel(0);
                 // If the agent was in an ask_user wait, clear the
                 // UI-side pending flag here (we're already on the
                 // UI thread). The runner's ask_user worker will

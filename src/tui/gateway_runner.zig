@@ -19,6 +19,13 @@ pub const GatewayRunner = struct {
     in_flight: harness.agent_runner.InFlightCounter = .{},
     mutex: std.Io.Mutex = .init,
     current_session: ?[]u8 = null,
+    /// Idempotency guard for `cancelCurrent`. Set to `true` when a
+    /// DELETE thread is in flight; further cancel calls are no-ops
+    /// until the thread clears it. Without this, repeated ESC
+    /// presses (or any caller racing the cancel) spawn one DELETE
+    /// per call and flood the gateway. The flag is cleared by the
+    /// cancel thread itself once the request completes.
+    cancel_in_flight: std.atomic.Value(bool) = .init(false),
     /// The most recent turn's accumulated assistant text. Freed and
     /// replaced on every `run()`. Returned to the caller as
     /// `TurnResult.output`; the contract (matching `LiveAgentRunner`)
@@ -153,10 +160,23 @@ pub const GatewayRunner = struct {
     }
 
     fn cancelCurrent(self: *GatewayRunner) void {
-        const session_id = self.copyCurrentSession() orelse return;
+        // Win the CAS or bail. Only one DELETE may be in flight per
+        // runner instance at a time; the flag is cleared by the
+        // cancel thread once the gateway responds (or the request
+        // fails). This is the second line of defence after the
+        // event-handler guard in `Root.eventHandler`.
+        if (self.cancel_in_flight.cmpxchgStrong(false, true, .acq_rel, .monotonic) != null) {
+            return;
+        }
+
+        const session_id = self.copyCurrentSession() orelse {
+            self.cancel_in_flight.store(false, .release);
+            return;
+        };
 
         const base_url = self.allocator.dupe(u8, self.base_url) catch {
             self.allocator.free(session_id);
+            self.cancel_in_flight.store(false, .release);
             return;
         };
 
@@ -164,6 +184,7 @@ pub const GatewayRunner = struct {
             self.allocator.dupe(u8, token) catch {
                 self.allocator.free(base_url);
                 self.allocator.free(session_id);
+                self.cancel_in_flight.store(false, .release);
                 return;
             }
         else
@@ -173,6 +194,7 @@ pub const GatewayRunner = struct {
             if (bearer) |token| self.allocator.free(token);
             self.allocator.free(base_url);
             self.allocator.free(session_id);
+            self.cancel_in_flight.store(false, .release);
             return;
         };
         job.* = .{
@@ -181,10 +203,12 @@ pub const GatewayRunner = struct {
             .base_url = base_url,
             .session_id = session_id,
             .bearer = bearer,
+            .runner = self,
         };
 
         const thread = std.Thread.spawn(.{}, cancelThreadMain, .{job}) catch {
             job.deinit();
+            self.cancel_in_flight.store(false, .release);
             return;
         };
         thread.detach();
@@ -204,6 +228,12 @@ const CancelJob = struct {
     base_url: []u8,
     session_id: []u8,
     bearer: ?[]u8,
+    /// Owning runner. The cancel thread clears
+    /// `runner.cancel_in_flight` once the DELETE has settled so the
+    /// next user cancel can fire. Borrowed pointer; the runner
+    /// outlives every cancel job by construction (jobs only spawn
+    /// from inside the runner's `cancelCurrent`).
+    runner: *GatewayRunner,
 
     fn deinit(self: *CancelJob) void {
         self.allocator.free(self.base_url);
@@ -215,6 +245,7 @@ const CancelJob = struct {
 
 fn cancelThreadMain(job: *CancelJob) void {
     defer job.deinit();
+    defer job.runner.cancel_in_flight.store(false, .release);
     cancelTurn(job.allocator, job.io, job.base_url, job.session_id, job.bearer) catch {};
 }
 
