@@ -47,6 +47,7 @@ fn postToolStart(root: *Root, ctx: *vxfw.EventContext, id: []const u8, name: []c
     const payload = try root.allocator.create(Root.ToolStartPayload);
     payload.* = .{
         .epoch = root.turn_epoch,
+        .agent = try root.allocator.dupe(u8, "tiger"),
         .id = try root.allocator.dupe(u8, id),
         .name = try root.allocator.dupe(u8, name),
         .args_summary = try root.allocator.dupe(u8, ""),
@@ -58,6 +59,7 @@ fn postToolDone(root: *Root, ctx: *vxfw.EventContext, id: []const u8, name: []co
     const payload = try root.allocator.create(Root.ToolDonePayload);
     payload.* = .{
         .epoch = root.turn_epoch,
+        .agent = try root.allocator.dupe(u8, "tiger"),
         .id = try root.allocator.dupe(u8, id),
         .name = try root.allocator.dupe(u8, name),
         .output = try root.allocator.dupe(u8, output),

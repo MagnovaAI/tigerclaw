@@ -180,9 +180,16 @@ agent_names: []const []const u8 = &.{},
 /// Borrowed App pointer. Used by worker-thread sinks to post
 /// UserEvents back into the main loop via \`app.loop.?.postEvent\`.
 app: ?*vxfw.App = null,
-/// History index of the line currently being streamed into. Set
-/// when a turn starts; reset on done/error.
-pending_agent_line: ?usize = null,
+/// History index of the agent line currently being streamed into,
+/// **per agent**. Parallel sub-turns under multi-agent dispatch
+/// produce concurrent streams; a single pointer would alternate
+/// between speakers and fragment each agent's reply across
+/// multiple lines whenever a peer chunk landed in between. Keys
+/// are canonical agent slices borrowed from `agent_names`, so
+/// they stay alive as long as Root does. Cleared per-agent on
+/// tool boundaries and on done; cleared wholesale on user submit
+/// and turn cancel.
+pending_agent_lines: std.StringHashMapUnmanaged(usize) = .empty,
 /// Whether any text has been streamed into the pending agent
 /// line yet. If the turn finishes with zero text (tool-only
 /// reply, error mid-stream), we drop the empty placeholder.
@@ -361,6 +368,8 @@ pub fn deinit(self: *Root) void {
     self.history.deinit(self.allocator);
     self.clearSubturnState();
     self.subturn_slots.deinit(self.allocator);
+    self.clearAllPendingAgentLines();
+    self.pending_agent_lines.deinit(self.allocator);
     if (self.last_resume_body) |b| self.allocator.free(b);
     if (self.peer_chatter) |b| self.allocator.free(b);
     if (self.paste_dir_owned) |p| self.allocator.free(p);
@@ -832,9 +841,15 @@ pub const ue_subturn_timeout = "tui.subturn_timeout";
 /// `WorkerCtx.session_id`); freed by the handler with the payload.
 pub const ChunkPayload = struct { epoch: u64, agent: []u8, text: []u8 };
 pub const AskUserPayload = struct { epoch: u64, question: []u8 };
-pub const ToolStartPayload = struct { epoch: u64, id: []u8, name: []u8, args_summary: []u8 };
+/// Tool events carry `agent` for the same reason chunks do — under
+/// parallel sub-turns the active speaker on Root may not own the
+/// tool, so the per-agent pending-line map needs to know which
+/// agent's line to invalidate on tool boundaries. Owned heap slice;
+/// freed by the handler with the payload.
+pub const ToolStartPayload = struct { epoch: u64, agent: []u8, id: []u8, name: []u8, args_summary: []u8 };
 pub const ToolProgressPayload = struct {
     epoch: u64,
+    agent: []u8,
     id: []u8,
     /// stdout=0, stderr=1. We don't render the two streams differently
     /// today, but the field is here so a future colour pass can use it.
@@ -843,6 +858,7 @@ pub const ToolProgressPayload = struct {
 };
 pub const ToolDonePayload = struct {
     epoch: u64,
+    agent: []u8,
     id: []u8,
     name: []u8,
     output: []u8,
@@ -963,6 +979,77 @@ fn knowsAgent(self: *const Root, name: []const u8) bool {
     return false;
 }
 
+/// Look up the canonical (config-cased) slice for `name` from
+/// `agent_names`. Returns null when the name doesn't match a known
+/// agent. Used to normalise `@SAGE` and `@sage` to the same key
+/// so the pending-line map doesn't double-up entries.
+fn canonicalAgent(self: *const Root, name: []const u8) ?[]const u8 {
+    for (self.agent_names) |n| {
+        if (std.ascii.eqlIgnoreCase(n, name)) return n;
+    }
+    return null;
+}
+
+/// Find an existing pending-line key matching `name`
+/// case-insensitively. Returns the canonical key already in the
+/// map (its lifetime is the map's), or null if no entry exists.
+fn findPendingKey(self: *Root, name: []const u8) ?[]const u8 {
+    var it = self.pending_agent_lines.iterator();
+    while (it.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) return entry.key_ptr.*;
+    }
+    return null;
+}
+
+/// Look up the pending agent-line index for `agent`. Returns null
+/// when the agent has no open line in the current turn (either
+/// never started one, just finished, or just hit a tool boundary).
+fn getPendingAgentLine(self: *Root, agent: []const u8) ?usize {
+    const key = self.findPendingKey(agent) orelse return null;
+    return self.pending_agent_lines.get(key);
+}
+
+/// Remember `idx` as the open line for `agent`. The map owns its
+/// keys — we dupe on insert and free on remove — so the chunk
+/// payload's heap-owned `agent` slice can be freed by the handler
+/// after this returns without dangling the map. Bounded set
+/// (one entry per concurrently-streaming agent), so the alloc
+/// cost is negligible.
+fn setPendingAgentLine(self: *Root, agent: []const u8, idx: usize) !void {
+    if (self.findPendingKey(agent)) |existing_key| {
+        // Already tracking this agent — just refresh the index;
+        // don't dupe a new key.
+        try self.pending_agent_lines.put(self.allocator, existing_key, idx);
+        return;
+    }
+    const key_owned = try self.allocator.dupe(u8, self.canonicalAgent(agent) orelse agent);
+    errdefer self.allocator.free(key_owned);
+    try self.pending_agent_lines.put(self.allocator, key_owned, idx);
+}
+
+/// Drop the pending entry for `agent`, if any. Called on tool
+/// boundaries and `ue_done` so the next chunk for that agent
+/// opens a fresh line below the tool block (or the previous
+/// reply, if the agent speaks twice in one turn).
+fn clearPendingAgentLine(self: *Root, agent: []const u8) void {
+    const key = self.findPendingKey(agent) orelse return;
+    if (self.pending_agent_lines.fetchRemove(key)) |kv| {
+        self.allocator.free(kv.key);
+    }
+}
+
+/// Wipe every pending-line entry. Called on fresh user submit and
+/// on turn cancel — the previous turn's bookkeeping is no longer
+/// meaningful and any in-flight worker chunks were already gated
+/// out by the epoch check in `dropStaleIfNeeded`.
+fn clearAllPendingAgentLines(self: *Root) void {
+    var it = self.pending_agent_lines.iterator();
+    while (it.next()) |entry| {
+        self.allocator.free(entry.key_ptr.*);
+    }
+    self.pending_agent_lines.clearRetainingCapacity();
+}
+
 /// Switch the active agent. Updates session_id (drives the
 /// runner's request body), the header banner, and the status
 /// bar. Resolves the canonical-case name from `agent_names` so
@@ -1004,8 +1091,12 @@ fn beginTurnWithEcho(self: *Root, echo: []const u8, body: []const u8) !void {
     // the chunk handler; chunks that arrive *after* tool lines
     // get their own agent line below the tools. This keeps the
     // reading order natural — tool calls nest between the
-    // user prompt and the agent's final reply.
-    self.pending_agent_line = null;
+    // user prompt and the agent's final reply. Clearing every
+    // pending entry here drops any leftover bookkeeping from a
+    // previous turn whose worker chunks raced past the epoch
+    // gate (rare but possible if `dropStaleIfNeeded` ran after
+    // we'd already opened a line).
+    self.clearAllPendingAgentLines();
     self.pending_saw_text = false;
 
     self.thinking.pending = true;
@@ -1145,13 +1236,20 @@ fn toolEventSink(
     switch (event) {
         .started => |s| {
             const payload = ctx.allocator.create(ToolStartPayload) catch return;
+            const agent_dup = ctx.allocator.dupe(u8, ctx.session_id) catch {
+                ctx.allocator.destroy(payload);
+                return;
+            };
             payload.* = .{
                 .epoch = ctx.epoch,
+                .agent = agent_dup,
                 .id = ctx.allocator.dupe(u8, s.id) catch {
+                    ctx.allocator.free(agent_dup);
                     ctx.allocator.destroy(payload);
                     return;
                 },
                 .name = ctx.allocator.dupe(u8, s.name) catch {
+                    ctx.allocator.free(payload.agent);
                     ctx.allocator.free(payload.id);
                     ctx.allocator.destroy(payload);
                     return;
@@ -1159,6 +1257,7 @@ fn toolEventSink(
                 // Dupe even when empty so the consumer can free
                 // unconditionally without branching on length.
                 .args_summary = ctx.allocator.dupe(u8, s.args_summary) catch {
+                    ctx.allocator.free(payload.agent);
                     ctx.allocator.free(payload.id);
                     ctx.allocator.free(payload.name);
                     ctx.allocator.destroy(payload);
@@ -1169,9 +1268,15 @@ fn toolEventSink(
         },
         .progress => |pr| {
             const payload = ctx.allocator.create(ToolProgressPayload) catch return;
+            const agent_dup = ctx.allocator.dupe(u8, ctx.session_id) catch {
+                ctx.allocator.destroy(payload);
+                return;
+            };
             payload.* = .{
                 .epoch = ctx.epoch,
+                .agent = agent_dup,
                 .id = ctx.allocator.dupe(u8, pr.id) catch {
+                    ctx.allocator.free(agent_dup);
                     ctx.allocator.destroy(payload);
                     return;
                 },
@@ -1180,6 +1285,7 @@ fn toolEventSink(
                     .stderr => 1,
                 },
                 .chunk = ctx.allocator.dupe(u8, pr.chunk) catch {
+                    ctx.allocator.free(payload.agent);
                     ctx.allocator.free(payload.id);
                     ctx.allocator.destroy(payload);
                     return;
@@ -1194,15 +1300,23 @@ fn toolEventSink(
                 ctx.allocator.free(preview);
                 return;
             };
+            const agent_dup = ctx.allocator.dupe(u8, ctx.session_id) catch {
+                ctx.allocator.free(preview);
+                ctx.allocator.destroy(payload);
+                return;
+            };
             payload.* = .{
                 .epoch = ctx.epoch,
+                .agent = agent_dup,
                 .id = ctx.allocator.dupe(u8, f.id) catch {
                     ctx.allocator.free(preview);
+                    ctx.allocator.free(agent_dup);
                     ctx.allocator.destroy(payload);
                     return;
                 },
                 .name = ctx.allocator.dupe(u8, f.name) catch {
                     ctx.allocator.free(preview);
+                    ctx.allocator.free(payload.agent);
                     ctx.allocator.free(payload.id);
                     ctx.allocator.destroy(payload);
                     return;
@@ -2153,6 +2267,7 @@ fn dropStaleIfNeeded(self: *Root, ue: vxfw.UserEvent) bool {
     } else if (std.mem.eql(u8, ue.name, ue_tool_start)) {
         const p: *ToolStartPayload = @ptrCast(@alignCast(@constCast(data)));
         if (p.epoch == self.turn_epoch) return false;
+        a.free(p.agent);
         a.free(p.id);
         a.free(p.name);
         a.free(p.args_summary);
@@ -2160,12 +2275,14 @@ fn dropStaleIfNeeded(self: *Root, ue: vxfw.UserEvent) bool {
     } else if (std.mem.eql(u8, ue.name, ue_tool_progress)) {
         const p: *ToolProgressPayload = @ptrCast(@alignCast(@constCast(data)));
         if (p.epoch == self.turn_epoch) return false;
+        a.free(p.agent);
         a.free(p.id);
         a.free(p.chunk);
         a.destroy(p);
     } else if (std.mem.eql(u8, ue.name, ue_tool_done)) {
         const p: *ToolDonePayload = @ptrCast(@alignCast(@constCast(data)));
         if (p.epoch == self.turn_epoch) return false;
+        a.free(p.agent);
         a.free(p.id);
         a.free(p.name);
         a.free(p.output);
@@ -2224,27 +2341,19 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         defer self.allocator.free(text_slice);
         defer self.allocator.free(agent_slice);
 
-        // If the chunk's agent differs from the speaker on the
-        // pending line, drop the pending pointer so a fresh line is
-        // created under the new speaker. Sub-turn replies arriving
-        // while another agent's line is still pending land on their
-        // own row with their own pill.
-        if (self.pending_agent_line) |pending_idx| {
-            const pending = &self.history.items[pending_idx];
-            const same = if (pending.speaker) |s| std.mem.eql(u8, s, p.agent) else false;
-            if (!same) self.pending_agent_line = null;
-        }
-
-        // Lazily create (or reuse) an agent line at the current
-        // end of history. `pending_agent_line` is set on the
-        // first chunk and cleared whenever a tool event lands,
-        // so chunks before + after tools each live on their own
-        // line in the natural reading order.
-        const idx = self.pending_agent_line orelse blk: {
+        // Per-agent pending-line lookup. Each agent has its own
+        // open line in the map, so concurrent sub-turn streams
+        // append to their own row without alternating with peers.
+        // First chunk for an agent (or first chunk after a tool
+        // boundary) opens a fresh line at the current tail; later
+        // chunks append to it. We don't try to reuse a line that
+        // already has tool rows after it — the open-line index is
+        // valid only as long as nothing has appended past it.
+        const idx = self.getPendingAgentLine(p.agent) orelse blk: {
             dispatch_log.info("ue_chunk: opening new agent line for @{s} (epoch={d})", .{ p.agent, p.epoch });
             try self.appendLineWithSpeaker(.agent, "", p.agent);
             const new_idx = self.history.items.len - 1;
-            self.pending_agent_line = new_idx;
+            try self.setPendingAgentLine(p.agent, new_idx);
             break :blk new_idx;
         };
         var line = &self.history.items[idx];
@@ -2253,18 +2362,22 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_tool_start)) {
         const p: *const ToolStartPayload = @ptrCast(@alignCast(ue.data.?));
+        const agent_slice = p.agent;
         const id_slice = p.id;
         const name_slice = p.name;
         const args_slice = p.args_summary;
         defer self.allocator.destroy(@as(*ToolStartPayload, @constCast(p)));
+        defer self.allocator.free(agent_slice);
         defer self.allocator.free(id_slice);
         defer self.allocator.free(name_slice);
         defer self.allocator.free(args_slice);
 
-        // Tool call breaks the current agent-line accumulator.
-        // Subsequent chunks (post-tool) create a fresh agent
-        // line below the tool entry.
-        self.pending_agent_line = null;
+        // Tool call breaks the agent-line accumulator for this
+        // agent only. Subsequent chunks from the same agent open a
+        // fresh line below the tool entry; chunks from peers (other
+        // sub-turns running in parallel) keep streaming into their
+        // own pending line untouched.
+        self.clearPendingAgentLine(agent_slice);
         if (!self.tool_output_enabled) {
             ctx.redraw = true;
             return;
@@ -2326,9 +2439,11 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_tool_progress)) {
         const p: *const ToolProgressPayload = @ptrCast(@alignCast(ue.data.?));
+        const agent_slice = p.agent;
         const id_slice = p.id;
         const chunk_slice = p.chunk;
         defer self.allocator.destroy(@as(*ToolProgressPayload, @constCast(p)));
+        defer self.allocator.free(agent_slice);
         defer self.allocator.free(id_slice);
         defer self.allocator.free(chunk_slice);
 
@@ -2362,13 +2477,19 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         }
     } else if (std.mem.eql(u8, ue.name, ue_tool_done)) {
         const p: *const ToolDonePayload = @ptrCast(@alignCast(ue.data.?));
+        const agent_slice = p.agent;
         const id_slice = p.id;
         const name_slice = p.name;
         const output_slice = p.output;
         defer self.allocator.destroy(@as(*ToolDonePayload, @constCast(p)));
+        defer self.allocator.free(agent_slice);
         defer self.allocator.free(id_slice);
         defer self.allocator.free(name_slice);
         defer self.allocator.free(output_slice);
+        // Defensive: tool_start already cleared this agent's
+        // pending line. Clear again here in case a tool_done
+        // arrives without a prior start (legacy/edge paths).
+        self.clearPendingAgentLine(agent_slice);
 
         var i: usize = self.history.items.len;
         while (i > 0) {
@@ -2490,8 +2611,10 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
 
         // No placeholder to drop — the chunk handler creates the
         // agent line lazily, so an empty turn leaves no empty
-        // line behind.
-        self.pending_agent_line = null;
+        // line behind. Clear only THIS agent's pending entry;
+        // peers running parallel sub-turns keep their own open
+        // lines until their own `ue_done` lands.
+        self.clearPendingAgentLine(p.target_agent);
         self.pending_saw_text = false;
         self.thinking.pending = false;
         self.thinking.stopping = false;
