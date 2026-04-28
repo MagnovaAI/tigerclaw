@@ -2643,6 +2643,8 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     // row so a stray off-by-one earlier in the stack can't hide
     // the footer.
     const status_origin: u16 = height - trailing_rows - status_rows;
+    self.status_bar.dispatch_used = self.auto_dispatch_calls;
+    self.status_bar.dispatch_max = self.auto_dispatch_max_calls;
     {
         const s = try self.status_bar.widget().draw(ctx.withConstraints(
             .{ .width = 0, .height = 0 },

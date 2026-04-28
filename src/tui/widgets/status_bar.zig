@@ -3,7 +3,10 @@
 //! Layout (pipe-separated cells, left-aligned, fills the row with
 //! the status background tint):
 //!
-//!   agent │ model │ <used>/<max> [bar] N% │ gateway: on │ locked: a/b/c
+//!   agent │ model │ <used>/<max> [bar] N% │ gateway: on │ N/M dispatch │ locked: a/b/c
+//!
+//! The dispatch cell is hidden when no peer dispatches have fired
+//! this turn.
 //!
 //! The context cell collapses to just `<used>` when the model's
 //! max context is unknown. The sandbox cell renders as `unlocked`
@@ -33,6 +36,13 @@ turn_stopping: bool = false,
 /// `locked: <last-3-path-segments>`.
 sandbox_locked: bool = false,
 sandbox_path: []const u8 = "",
+/// Auto-dispatch budget counters. The cell is hidden entirely when
+/// `dispatch_used == 0` so the bar stays quiet for single-agent
+/// turns. When at least one peer dispatch has fired, render the
+/// fraction in the caution tint as it climbs toward the cap so the
+/// user can see how close they are without leaving the chat view.
+dispatch_used: u8 = 0,
+dispatch_max: u8 = 0,
 
 pub fn widget(self: *const StatusBar) vxfw.Widget {
     return .{
@@ -127,14 +137,30 @@ pub fn draw(self: *const StatusBar, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     }
     col = writeSep(ctx, surface, col, sep_style, width);
 
-    // 5. turn state: only shown when cancel is actively in flight.
+    // 5. dispatch budget: only shown when at least one peer
+    // dispatch has fired this turn. Format `<used>/<max> dispatch`,
+    // styled as caution when within 2 of the cap so the user sees
+    // they're about to be throttled.
+    if (self.dispatch_used > 0 and self.dispatch_max > 0) {
+        const near_cap = self.dispatch_used + 2 >= self.dispatch_max;
+        const cell_style = if (near_cap) caution_style else value_style;
+        const txt = std.fmt.allocPrint(
+            ctx.arena,
+            "{d}/{d} dispatch",
+            .{ self.dispatch_used, self.dispatch_max },
+        ) catch "?";
+        col = writeText(ctx, surface, col, txt, cell_style, width);
+        col = writeSep(ctx, surface, col, sep_style, width);
+    }
+
+    // 6. turn state: only shown when cancel is actively in flight.
     if (self.turn_stopping) {
         col = writeText(ctx, surface, col, "turn: ", sep_style, width);
         col = writeText(ctx, surface, col, "stopping", caution_style, width);
         col = writeSep(ctx, surface, col, sep_style, width);
     }
 
-    // 6. sandbox: unlocked or `locked: tail`
+    // 7. sandbox: unlocked or `locked: tail`
     if (self.sandbox_locked) {
         col = writeText(ctx, surface, col, "locked: ", caution_style, width);
         const tail = lastNSegments(self.sandbox_path, 3);
