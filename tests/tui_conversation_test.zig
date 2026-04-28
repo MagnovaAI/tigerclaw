@@ -37,6 +37,7 @@ fn postChunk(root: *Root, ctx: *vxfw.EventContext, text: []const u8) !void {
     const payload = try root.allocator.create(Root.ChunkPayload);
     payload.* = .{
         .epoch = root.turn_epoch,
+        .agent = try root.allocator.dupe(u8, "tiger"),
         .text = try root.allocator.dupe(u8, text),
     };
     try root.handleUserEvent(ctx, .{ .name = Root.ue_chunk, .data = payload });
@@ -197,6 +198,7 @@ fn postChunkAtEpoch(root: *Root, ctx: *vxfw.EventContext, text: []const u8, epoc
     const payload = try root.allocator.create(Root.ChunkPayload);
     payload.* = .{
         .epoch = epoch,
+        .agent = try root.allocator.dupe(u8, "tiger"),
         .text = try root.allocator.dupe(u8, text),
     };
     try root.handleUserEvent(ctx, .{ .name = Root.ue_chunk, .data = payload });

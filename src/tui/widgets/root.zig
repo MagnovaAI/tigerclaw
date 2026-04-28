@@ -734,7 +734,11 @@ pub const ue_subturn_timeout = "tui.subturn_timeout";
 // matches `Root.turn_epoch`, so a late chunk from a cancelled turn
 // can't bleed into a fresh transcript. `ue_done` (which posts a
 // null payload) is special-cased — see `EmptyPayload`.
-pub const ChunkPayload = struct { epoch: u64, text: []u8 };
+/// `agent` carries the speaker name for this chunk so sub-turn replies
+/// land under the sub-turn agent's pill, not under whichever agent
+/// is currently "active" on the Root. Owned heap slice (duped from
+/// `WorkerCtx.session_id`); freed by the handler with the payload.
+pub const ChunkPayload = struct { epoch: u64, agent: []u8, text: []u8 };
 pub const AskUserPayload = struct { epoch: u64, question: []u8 };
 pub const ToolStartPayload = struct { epoch: u64, id: []u8, name: []u8, args_summary: []u8 };
 pub const ToolProgressPayload = struct {
@@ -1010,12 +1014,19 @@ fn postUsage(ctx: *WorkerCtx, ctx_used: u64) void {
 fn chunkSink(sink_ctx: ?*anyopaque, fragment: []const u8) void {
     const ctx: *WorkerCtx = @ptrCast(@alignCast(sink_ctx.?));
     const payload = ctx.allocator.create(ChunkPayload) catch return;
+    const agent_dup = ctx.allocator.dupe(u8, ctx.session_id) catch {
+        ctx.allocator.destroy(payload);
+        return;
+    };
+    const text_dup = ctx.allocator.dupe(u8, fragment) catch {
+        ctx.allocator.free(agent_dup);
+        ctx.allocator.destroy(payload);
+        return;
+    };
     payload.* = .{
         .epoch = ctx.epoch,
-        .text = ctx.allocator.dupe(u8, fragment) catch {
-            ctx.allocator.destroy(payload);
-            return;
-        },
+        .agent = agent_dup,
+        .text = text_dup,
     };
     postUserEvent(ctx, ue_chunk, payload);
 }
@@ -1519,35 +1530,23 @@ fn dispatchResume(self: *Root, invoker: []const u8, body: []u8) !void {
     thread.detach();
 }
 
-/// Trigger the join+resume step if the current fan-out has
-/// drained. Idempotent — safe to call after every slot transition.
-/// Slot allocations are freed once the body is built; further
-/// transitions on the cleared slots are impossible because slot
-/// lookups go through `findSubturnSlot` which only matches
-/// `.in_flight`.
+/// Drain fan-out state once all sub-turns reach a terminal state.
+/// Originally this fired a synthesizing resume back at the invoker
+/// (tiger sees `@sage replied: ...` and writes a follow-up). In the
+/// peer-chat model the user wants, sub-turn replies *are* the
+/// agent's contribution to the conversation — the invoker doesn't
+/// need to summarize them. So this just cleans up state and stops.
+///
+/// `dispatchResume` and `buildResumeBody` are kept around (currently
+/// dead at runtime) in case a future "synthesize for me" UX flag
+/// wants the old behavior back.
 fn maybeResume(self: *Root) !void {
     if (self.pending_subturns != 0) return;
-    const invoker_owned = self.invoker_to_resume orelse return;
+    if (self.invoker_to_resume == null) return;
 
-    // Snapshot what we need before clearing slot state. The body
-    // borrows from slot replies, so we build it before freeing.
-    const body = try buildResumeBody(self.allocator, self.subturn_slots.items);
-
-    // Free slot allocations now that the body is built. Leave
-    // `invoker_to_resume` populated until dispatch succeeds so a
-    // failure here doesn't strand the invoker silently.
     for (self.subturn_slots.items) |*slot| slot.deinit(self.allocator);
     self.subturn_slots.clearRetainingCapacity();
-
-    // `dispatchResume` takes ownership of `body` unconditionally —
-    // success path threads it into the worker, failure path frees
-    // it. So we must not touch `body` after this call regardless
-    // of outcome.
-    try self.dispatchResume(invoker_owned, body);
-
-    // Worker now owns `body` and `invoker_owned` lifetime is
-    // managed by the resume cycle. Clear our pointer.
-    self.allocator.free(invoker_owned);
+    if (self.invoker_to_resume) |s| self.allocator.free(s);
     self.invoker_to_resume = null;
 }
 
@@ -1930,6 +1929,7 @@ fn dropStaleIfNeeded(self: *Root, ue: vxfw.UserEvent) bool {
     const a = self.allocator;
     if (std.mem.eql(u8, ue.name, ue_chunk)) {
         const p: *ChunkPayload = @ptrCast(@alignCast(@constCast(data)));
+        a.free(p.agent);
         a.free(p.text);
         a.destroy(p);
     } else if (std.mem.eql(u8, ue.name, ue_tool_start)) {
@@ -1988,13 +1988,26 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         self.scroll_offset = 0;
 
         const p: *const ChunkPayload = @ptrCast(@alignCast(ue.data.?));
-        // Defers run LIFO: capture `text` into a local so we can
-        // free it *after* destroying the payload allocation —
+        // Defers run LIFO: capture inner slices into locals so we
+        // can free them *after* destroying the payload allocation —
         // otherwise the reverse-order destroy runs first, then
         // `free(p.text)` reads a dangling `p`.
         const text_slice = p.text;
+        const agent_slice = p.agent;
         defer self.allocator.destroy(@as(*ChunkPayload, @constCast(p)));
         defer self.allocator.free(text_slice);
+        defer self.allocator.free(agent_slice);
+
+        // If the chunk's agent differs from the speaker on the
+        // pending line, drop the pending pointer so a fresh line is
+        // created under the new speaker. Sub-turn replies arriving
+        // while another agent's line is still pending land on their
+        // own row with their own pill.
+        if (self.pending_agent_line) |pending_idx| {
+            const pending = &self.history.items[pending_idx];
+            const same = if (pending.speaker) |s| std.mem.eql(u8, s, p.agent) else false;
+            if (!same) self.pending_agent_line = null;
+        }
 
         // Lazily create (or reuse) an agent line at the current
         // end of history. `pending_agent_line` is set on the
@@ -2002,7 +2015,7 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         // so chunks before + after tools each live on their own
         // line in the natural reading order.
         const idx = self.pending_agent_line orelse blk: {
-            try self.appendAgentLine("");
+            try self.appendLineWithSpeaker(.agent, "", p.agent);
             const new_idx = self.history.items.len - 1;
             self.pending_agent_line = new_idx;
             break :blk new_idx;
@@ -2965,17 +2978,16 @@ test "e2e: tiger fans out to @sage @bolt, joins replies, resumes invoker" {
     defer testing.allocator.free(bolt_done.output);
     try root.onSubturnDone(&bolt_done);
 
-    // Slots cleared, invoker pointer cleared, resume body stashed.
+    // After the last sub-turn lands, fan-out state is drained but
+    // no resume fires — sub-turn replies are the agents' contributions
+    // to the chat, full stop. Tiger does not get a synthesizing
+    // follow-up turn.
     try testing.expectEqual(@as(usize, 0), root.subturn_slots.items.len);
     try testing.expectEqual(@as(usize, 0), root.pending_subturns);
     try testing.expect(root.invoker_to_resume == null);
-    const body = root.last_resume_body orelse return error.MissingResumeBody;
-    try testing.expectEqualStrings(
-        "@sage replied:\nsage's view\n\n@bolt replied:\nbolt's view",
-        body,
-    );
-    // Resume consumed one more model call: 2 sub-turns + 1 resume.
-    try testing.expectEqual(@as(u8, 3), root.auto_dispatch_calls);
+    try testing.expect(root.last_resume_body == null);
+    // Only the two sub-turn dispatches were counted; no resume call.
+    try testing.expectEqual(@as(u8, 2), root.auto_dispatch_calls);
 }
 
 test "scanAndFanOut: budget halt skips dispatch when reserve exhausted" {
