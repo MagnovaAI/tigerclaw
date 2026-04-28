@@ -30,7 +30,50 @@ const Thinking = @import("thinking.zig");
 const Hint = @import("hint.zig");
 const StatusBar = @import("status_bar.zig");
 const mention = @import("../mention.zig");
-const dispatch_log = std.log.scoped(.tui_dispatch);
+
+/// Side-channel logger for the cross-agent dispatch state machine.
+/// Writes to `/tmp/tigerclaw-tui.log` so the lines don't bleed into
+/// the alt-screen TUI render. Best-effort: file-open failure makes
+/// every call a no-op rather than crash the UI.
+const dispatch_log = struct {
+    const file_path = "/tmp/tigerclaw-tui.log";
+    /// Cheap spinlock — log calls are infrequent and we only need to
+    /// serialize writes so the seconds-tagged lines don't interleave.
+    var lock_flag: std.atomic.Value(bool) = .init(false);
+
+    fn write(comptime fmt: []const u8, args: anytype) void {
+        while (lock_flag.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {}
+        defer lock_flag.store(false, .release);
+        const mode: std.c.mode_t = 0o644;
+        const fd = std.c.open(file_path, std.c.O{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, mode);
+        if (fd < 0) return;
+        defer _ = std.c.close(fd);
+        var buf: [2048]u8 = undefined;
+        var bw = std.Io.Writer.fixed(&buf);
+        // Wall-clock ts (seconds resolution is enough for tracing).
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+        const epoch_secs: u64 = @intCast(ts.sec);
+        const day_secs = epoch_secs % 86400;
+        bw.print("{d:0>2}:{d:0>2}:{d:0>2} ", .{
+            (day_secs / 3600) % 24,
+            (day_secs / 60) % 60,
+            day_secs % 60,
+        }) catch return;
+        bw.print(fmt, args) catch return;
+        bw.writeAll("\n") catch return;
+        const out = bw.buffered();
+        _ = std.c.write(fd, out.ptr, out.len);
+    }
+
+    fn info(comptime fmt: []const u8, args: anytype) void {
+        write(fmt, args);
+    }
+
+    fn warn(comptime fmt: []const u8, args: anytype) void {
+        write("WARN " ++ fmt, args);
+    }
+};
 const CommandMenu = @import("command_menu.zig");
 const skills_mod = @import("../../skills/skills.zig");
 
