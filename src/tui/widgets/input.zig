@@ -119,15 +119,22 @@ fn eventHandler(
             // the pasted content, not user typing. Append to the
             // accumulator; commit on `paste_end`.
             if (self.in_bracketed_paste) {
-                if (key.text) |txt| {
-                    self.paste_buffer.appendSlice(self.allocator, txt) catch {};
-                } else if (key.codepoint == 13 or key.codepoint == 10) {
-                    // Newline keys mid-paste — terminals deliver
-                    // pasted line breaks as bare CR/LF without a
-                    // `text` field. Translate to '\n' so the
-                    // stash threshold and placeholder line count
-                    // match what was actually pasted.
+                // Reconstruct the pasted byte from `key.codepoint`
+                // instead of trusting `key.text`. The latter is a
+                // slice into the input thread's local parser buffer
+                // and is already overwritten by the time the main
+                // thread drains the queued event — dereferencing it
+                // segfaults on any non-trivial paste. Encoding from
+                // the codepoint stays inside the bytes the event
+                // carries by value.
+                if (key.codepoint == 13 or key.codepoint == 10) {
+                    // Pasted line breaks — terminals send them as
+                    // bare CR/LF. Normalise to '\n'.
                     self.paste_buffer.append(self.allocator, '\n') catch {};
+                } else if (key.codepoint > 0 and key.codepoint <= 0x10FFFF) {
+                    var utf8_buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(@intCast(key.codepoint), &utf8_buf) catch 0;
+                    if (n > 0) self.paste_buffer.appendSlice(self.allocator, utf8_buf[0..n]) catch {};
                 }
                 ctx.consumeAndRedraw();
                 return;
@@ -135,14 +142,25 @@ fn eventHandler(
             try self.handleKey(ctx, key);
         },
         .paste => |text| {
-            // OSC52 paste payload, allocated by vaxis's Parser via
-            // the system_clipboard_allocator (we hand vxfw the
-            // smp_allocator from main, the same one Input uses).
-            // The vxfw event docs explicitly say "caller must free,"
-            // so leaking it would slowly bleed the heap on every
-            // paste. We guard handlePaste with a length sanity
-            // check before walking the slice, then free regardless
-            // of whether the inline/stash path succeeded.
+            // OSC52 paste payload. In normal operation it's allocated
+            // by vaxis's parser and we own the free. But under load
+            // we've observed corrupted slices arriving on this event
+            // (`text.len` in the exabyte range, `text.ptr` pointing
+            // at random escape-sequence bytes). The cause is the
+            // same cross-thread parser race that bites `key.text` —
+            // see the `.key_press` arm. Freeing such a slice
+            // segfaults inside the allocator. Length-gate before
+            // both reading and freeing: anything over 16 MiB is
+            // almost certainly a torn read, drop it on the floor.
+            // The leak risk is bounded — vaxis allocates these from
+            // a per-paste buffer that resets on the next paste.
+            if (text.len > 16 * 1024 * 1024) {
+                std.log.scoped(.tui_paste).warn(
+                    "rejecting paste with implausible len={d}; not freeing torn slice",
+                    .{text.len},
+                );
+                return;
+            }
             defer self.allocator.free(text);
             self.handlePaste(ctx, text) catch |err| {
                 std.log.scoped(.tui_paste).warn(
@@ -277,10 +295,13 @@ fn handleKey(self: *Input, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
     //   - 57414     → kp_enter (numeric keypad Enter)
     //   - text "\r" / "\n" → some terminals deliver Enter as text
     //   - Ctrl+J    → fallback for the LF-as-Ctrl+J remap above
+    // `key.text` is unsafe to dereference (input thread vs main
+    // thread race on the parser's local buffer), so we drive every
+    // detection branch off codepoint + mods. The `text "\r" / "\n"`
+    // case from the old code was already covered by codepoint 13/10.
     const is_enter_codepoint = key.codepoint == 13 or key.codepoint == 10 or key.codepoint == 57414;
-    const is_enter_text = if (key.text) |t| std.mem.eql(u8, t, "\r") or std.mem.eql(u8, t, "\n") else false;
     const is_ctrl_j = key.codepoint == 'j' and key.mods.ctrl and key.text == null;
-    const is_enter = is_enter_codepoint or is_enter_text or is_ctrl_j;
+    const is_enter = is_enter_codepoint or is_ctrl_j;
 
     if (is_enter) {
         if (self.on_submit) |cb| {
@@ -346,12 +367,18 @@ fn handleKey(self: *Input, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         return;
     }
 
-    // Printable text insertion. `key.text` is the UTF-8 bytes
-    // the terminal emitted; non-null for any visible character.
-    if (key.text) |txt| {
-        if (txt.len == 0) return;
-        try self.buf.insertSlice(self.allocator, self.cursor, txt);
-        self.cursor += txt.len;
+    // Printable text insertion. We rebuild the bytes from
+    // `key.codepoint` instead of dereferencing `key.text`: that
+    // slice points into the input-thread parser's local buffer
+    // and is overwritten by the next sequence well before the
+    // main thread drains the event queue. Trusting it crashes on
+    // any high-rate input (e.g. bracketed paste).
+    if (key.text != null and key.codepoint > 0 and key.codepoint <= 0x10FFFF) {
+        var utf8_buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(key.codepoint), &utf8_buf) catch return;
+        if (n == 0) return;
+        try self.buf.insertSlice(self.allocator, self.cursor, utf8_buf[0..n]);
+        self.cursor += n;
         ctx.consumeAndRedraw();
     }
 }

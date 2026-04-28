@@ -60,8 +60,14 @@ pub fn matches(self: Key, cp: u21, mods: Modifiers) bool {
     // rule 1
     if (self.matchExact(cp, mods)) return true;
 
-    // rule 2
-    if (self.matchText(cp, mods)) return true;
+    // rule 2 — `matchText` dereferences `self.text`, which is a
+    // pointer into the input thread's local parser scratch buffer.
+    // When events are queued and drained on a different thread, the
+    // pointer may already point at the next sequence's bytes. We
+    // disable this rule entirely; the cost is missing the
+    // alternate-layout match (e.g. dvorak `c` keystroke matching
+    // qwerty `c`) which we don't rely on for shortcut dispatch.
+    // if (self.matchText(cp, mods)) return true;
 
     // rule 3
     if (self.matchShiftedCodepoint(cp, mods)) return true;
@@ -104,7 +110,15 @@ pub fn matchShiftedCodepoint(self: Key, cp: u21, mods: Modifiers) bool {
 /// text of the key. This function will consume Shift and Caps Lock when matching
 pub fn matchText(self: Key, cp: u21, mods: Modifiers) bool {
     // return early if we have no text
-    if (self.text == null) return false;
+    const text = self.text orelse return false;
+    // The parser writes `text` into a per-thread scratch buffer that
+    // gets overwritten by the next sequence. When events are queued
+    // and drained on a different thread (vxfw event loop), `text`
+    // may already be invalid by the time we look at it. A sane key
+    // event has at most 4 UTF-8 bytes; anything longer is a torn
+    // read on the slice header, dereferencing it would segfault.
+    // Bail rather than walk corrupted memory.
+    if (text.len == 0 or text.len > 4) return false;
 
     var self_mods = self.mods;
     self_mods.num_lock = false;
@@ -126,7 +140,7 @@ pub fn matchText(self: Key, cp: u21, mods: Modifiers) bool {
 
     var buf: [4]u8 = undefined;
     const n = std.unicode.utf8Encode(_cp, &buf) catch return false;
-    return std.mem.eql(u8, self.text.?, buf[0..n]) and std.meta.eql(self_mods, arg_mods);
+    return std.mem.eql(u8, text, buf[0..n]) and std.meta.eql(self_mods, arg_mods);
 }
 
 // The key must exactly match the codepoint and modifiers. caps_lock and
