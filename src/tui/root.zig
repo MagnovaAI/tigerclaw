@@ -227,6 +227,11 @@ pub const Options = struct {
     /// `runTuiLocal` from `~/.tigerclaw/config.json:user_name`,
     /// then `$USER`, then this fallback.
     user_name: []const u8 = "Omkar",
+    /// When true, the cross-agent dispatch logger appends every
+    /// dispatch event to `/tmp/tigerclaw-tui.log`. Off by default
+    /// so production TUI runs don't litter `/tmp`. Toggled by
+    /// `--debug` on the CLI or `TIGERCLAW_DEBUG=1` in the env.
+    debug: bool = false,
 };
 
 const EventLoop = vaxis.Loop(Event);
@@ -450,6 +455,10 @@ fn askUserCancelAdapter(ctx: *anyopaque) void {
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
+    // Flip the side-channel dispatch logger gate before any worker
+    // thread is spawned. The logger has process-global state, so
+    // setting it once here is enough for both vxfw and legacy paths.
+    @import("widgets/root.zig").dispatch_log.setEnabled(opts.debug);
     // vxfw path is the default. Set \`TIGERCLAW_VXFW=0\` to fall
     // back to the hand-rolled implementation — kept around as a
     // rollback escape hatch while the vxfw port soaks. The old

@@ -31,7 +31,30 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
 
-    const argv = try init.minimal.args.toSlice(arena);
+    const raw_argv = try init.minimal.args.toSlice(arena);
+
+    // Peel off the global `--debug` flag before subcommand parsing.
+    // It's accepted both as `tigerclaw --debug` (TUI launch) and as
+    // `tigerclaw --debug <subcommand>`. We also honour the env var
+    // `TIGERCLAW_DEBUG=1` so devs can flip it on without rewriting
+    // every shell history line. The flag only gates the side-channel
+    // dispatch logger today; subcommands that don't use the logger
+    // simply ignore it.
+    var debug_enabled: bool = blk: {
+        const v = init.environ_map.get("TIGERCLAW_DEBUG") orelse break :blk false;
+        break :blk v.len > 0 and !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "false");
+    };
+    var argv_buf = try arena.alloc([:0]const u8, raw_argv.len);
+    var argv_len: usize = 0;
+    for (raw_argv) |a| {
+        if (std.mem.eql(u8, a, "--debug")) {
+            debug_enabled = true;
+            continue;
+        }
+        argv_buf[argv_len] = a;
+        argv_len += 1;
+    }
+    const argv = argv_buf[0..argv_len];
 
     var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [4096]u8 = undefined;
@@ -45,7 +68,7 @@ pub fn main(init: std.process.Init) !u8 {
         // TUI — no gateway daemon, no HTTP round-trip. The runner
         // lives inside the TUI's process and talks to the provider
         // directly.
-        return runTuiLocal(arena, io, init);
+        return runTuiLocal(arena, io, init, debug_enabled);
     }
 
     // Convert [:0]const u8 slices to []const u8 for the parser.
@@ -649,7 +672,7 @@ test "shouldEnableColor: windows/wasi stay monochrome without force" {
 
 const tui = @import("tui/root.zig");
 
-fn runTuiLocal(arena: std.mem.Allocator, io: std.Io, init: std.process.Init) !u8 {
+fn runTuiLocal(arena: std.mem.Allocator, io: std.Io, init: std.process.Init, debug: bool) !u8 {
     const home = init.environ_map.get("HOME") orelse "";
     // The user's pill name. Hardcoded to "Omkar" for now —
     // config-driven `~/.tigerclaw/config.json:user_name` lands when
@@ -659,6 +682,7 @@ fn runTuiLocal(arena: std.mem.Allocator, io: std.Io, init: std.process.Init) !u8
     tui.run(arena, io, .{
         .home = home,
         .user_name = "Omkar",
+        .debug = debug,
     }) catch |err| {
         // The tty is now in an undefined state if vaxis bailed
         // mid-render; print to stderr via libc write so we don't

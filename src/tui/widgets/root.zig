@@ -33,15 +33,31 @@ const mention = @import("../mention.zig");
 
 /// Side-channel logger for the cross-agent dispatch state machine.
 /// Writes to `/tmp/tigerclaw-tui.log` so the lines don't bleed into
-/// the alt-screen TUI render. Best-effort: file-open failure makes
-/// every call a no-op rather than crash the UI.
-const dispatch_log = struct {
+/// the alt-screen TUI render. Disabled by default — flip on with
+/// `--debug` on the CLI or `TIGERCLAW_DEBUG=1` in the environment.
+/// Both `info`/`warn` short-circuit when `enabled == false`, so the
+/// per-call cost is one atomic load on the hot path.
+pub const dispatch_log = struct {
     const file_path = "/tmp/tigerclaw-tui.log";
     /// Cheap spinlock — log calls are infrequent and we only need to
     /// serialize writes so the seconds-tagged lines don't interleave.
     var lock_flag: std.atomic.Value(bool) = .init(false);
+    /// Master gate. `setEnabled(true)` is called once at TUI startup
+    /// when `--debug` or `TIGERCLAW_DEBUG=1` is set. Lives for the
+    /// process lifetime — the flag is process-global because the
+    /// logger has no other handle on caller state.
+    var enabled_flag: std.atomic.Value(bool) = .init(false);
+
+    pub fn setEnabled(on: bool) void {
+        enabled_flag.store(on, .release);
+    }
+
+    pub fn isEnabled() bool {
+        return enabled_flag.load(.acquire);
+    }
 
     fn write(comptime fmt: []const u8, args: anytype) void {
+        if (!enabled_flag.load(.acquire)) return;
         while (lock_flag.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {}
         defer lock_flag.store(false, .release);
         const mode: std.c.mode_t = 0o644;
