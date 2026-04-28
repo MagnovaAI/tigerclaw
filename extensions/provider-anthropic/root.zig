@@ -102,7 +102,15 @@ pub const AnthropicProvider = struct {
     ) anyerror!ChatResponse {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
         switch (self.source) {
-            .literal => |bytes| return streamTokensCancellable(allocator, .{ .literal = bytes }, sink, sink_ctx, request.cancel_token),
+            .literal => |bytes| return parseStreamInnerFull(
+                allocator,
+                .{ .literal = bytes },
+                sink,
+                sink_ctx,
+                request.cancel_token,
+                request.tool_start_sink,
+                request.tool_start_sink_ctx,
+            ),
             .http => |cfg| return runHttp(allocator, cfg, request, sink, sink_ctx),
         }
     }
@@ -183,6 +191,18 @@ fn parseStreamInner(
     sink_ctx: ?*anyopaque,
     cancel: ?*std.atomic.Value(bool),
 ) !ChatResponse {
+    return parseStreamInnerFull(allocator, input, sink, sink_ctx, cancel, null, null);
+}
+
+fn parseStreamInnerFull(
+    allocator: std.mem.Allocator,
+    input: StreamInput,
+    sink: ?TokenSink,
+    sink_ctx: ?*anyopaque,
+    cancel: ?*std.atomic.Value(bool),
+    tool_start_sink: ?provider_mod.ToolStartSink,
+    tool_start_ctx: ?*anyopaque,
+) !ChatResponse {
     var parser = transport.sse.Parser.init();
     defer parser.deinit(allocator);
 
@@ -226,12 +246,14 @@ fn parseStreamInner(
             etx: *?[]const u8,
             sk: ?TokenSink,
             sk_ctx: ?*anyopaque,
+            ts_sink: ?provider_mod.ToolStartSink,
+            ts_ctx: ?*anyopaque,
             cnc: ?*std.atomic.Value(bool),
             out_cancelled: *bool,
         ) !void {
             while (try p.nextEvent(alloc)) |ev| {
                 if (std.mem.eql(u8, ev.name, "content_block_start")) {
-                    try absorbContentBlockStart(alloc, tb, ev.data);
+                    try absorbContentBlockStart(alloc, tb, ev.data, ts_sink, ts_ctx);
                 } else if (std.mem.eql(u8, ev.name, "content_block_delta")) {
                     const before = txt.items.len;
                     try absorbDelta(alloc, txt, ev.data);
@@ -259,7 +281,7 @@ fn parseStreamInner(
     if (!cancelled) switch (input) {
         .literal => |bytes| {
             try parser.feed(allocator, bytes);
-            try Drain.run(allocator, &parser, &text, &tool_builders, &usage, &stop, &err_text, sink, sink_ctx, cancel, &cancelled);
+            try Drain.run(allocator, &parser, &text, &tool_builders, &usage, &stop, &err_text, sink, sink_ctx, tool_start_sink, tool_start_ctx, cancel, &cancelled);
         },
         .reader => |r| {
             // Streaming path: interleave byte reads with event drains
@@ -276,7 +298,7 @@ fn parseStreamInner(
                 const n = try r.readSliceShort(&buf);
                 if (n == 0) break;
                 try parser.feed(allocator, buf[0..n]);
-                try Drain.run(allocator, &parser, &text, &tool_builders, &usage, &stop, &err_text, sink, sink_ctx, cancel, &cancelled);
+                try Drain.run(allocator, &parser, &text, &tool_builders, &usage, &stop, &err_text, sink, sink_ctx, tool_start_sink, tool_start_ctx, cancel, &cancelled);
                 if (cancelled) break;
             }
         },
@@ -349,6 +371,133 @@ fn parseStreamInner(
     };
 }
 
+/// Drive the SSE parser straight off a pipe `File.readStreaming`
+/// loop. Mirrors `parseStreamInner` but bypasses the `Io.Reader`
+/// interface (which buffers fill-the-buffer-first) so each curl
+/// write reaches the parser the moment it hits the kernel pipe.
+fn pumpStream(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    sink: ?TokenSink,
+    sink_ctx: ?*anyopaque,
+    cancel: ?*std.atomic.Value(bool),
+    tool_start_sink: ?provider_mod.ToolStartSink,
+    tool_start_ctx: ?*anyopaque,
+) !ChatResponse {
+    var parser = transport.sse.Parser.init();
+    defer parser.deinit(allocator);
+
+    var text: std.array_list.Aligned(u8, null) = .empty;
+    errdefer text.deinit(allocator);
+
+    var usage = types.TokenUsage{};
+    var stop: types.StopReason = .end_turn;
+    var err_text: ?[]const u8 = null;
+    defer if (err_text) |e| allocator.free(e);
+
+    var tool_builders: std.ArrayListUnmanaged(ToolBuilder) = .empty;
+    defer {
+        for (tool_builders.items) |*b| b.deinit(allocator);
+        tool_builders.deinit(allocator);
+    }
+
+    var cancelled = false;
+    if (cancel) |c| if (c.load(.acquire)) {
+        cancelled = true;
+    };
+
+    var buf: [4096]u8 = undefined;
+    while (!cancelled) {
+        if (cancel) |c| if (c.load(.acquire)) {
+            cancelled = true;
+            break;
+        };
+        var iov: [1][]u8 = .{buf[0..]};
+        const n = file.readStreaming(io, &iov) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        try parser.feed(allocator, buf[0..n]);
+        // Drain whatever events the just-fed bytes completed. Same
+        // event table as parseStreamInner; copied inline to avoid a
+        // big refactor of the existing helper.
+        while (try parser.nextEvent(allocator)) |ev| {
+            if (std.mem.eql(u8, ev.name, "content_block_start")) {
+                try absorbContentBlockStart(allocator, &tool_builders, ev.data, tool_start_sink, tool_start_ctx);
+            } else if (std.mem.eql(u8, ev.name, "content_block_delta")) {
+                const before = text.items.len;
+                try absorbDelta(allocator, &text, ev.data);
+                if (sink) |s| {
+                    const fragment = text.items[before..];
+                    if (fragment.len > 0) s(sink_ctx, fragment);
+                }
+                try absorbInputJsonDelta(allocator, &tool_builders, ev.data);
+            } else if (std.mem.eql(u8, ev.name, "message_delta")) {
+                try absorbMessageDelta(&usage, &stop, ev.data);
+            } else if (std.mem.eql(u8, ev.name, "message_start")) {
+                try absorbMessageStart(&usage, ev.data);
+            } else if (std.mem.eql(u8, ev.name, "error")) {
+                stop = .refusal;
+                err_text = try absorbError(allocator, ev.data);
+            }
+            if (cancel) |c| if (c.load(.acquire)) {
+                cancelled = true;
+                break;
+            };
+        }
+    }
+
+    if (cancelled) stop = .cancelled;
+
+    if (err_text) |e| {
+        const owned = try allocator.dupe(u8, e);
+        text.deinit(allocator);
+        return .{ .text = owned, .usage = usage, .stop_reason = .refusal };
+    }
+
+    var tool_calls: std.ArrayListUnmanaged(types.ToolCall) = .empty;
+    errdefer {
+        for (tool_calls.items) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments_json);
+        }
+        tool_calls.deinit(allocator);
+    }
+    const last_idx: ?usize = if (stop == .max_tokens and tool_builders.items.len > 0)
+        tool_builders.items.len - 1
+    else
+        null;
+    for (tool_builders.items, 0..) |*b, i| {
+        if (b.id.len == 0 or b.name.len == 0) continue;
+        if (last_idx != null and i == last_idx.? and b.input.items.len > 0) {
+            const probe = std.json.parseFromSlice(std.json.Value, allocator, b.input.items, .{}) catch {
+                continue;
+            };
+            probe.deinit();
+        }
+        const args = if (b.input.items.len == 0)
+            try allocator.dupe(u8, "{}")
+        else
+            try allocator.dupe(u8, b.input.items);
+        errdefer allocator.free(args);
+        try tool_calls.append(allocator, .{
+            .id = try allocator.dupe(u8, b.id),
+            .name = try allocator.dupe(u8, b.name),
+            .arguments_json = args,
+        });
+    }
+
+    return .{
+        .text = try text.toOwnedSlice(allocator),
+        .tool_calls = try tool_calls.toOwnedSlice(allocator),
+        .usage = usage,
+        .stop_reason = stop,
+    };
+}
+
 /// Per-content-block accumulator for a tool_use response.
 const ToolBuilder = struct {
     index: u32,
@@ -367,6 +516,8 @@ fn absorbContentBlockStart(
     allocator: std.mem.Allocator,
     builders: *std.ArrayListUnmanaged(ToolBuilder),
     data: []const u8,
+    tool_start_sink: ?provider_mod.ToolStartSink,
+    tool_start_ctx: ?*anyopaque,
 ) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return;
     defer parsed.deinit();
@@ -383,6 +534,14 @@ fn absorbContentBlockStart(
     if (id_v != .string) return;
     const name_v = block.object.get("name") orelse return;
     if (name_v != .string) return;
+
+    // Fire the early-start sink the moment we know the id+name.
+    // The model is still streaming this tool's args at this point,
+    // so the TUI sees the row appear before write_file/bash/etc
+    // arguments finish generating — what `tool_start` is meant to
+    // do, instead of firing post-round when the runner is about to
+    // dispatch.
+    if (tool_start_sink) |sink| sink(tool_start_ctx, id_v.string, name_v.string);
 
     try builders.append(allocator, .{
         .index = @intCast(idx_v.integer),
@@ -432,110 +591,160 @@ fn runHttp(
     const body = try buildRequestBody(allocator, request, 1024);
     defer allocator.free(body);
 
-    // Anthropic OAuth tokens (sk-ant-oat01-...) speak the same Messages
-    // endpoint but switch authentication: Bearer auth, ?beta=true on
-    // the URL, anthropic-beta: oauth-2025-04-20, and a Claude CLI
-    // user-agent. Standard sk-ant-api03- keys keep the x-api-key path.
+    // Anthropic OAuth tokens (sk-ant-oat01-...) flip the auth scheme:
+    // Bearer + `?beta=true` + `anthropic-beta: oauth-2025-04-20` +
+    // a Claude-CLI user-agent. Standard sk-ant-api03- keys keep the
+    // x-api-key path.
     const is_oauth = std.mem.startsWith(u8, cfg.api_key, "sk-ant-oat01-");
 
-    const oauth_url_buf_size = 256;
-    var oauth_url_buf: [oauth_url_buf_size]u8 = undefined;
-    const endpoint_str = if (is_oauth) blk: {
+    var url_buf: [512]u8 = undefined;
+    const url = if (is_oauth) blk: {
         const sep: u8 = if (std.mem.indexOfScalar(u8, cfg.endpoint, '?') != null) '&' else '?';
-        const u = std.fmt.bufPrint(&oauth_url_buf, "{s}{c}beta=true", .{ cfg.endpoint, sep }) catch
+        const u = std.fmt.bufPrint(&url_buf, "{s}{c}beta=true", .{ cfg.endpoint, sep }) catch
             return refusal(allocator, "anthropic transport error: endpoint too long", .{});
         break :blk u;
     } else cfg.endpoint;
 
-    const uri = std.Uri.parse(endpoint_str) catch
-        return refusal(allocator, "anthropic transport error: invalid endpoint", .{});
+    // Build the auth + extra headers as `-H "name: value"` argv slots.
+    // Each header needs its own owned buffer so we can hand the slice
+    // to argv. Stash everything on an arena so cleanup is one call.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
 
-    var client: std.http.Client = .{ .allocator = allocator, .io = cfg.io };
-    defer client.deinit();
-
-    var auth_buf: [512]u8 = undefined;
-    var extra_buf: [6]std.http.Header = undefined;
-    var extra_len: usize = 0;
+    var headers: std.ArrayListUnmanaged([]const u8) = .empty;
     if (is_oauth) {
-        const v = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{cfg.api_key}) catch
-            return refusal(allocator, "anthropic transport error: api_key too long", .{});
-        extra_buf[extra_len] = .{ .name = "authorization", .value = v };
-        extra_len += 1;
+        try headers.append(aalloc, try std.fmt.allocPrint(aalloc, "authorization: Bearer {s}", .{cfg.api_key}));
+        try headers.append(aalloc, try std.fmt.allocPrint(aalloc, "anthropic-beta: oauth-2025-04-20", .{}));
+        try headers.append(aalloc, try std.fmt.allocPrint(aalloc, "user-agent: claude-cli/2.1.2 (external, cli)", .{}));
     } else {
-        extra_buf[extra_len] = .{ .name = "x-api-key", .value = cfg.api_key };
-        extra_len += 1;
+        try headers.append(aalloc, try std.fmt.allocPrint(aalloc, "x-api-key: {s}", .{cfg.api_key}));
+        if (cfg.beta_features.len > 0) {
+            try headers.append(aalloc, try std.fmt.allocPrint(aalloc, "anthropic-beta: {s}", .{cfg.beta_features}));
+        }
     }
-    extra_buf[extra_len] = .{ .name = "anthropic-version", .value = cfg.api_version };
-    extra_len += 1;
-    extra_buf[extra_len] = .{ .name = "content-type", .value = "application/json" };
-    extra_len += 1;
-    // Disable compression negotiation. Zig's http.Client does not
-    // auto-decompress responses, so a gzipped 400 body surfaces as
-    // raw compressed bytes in the refusal message. `identity` tells
-    // the server to send the body uncompressed.
-    extra_buf[extra_len] = .{ .name = "accept-encoding", .value = "identity" };
-    extra_len += 1;
-    if (is_oauth) {
-        extra_buf[extra_len] = .{ .name = "anthropic-beta", .value = "oauth-2025-04-20" };
-        extra_len += 1;
-        extra_buf[extra_len] = .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" };
-        extra_len += 1;
-    } else if (cfg.beta_features.len > 0) {
-        extra_buf[extra_len] = .{ .name = "anthropic-beta", .value = cfg.beta_features };
-        extra_len += 1;
+    try headers.append(aalloc, try std.fmt.allocPrint(aalloc, "anthropic-version: {s}", .{cfg.api_version}));
+    try headers.append(aalloc, "content-type: application/json");
+
+    return runCurl(
+        allocator,
+        cfg.io,
+        url,
+        body,
+        headers.items,
+        sink,
+        sink_ctx,
+        request.cancel_token,
+        request.tool_start_sink,
+        request.tool_start_sink_ctx,
+    );
+}
+
+/// Spawn `curl --no-buffer` and pipe its SSE stdout into the parser.
+/// `--no-buffer` disables curl's stdio buffering so each network read
+/// flushes through the pipe as soon as it arrives, which is what
+/// std.http's chunked body reader fails to do in Zig 0.16.
+fn runCurl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    sink: ?provider_mod.TokenSink,
+    sink_ctx: ?*anyopaque,
+    cancel: ?*std.atomic.Value(bool),
+    tool_start_sink: ?provider_mod.ToolStartSink,
+    tool_start_ctx: ?*anyopaque,
+) !ChatResponse {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    // Stash the body in a temp file so we don't have to wrangle stdin
+    // pipe writes alongside stdout reads. `curl -d @path` reads it
+    // verbatim. Temp file is auto-deleted on close via O_CLEXEC +
+    // explicit unlink after open.
+    var body_path_buf: [256]u8 = undefined;
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    const body_path = std.fmt.bufPrint(&body_path_buf, "/tmp/tigerclaw-anthropic-{d}-{d}.json", .{
+        std.c.getpid(),
+        @as(u64, @intCast(ts.nsec)),
+    }) catch return error.OutOfMemory;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = body_path, .data = body }) catch
+        return refusal(allocator, "anthropic transport error: cannot write body file", .{});
+    defer std.Io.Dir.cwd().deleteFile(io, body_path) catch {};
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    try argv.appendSlice(aalloc, &.{
+        "curl",
+        "-sS",
+        "--no-buffer",
+        "--fail-with-body",
+        "--max-time", "120",
+        "-X", "POST",
+    });
+    for (headers) |h| {
+        try argv.append(aalloc, "-H");
+        try argv.append(aalloc, h);
+    }
+    const data_arg = try std.fmt.allocPrint(aalloc, "@{s}", .{body_path});
+    try argv.appendSlice(aalloc, &.{ "-d", data_arg, url });
+
+    var child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch return refusal(allocator, "anthropic transport error: failed to spawn curl", .{});
+    var child_alive = true;
+    defer if (child_alive) child.kill(io);
+
+    // Drive the SSE parser directly off `File.readStreaming`. Going
+    // through `.reader(io, &buf).interface.readSliceShort` adds a
+    // buffering layer that waits to fill `buf` before yielding —
+    // identical to the std.http reader bug we worked around. Calling
+    // `readStreaming` on the raw pipe returns whatever curl just
+    // wrote, so each SSE event reaches the parser the moment it
+    // lands in the kernel pipe buffer.
+    const stdout_file = child.stdout orelse
+        return refusal(allocator, "anthropic transport error: no stdout pipe", .{});
+
+    const result = pumpStream(allocator, io, stdout_file, sink, sink_ctx, cancel, tool_start_sink, tool_start_ctx);
+
+    // Reap the child either way so the zombie process count stays
+    // sane. If the parser failed mid-stream `child.kill` already ran
+    // via the deferred path; here we wait on a clean exit.
+    const term = child.wait(io) catch {
+        child_alive = false;
+        return result;
+    };
+    child_alive = false;
+
+    // Non-zero exit — surface curl's stderr (often DNS/TLS hints)
+    // when the parser already produced something we can attach to.
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            // Drain stderr; small, fixed cap. We don't have a great
+            // signal for "parser succeeded with empty body" vs "curl
+            // died and parser saw nothing", so prefer the parser's
+            // result when it produced any text.
+            if (child.stderr) |stderr_file| {
+                var stderr_buf: [2048]u8 = undefined;
+                var stderr_reader = stderr_file.reader(io, &stderr_buf);
+                const got = stderr_reader.interface.readSliceShort(&stderr_buf) catch 0;
+                if (got > 0) {
+                    return refusal(allocator, "anthropic curl exit={d}: {s}", .{
+                        code,
+                        stderr_buf[0..got],
+                    });
+                }
+            }
+        },
+        else => {},
     }
 
-    var req = client.request(.POST, uri, .{
-        .keep_alive = false,
-        .extra_headers = extra_buf[0..extra_len],
-    }) catch |err| return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
-    defer req.deinit();
-
-    // Half-open connections (laptop sleep, network change, NAT
-    // rebind) leave the socket alive in our process while the peer
-    // is gone. Without timeouts the next read() blocks until the
-    // kernel's TCP retransmit budget runs out — minutes — and the
-    // TUI looks frozen. Set a per-read timeout so a stalled stream
-    // unwinds as `error.Timeout` and the runner can surface a
-    // refusal. Enable TCP keepalive so the kernel detects the
-    // dead peer faster on its own.
-    if (req.connection) |c| transport.applyDefaultSocketTimeouts(c.stream_reader.stream.socket.handle);
-
-    var send_buf: [1024]u8 = undefined;
-    req.transfer_encoding = .{ .content_length = body.len };
-    var body_writer = req.sendBodyUnflushed(&send_buf) catch |err|
-        return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
-    body_writer.writer.writeAll(body) catch |err|
-        return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
-    body_writer.end() catch |err|
-        return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
-    req.connection.?.flush() catch |err|
-        return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
-
-    var redirect_buf: [256]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch |err|
-        return refusal(allocator, "anthropic transport error: {s}", .{@errorName(err)});
-
-    const status_code: u16 = @intFromEnum(response.head.status);
-    if (status_code != 200) {
-        var transfer_buf: [4096]u8 = undefined;
-        var decompress: std.http.Decompress = undefined;
-        var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
-        const body_reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
-        return refusalFromHttp(allocator, status_code, body_reader);
-    }
-
-    // Anthropic's HTTP layer auto-negotiates Accept-Encoding so the
-    // response body may arrive gzip- or zstd-compressed. Use the
-    // `readerDecompressing` variant so the parser sees plain SSE
-    // bytes regardless of what content-encoding the server picked.
-    var transfer_buf: [4096]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
-    const body_reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
-    const input: StreamInput = .{ .reader = body_reader };
-    if (sink) |s| return streamTokensCancellable(allocator, input, s, sink_ctx, request.cancel_token);
-    return parseStreamInner(allocator, input, null, null, request.cancel_token);
+    return result;
 }
 
 /// Render the Anthropic-shaped JSON request body. Extracted so tests
@@ -1158,84 +1367,6 @@ test "anthropic: parseStream drops a truncated tail tool_use on max_tokens" {
     try testing.expectEqual(types.StopReason.max_tokens, resp.stop_reason);
     try testing.expectEqual(@as(usize, 1), resp.tool_calls.len);
     try testing.expectEqualStrings("toolu_a", resp.tool_calls[0].id);
-}
-
-const ServerArgs = struct {
-    io: std.Io,
-    server: *std.Io.net.Server,
-};
-
-fn serveOne401(args: *ServerArgs) void {
-    var stream = args.server.accept(args.io) catch return;
-    defer stream.close(args.io);
-    var write_buf: [256]u8 = undefined;
-    var w = stream.writer(args.io, &write_buf);
-    _ = w.interface.writeAll(
-        "HTTP/1.1 401 Unauthorized\r\ncontent-length: 16\r\nconnection: close\r\n\r\n{\"error\":\"oops\"}",
-    ) catch {};
-    _ = w.interface.flush() catch {};
-}
-
-fn refusalFromHttp(
-    allocator: std.mem.Allocator,
-    status_code: u16,
-    body_reader: *std.Io.Reader,
-) !ChatResponse {
-    var drained: std.array_list.Aligned(u8, null) = .empty;
-    defer drained.deinit(allocator);
-
-    var read_buf: [1024]u8 = undefined;
-    while (drained.items.len < 1024) {
-        const n = body_reader.readSliceShort(&read_buf) catch break;
-        if (n == 0) break;
-        const room = 1024 - drained.items.len;
-        const take = @min(n, room);
-        try drained.appendSlice(allocator, read_buf[0..take]);
-        if (take < n) break;
-    }
-
-    return refusal(
-        allocator,
-        "anthropic api error: {d} {s}",
-        .{ status_code, drained.items },
-    );
-}
-
-test "anthropic: http error path surfaces refusal" {
-    const probe_addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
-    var server = try probe_addr.listen(testing.io, .{ .reuse_address = true });
-    const port = server.socket.address.getPort();
-
-    var args: ServerArgs = .{ .io = testing.io, .server = &server };
-    const thread = try std.Thread.spawn(.{}, serveOne401, .{&args});
-    defer {
-        thread.join();
-        server.deinit(testing.io);
-    }
-
-    var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/v1/messages", .{port});
-
-    var p = makeProvider(.{ .http = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .api_key = "sk-test",
-        .endpoint = url,
-    } });
-    const provider = p.provider();
-
-    const msgs = [_]types.Message{
-        types.Message.literal(.user, "hello"),
-    };
-    const resp = try provider.chat(testing.allocator, .{
-        .messages = &msgs,
-        .model = .{ .provider = "anthropic", .model = "claude-opus-4-7" },
-    });
-    defer if (resp.text) |t| testing.allocator.free(t);
-
-    try testing.expectEqual(types.StopReason.refusal, resp.stop_reason);
-    try testing.expect(resp.text != null);
-    try testing.expect(std.mem.indexOf(u8, resp.text.?, "401") != null);
 }
 
 const TokenCollector = struct {

@@ -186,15 +186,37 @@ fn streamOnce(
     var response = try request.receiveHead(&.{});
     const classified = try classifyResponse(.{ .status = response.head.status });
 
-    var transfer_buffer: [64]u8 = undefined;
+    // Drive the chunked-transfer reader so each network arrival
+    // reaches `sink` immediately. `readSliceShort` would fill the
+    // 4KB transfer buffer before yielding (the bug we hit in the
+    // Anthropic provider too); `take(1)` forces one byte to land,
+    // after which `bufferedLen()` exposes whatever else came in
+    // the same TCP read for a single drain. Mirrors the v1
+    // sse_client read() pattern.
+    var transfer_buffer: [4096]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    var chunk: [4096]u8 = undefined;
     while (true) {
-        const n = reader.readSliceShort(&chunk) catch |err| switch (err) {
-            error.ReadFailed => return err,
+        // Drain anything already buffered.
+        var buffered = reader.bufferedLen();
+        while (buffered > 0) {
+            const data = reader.take(buffered) catch |err| switch (err) {
+                error.EndOfStream => return classified,
+                else => return error.ReadFailed,
+            };
+            if (data.len == 0) break;
+            try sink(sink_ctx, data);
+            buffered = reader.bufferedLen();
+        }
+
+        // Buffer empty: pull one byte (blocks until something
+        // arrives or EOF), then loop back to drain whatever else
+        // came in the same read.
+        const first = reader.take(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return error.ReadFailed,
         };
-        if (n == 0) break;
-        try sink(sink_ctx, chunk[0..n]);
+        if (first.len == 0) break;
+        try sink(sink_ctx, first);
     }
 
     return classified;

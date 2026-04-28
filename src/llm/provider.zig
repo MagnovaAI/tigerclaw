@@ -27,7 +27,20 @@ pub const ChatRequest = struct {
     /// the request. Null means cancellation is not wired (legacy
     /// callers, tests).
     cancel_token: ?*std.atomic.Value(bool) = null,
+    /// Optional callback fired the moment the provider sees a
+    /// `tool_use` block start in the stream — i.e. as soon as the
+    /// model commits to calling a tool, before its arguments
+    /// finish generating. The runner uses this to surface the
+    /// "⚙ tool_name" row in the TUI immediately instead of waiting
+    /// for the whole round to land. `id` and `name` are borrowed
+    /// for the duration of the call; copy if needed to outlive it.
+    tool_start_sink: ?ToolStartSink = null,
+    tool_start_sink_ctx: ?*anyopaque = null,
 };
+
+/// Provider-level early notification that the model has just emitted
+/// a `tool_use` content block (id + name known, args still streaming).
+pub const ToolStartSink = *const fn (ctx: ?*anyopaque, id: []const u8, name: []const u8) void;
 
 pub const ChatResponse = struct {
     text: ?[]const u8 = null,
