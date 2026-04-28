@@ -1918,56 +1918,68 @@ fn eventHandler(
 /// stale and consumed (caller must return); `false` to continue
 /// dispatching normally.
 fn dropStaleIfNeeded(self: *Root, ue: vxfw.UserEvent) bool {
-    // Every payload starts with `epoch: u64`. Cast through that
-    // common header to peek without knowing the concrete type; the
-    // free path below upcasts to the real type for inner cleanup.
-    const EpochHeader = struct { epoch: u64 };
-    const data = ue.data orelse return false;
-    const header: *const EpochHeader = @ptrCast(@alignCast(data));
-    if (header.epoch == self.turn_epoch) return false;
-
+    // Cast to the concrete payload type first, *then* read epoch.
+    // The earlier "peek through a generic header" approach panicked
+    // with incorrect-alignment when the heap allocation's actual
+    // alignment was looser than `u64`'s 8-byte requirement
+    // (different payload types have different leading-field
+    // alignment requirements, so `@alignCast` to a one-size-fits-all
+    // header was undefined behaviour). Reading via the right type
+    // sidesteps that — the allocator stamped the right alignment for
+    // *that* type when it created the payload.
     const a = self.allocator;
+    const data = ue.data orelse return false;
+
     if (std.mem.eql(u8, ue.name, ue_chunk)) {
         const p: *ChunkPayload = @ptrCast(@alignCast(@constCast(data)));
+        if (p.epoch == self.turn_epoch) return false;
         a.free(p.agent);
         a.free(p.text);
         a.destroy(p);
     } else if (std.mem.eql(u8, ue.name, ue_tool_start)) {
         const p: *ToolStartPayload = @ptrCast(@alignCast(@constCast(data)));
+        if (p.epoch == self.turn_epoch) return false;
         a.free(p.id);
         a.free(p.name);
         a.free(p.args_summary);
         a.destroy(p);
     } else if (std.mem.eql(u8, ue.name, ue_tool_progress)) {
         const p: *ToolProgressPayload = @ptrCast(@alignCast(@constCast(data)));
+        if (p.epoch == self.turn_epoch) return false;
         a.free(p.id);
         a.free(p.chunk);
         a.destroy(p);
     } else if (std.mem.eql(u8, ue.name, ue_tool_done)) {
         const p: *ToolDonePayload = @ptrCast(@alignCast(@constCast(data)));
+        if (p.epoch == self.turn_epoch) return false;
         a.free(p.id);
         a.free(p.name);
         a.free(p.output);
         a.destroy(p);
     } else if (std.mem.eql(u8, ue.name, ue_ask_user)) {
         const p: *AskUserPayload = @ptrCast(@alignCast(@constCast(data)));
+        if (p.epoch == self.turn_epoch) return false;
         a.free(p.question);
         a.destroy(p);
     } else if (std.mem.eql(u8, ue.name, ue_usage)) {
         const p: *UsagePayload = @ptrCast(@alignCast(@constCast(data)));
+        if (p.epoch == self.turn_epoch) return false;
         a.destroy(p);
     } else if (std.mem.eql(u8, ue.name, ue_error)) {
         const p: *ErrorPayload = @ptrCast(@alignCast(@constCast(data)));
+        if (p.epoch == self.turn_epoch) return false;
         a.free(p.message);
         a.destroy(p);
     } else if (std.mem.eql(u8, ue.name, ue_done)) {
         const p: *DonePayload = @ptrCast(@alignCast(@constCast(data)));
+        if (p.epoch == self.turn_epoch) return false;
         if (p.invoker) |s| a.free(s);
         a.free(p.target_agent);
         a.free(p.output);
         a.destroy(p);
     } else if (std.mem.eql(u8, ue.name, ue_subturn_timeout)) {
         const p: *SubturnTimeoutPayload = @ptrCast(@alignCast(@constCast(data)));
+        if (p.epoch == self.turn_epoch) return false;
         a.free(p.invoker);
         a.free(p.target);
         a.destroy(p);
