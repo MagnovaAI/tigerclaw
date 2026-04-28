@@ -127,7 +127,24 @@ pub const AgentRegistry = struct {
         .run = registryRun,
         .cancel = registryCancel,
         .counter = registryCounter,
+        .set_sandbox = registrySetSandbox,
     };
+
+    fn registrySetSandbox(
+        ctx: *anyopaque,
+        mode: harness.agent_runner.SandboxMode,
+        path: []const u8,
+    ) anyerror!void {
+        const self: *AgentRegistry = @ptrCast(@alignCast(ctx));
+        // Fan out to every loaded agent. The TUI tracks one
+        // sandbox state for the whole UI; mirroring that to every
+        // agent keeps the policy uniform — sub-turn dispatches see
+        // the same gate the user just set on the active agent.
+        for (self.entries.items) |*e| {
+            const sub = e.runner.runner();
+            if (sub.vtable.set_sandbox) |_| try sub.setSandbox(mode, path);
+        }
+    }
 
     fn registryCounter(ctx: *anyopaque) *harness.agent_runner.InFlightCounter {
         const self: *AgentRegistry = @ptrCast(@alignCast(ctx));

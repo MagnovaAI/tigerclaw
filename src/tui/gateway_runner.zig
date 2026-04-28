@@ -59,7 +59,17 @@ pub const GatewayRunner = struct {
         .run = runFn,
         .cancel = cancelFn,
         .counter = counterFn,
+        .set_sandbox = setSandboxFn,
     };
+
+    fn setSandboxFn(
+        ctx: *anyopaque,
+        mode: harness.agent_runner.SandboxMode,
+        path: []const u8,
+    ) anyerror!void {
+        const self: *GatewayRunner = @ptrCast(@alignCast(ctx));
+        try sendSandbox(self.allocator, self.io, self.base_url, self.bearer, mode, path);
+    }
 
     fn runFn(ctx: *anyopaque, req: harness.agent_runner.TurnRequest) harness.agent_runner.TurnError!harness.agent_runner.TurnResult {
         const self: *GatewayRunner = @ptrCast(@alignCast(ctx));
@@ -332,6 +342,52 @@ fn cancelTurn(
         allocator,
         io,
         .{ .method = .DELETE, .url = url, .bearer = bearer },
+        null,
+        .{},
+    );
+}
+
+/// POST /sandbox to the gateway daemon so its in-process runner
+/// adopts the same sandbox state the TUI just set. Without this,
+/// /lock and /unlock would only update the TUI's own copy and
+/// every sub-agent dispatch landing on the daemon would see the
+/// daemon's stale default.
+fn sendSandbox(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    base_url: []const u8,
+    bearer: ?[]const u8,
+    mode: harness.agent_runner.SandboxMode,
+    path: []const u8,
+) !void {
+    var url_buf: [512]u8 = undefined;
+    const url = std.fmt.bufPrint(
+        &url_buf,
+        "{s}/sandbox",
+        .{base_url},
+    ) catch return error.UrlTooLong;
+
+    const mode_str: []const u8 = switch (mode) {
+        .unlocked => "unlocked",
+        .locked => "locked",
+        .plan => "plan",
+    };
+
+    const body = try std.json.Stringify.valueAlloc(allocator, .{
+        .mode = mode_str,
+        .path = path,
+    }, .{});
+    defer allocator.free(body);
+
+    _ = try http_client.send(
+        allocator,
+        io,
+        .{
+            .method = .POST,
+            .url = url,
+            .bearer = bearer,
+            .json_body = body,
+        },
         null,
         .{},
     );

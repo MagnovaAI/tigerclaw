@@ -510,11 +510,26 @@ pub const LiveAgentRunner = struct {
         .run = liveRun,
         .cancel = liveCancel,
         .counter = liveCounter,
+        .set_sandbox = liveSetSandbox,
     };
 
     fn liveCounter(ctx: *anyopaque) *harness.agent_runner.InFlightCounter {
         const self: *LiveAgentRunner = @ptrCast(@alignCast(ctx));
         return &self.in_flight;
+    }
+
+    fn liveSetSandbox(
+        ctx: *anyopaque,
+        mode: harness.agent_runner.SandboxMode,
+        path: []const u8,
+    ) anyerror!void {
+        const self: *LiveAgentRunner = @ptrCast(@alignCast(ctx));
+        // Translate the harness-level enum to our local one. The
+        // LiveAgentRunner predates the vtable slot and keeps its
+        // own definition; the values match by ordinal so a direct
+        // intCast/enumFromInt round-trip is safe.
+        const local_mode: SandboxMode = @enumFromInt(@intFromEnum(mode));
+        try self.setSandboxMode(local_mode, path);
     }
 
     fn liveCancel(ctx: *anyopaque, _: harness.agent_runner.TurnId) void {

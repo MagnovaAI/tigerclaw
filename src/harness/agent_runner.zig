@@ -325,6 +325,8 @@ pub const TurnError = error{
 
 pub const TurnId = u64;
 
+pub const SandboxMode = enum(u8) { unlocked = 0, locked = 1, plan = 2 };
+
 pub const VTable = struct {
     /// Run a single turn to completion. Returning the result synchronously.
     /// Streaming impls will use `runStreaming` (added in a later commit);
@@ -337,6 +339,14 @@ pub const VTable = struct {
     /// Exposing it through the vtable lets the dispatch and the
     /// drain path share a single counter across impls.
     counter: *const fn (ctx: *anyopaque) *InFlightCounter,
+    /// Set the file-tool sandbox mode the next tool call observes.
+    /// `path` is meaningful only for `.locked`; impls free their
+    /// existing copy and dupe the new one. The TUI calls this via
+    /// the gateway-runner adapter so /lock, /unlock, /plan reach
+    /// the daemon's LiveAgentRunner instance even though that
+    /// instance lives in a different process. Optional — impls
+    /// without sandbox semantics (mock, echo) leave it null.
+    set_sandbox: ?*const fn (ctx: *anyopaque, mode: SandboxMode, path: []const u8) anyerror!void = null,
 };
 
 pub const AgentRunner = struct {
@@ -353,6 +363,15 @@ pub const AgentRunner = struct {
 
     pub fn counter(self: AgentRunner) *InFlightCounter {
         return self.vtable.counter(self.ctx);
+    }
+
+    /// Forward a sandbox-mode change to the underlying impl.
+    /// Silently no-ops when the impl doesn't expose the optional
+    /// `set_sandbox` slot — keeps mock/echo implementations free
+    /// of stub boilerplate.
+    pub fn setSandbox(self: AgentRunner, mode: SandboxMode, path: []const u8) !void {
+        const fn_ptr = self.vtable.set_sandbox orelse return;
+        return fn_ptr(self.ctx, mode, path);
     }
 };
 

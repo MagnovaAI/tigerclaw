@@ -424,9 +424,26 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     defer root.deinit();
     root.wireSubmit();
     root.attachRunner(&agent_runner, &app);
+    // Forward sandbox toggles (/lock, /unlock, /plan) through the
+    // gateway HTTP runner so the daemon's in-process LiveAgentRunner
+    // adopts the same policy. Without this bridge the TUI's status
+    // bar would say "unlocked" while the daemon — which actually
+    // dispatches every tool — kept whatever sandbox state it
+    // booted with. Ask-gate has no gateway endpoint today, so we
+    // wire a no-op for that slot; the gateway runner's defaults
+    // are what tools see.
+    root.attachSandbox(&agent_runner, gatewaySandboxAdapter, gatewayAskGateNoop);
 
     try app.run(root.widget(), .{});
 }
+
+fn gatewaySandboxAdapter(ctx: *anyopaque, mode: u8, path: []const u8) void {
+    const runner: *harness.AgentRunner = @ptrCast(@alignCast(ctx));
+    const m: harness.agent_runner.SandboxMode = @enumFromInt(mode);
+    runner.setSandbox(m, path) catch {};
+}
+
+fn gatewayAskGateNoop(_: *anyopaque, _: bool) void {}
 
 fn sandboxAdapter(ctx: *anyopaque, mode: u8, path: []const u8) void {
     const live: *live_runner.LiveAgentRunner = @ptrCast(@alignCast(ctx));

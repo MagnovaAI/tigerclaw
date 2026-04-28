@@ -129,6 +129,7 @@ pub const routes = [_]router.Route{
     .{ .method = .POST, .pattern = "/sessions/:id/messages", .tag = "sessions.message" },
     .{ .method = .POST, .pattern = "/sessions/:id/turns", .tag = "sessions.turn" },
     .{ .method = .DELETE, .pattern = "/sessions/:id/turns/current", .tag = "sessions.turn.cancel" },
+    .{ .method = .POST, .pattern = "/sandbox", .tag = "sandbox.set" },
     .{ .method = .GET, .pattern = "/instances", .tag = "instances.list" },
     .{ .method = .POST, .pattern = "/instances/register", .tag = "instances.register" },
     .{ .method = .POST, .pattern = "/instances/:id/heartbeat", .tag = "instances.heartbeat" },
@@ -145,6 +146,7 @@ pub const handlers = [_]dispatcher.HandlerEntry{
     .{ .tag = "sessions.message", .handler = sessionsMessageHandler },
     .{ .tag = "sessions.turn", .handler = sessionsTurnHandler },
     .{ .tag = "sessions.turn.cancel", .handler = sessionsTurnCancelHandler },
+    .{ .tag = "sandbox.set", .handler = sandboxSetHandler },
     .{ .tag = "instances.list", .handler = instancesListHandler },
     .{ .tag = "instances.register", .handler = instancesRegisterHandler },
     .{ .tag = "instances.heartbeat", .handler = instancesHeartbeatHandler },
@@ -829,6 +831,47 @@ fn sessionsTurnCancelHandler(
     // session→turn map so cancel reaches the right react loop. The
     // value zero is a sentinel for "current turn on this session".
     ctx.runner.cancel(0);
+    return .{ .status = .no_content };
+}
+
+/// POST /sandbox — set the file-tool sandbox mode on the gateway's
+/// runner. Body: `{"mode":"unlocked|locked|plan", "path":"..."}`.
+/// `path` is required only when `mode == "locked"` and is ignored
+/// otherwise. The TUI calls this every time the user issues
+/// `/lock`, `/unlock`, or `/plan` so the sub-agent workers running
+/// inside the gateway daemon see the same restriction the status
+/// bar advertises. Returns 204 on success, 400 on a malformed
+/// body, 500 if the underlying runner refused the change.
+fn sandboxSetHandler(
+    _: http.Request,
+    _: []const router.Param,
+    body: ?[]const u8,
+    _: dispatcher.StreamHook,
+) dispatcher.HandlerError!http.Response {
+    const ctx = try contextOrInternal();
+    const raw = body orelse return error.BadRequest;
+
+    const Args = struct {
+        mode: []const u8,
+        path: []const u8 = "",
+    };
+    var parsed = std.json.parseFromSlice(Args, std.heap.page_allocator, raw, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.BadRequest;
+    defer parsed.deinit();
+
+    const mode: harness.agent_runner.SandboxMode =
+        if (std.mem.eql(u8, parsed.value.mode, "unlocked"))
+        .unlocked
+    else if (std.mem.eql(u8, parsed.value.mode, "locked"))
+        .locked
+    else if (std.mem.eql(u8, parsed.value.mode, "plan"))
+        .plan
+    else
+        return error.BadRequest;
+
+    log.info("sandbox set mode={s} path_len={d}", .{ parsed.value.mode, parsed.value.path.len });
+    ctx.runner.setSandbox(mode, parsed.value.path) catch return error.InternalServerError;
     return .{ .status = .no_content };
 }
 
