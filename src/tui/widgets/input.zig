@@ -67,9 +67,12 @@ paste_buffer: std.ArrayList(u8) = .empty,
 /// instead of inlined into the buffer. The line threshold mirrors
 /// hermes-agent (5+ newlines) so multi-line code dumps collapse;
 /// the byte threshold catches single-line megablobs (minified JS,
-/// base64 data) before they explode the edit buffer.
+/// base64 data, paragraph-sized prose) before they explode the
+/// edit buffer. 512 bytes is roughly half a typical terminal row,
+/// which is the point at which inline display starts to wrap and
+/// the user can no longer Esc-clear the input by feel.
 const PASTE_LINE_THRESHOLD: usize = 5;
-const PASTE_BYTE_THRESHOLD: usize = 4 * 1024;
+const PASTE_BYTE_THRESHOLD: usize = 512;
 
 pub fn init(allocator: std.mem.Allocator) Input {
     return .{ .allocator = allocator };
