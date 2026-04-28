@@ -1601,11 +1601,23 @@ pub fn subturnFrame(
     invoker: []const u8,
     invoker_reply: []const u8,
 ) ![]u8 {
+    // Sub-turn frame. The instruction has to push the model to
+    // *do* whatever was asked rather than narrate a reply, because
+    // the agents' SOUL files frame sub-turn mode as "one paragraph,
+    // your audience is the inviter" — which Haiku-4.5 reads as
+    // "text-reply only" and skips tool execution. Without the
+    // explicit "if it needs tools, run them" clause, fan-outs that
+    // ask peers to actually do work end up with one peer running
+    // the tool and the other summarising.
     return std.fmt.allocPrint(
         allocator,
         "@{s} mentioned you in their reply to the user. " ++
-            "Their full reply follows. Respond to {s}; the user " ++
-            "will see your reply.\n\n---\n{s}",
+            "Their full reply follows. If their message asks you " ++
+            "to perform an action (run bash, read/write/edit a file, " ++
+            "search, fetch a URL, etc.), execute that action via the " ++
+            "appropriate tool — don't just describe what the action " ++
+            "would do. Otherwise, respond to {s} in one paragraph; " ++
+            "the user will see your reply either way.\n\n---\n{s}",
         .{ invoker, invoker, invoker_reply },
     );
 }
@@ -3413,7 +3425,7 @@ test "subturnFrame: includes invoker name twice and the verbatim reply" {
     defer testing.allocator.free(body);
     // Both the address and the imperative reference the invoker.
     try testing.expect(std.mem.indexOf(u8, body, "@tiger mentioned you") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "Respond to tiger") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "respond to tiger") != null);
     // Reply is appended verbatim after the separator.
     try testing.expect(std.mem.indexOf(u8, body, "---\nlet's ask sage") != null);
 }
@@ -3423,6 +3435,17 @@ test "subturnFrame: empty reply still produces a well-formed frame" {
     defer testing.allocator.free(body);
     // Must end with the separator + empty body — no trailing junk.
     try testing.expect(std.mem.endsWith(u8, body, "---\n"));
+}
+
+test "subturnFrame: includes the tool-execution clause" {
+    // Without this clause, peers like sage/bolt summarise rather
+    // than running the asked-for action when invoked as sub-turns.
+    // The explicit imperative is what flips Haiku-4.5 from text
+    // reply to tool dispatch on fan-out turns.
+    const body = try subturnFrame(testing.allocator, "tiger", "@bolt run sleep 20");
+    defer testing.allocator.free(body);
+    try testing.expect(std.mem.indexOf(u8, body, "execute that action via the") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "don't just describe") != null);
 }
 
 test "appendSubturnMarker: writes the chain line as a system row" {
