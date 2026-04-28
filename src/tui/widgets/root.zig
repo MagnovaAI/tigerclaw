@@ -2031,13 +2031,29 @@ fn eventHandler(
             try self.input.widget().handleEvent(ctx, event);
             return;
         },
-        // Bracketing markers themselves carry no payload; consume
-        // them so they don't propagate further.
+        // Bracketing markers — forward so the input widget can
+        // enter/exit its paste-accumulation mode. Between
+        // paste_start and paste_end, terminals send the pasted
+        // bytes as ordinary key_press events; the input widget
+        // batches those into one big paste so the stash-to-file
+        // threshold fires once at paste_end instead of inserting
+        // thousands of one-char inserts into the live edit buffer.
         .paste_start, .paste_end => {
+            try self.input.widget().handleEvent(ctx, event);
             ctx.consumeAndRedraw();
             return;
         },
         .key_press => |key| {
+            // Bracketed-paste body: between paste_start and
+            // paste_end every keystroke belongs to the paste, not
+            // to the user. Skip Root's chord/scrollback handling
+            // entirely so things like ESC, page-up, and Ctrl-C
+            // inside the pasted text don't fire chat actions.
+            if (self.input.in_bracketed_paste) {
+                try self.input.widget().handleEvent(ctx, event);
+                return;
+            }
+
             // Hard-quit chord: Ctrl-C / Ctrl-Q. Plain `q`
             // no longer quits now that the input box is live —
             // it's a valid character to type in a message.

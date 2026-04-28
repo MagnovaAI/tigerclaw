@@ -48,6 +48,20 @@ paste_io: ?std.Io = null,
 /// Monotonic per-session counter so successive stashes don't
 /// collide on identical wall-clock seconds.
 paste_counter: u32 = 0,
+/// True between `paste_start` and `paste_end` events. Most
+/// terminals deliver bracketed-paste content as a stream of
+/// individual key_press events between these two markers rather
+/// than as a coalesced `paste` event — Vaxis's parser leaves
+/// it that way too. Routing each char through the regular edit
+/// path defeats the stash-to-file logic and floods history with
+/// per-char redraws, so we instead append into `paste_buffer`
+/// while this is set and run the stash decision once at
+/// `paste_end`.
+in_bracketed_paste: bool = false,
+/// Bytes accumulated during a bracketed paste. Cleared on
+/// `paste_end` after the buffer is committed (either inlined or
+/// stashed). Owned heap buffer; freed in `deinit`.
+paste_buffer: std.ArrayList(u8) = .empty,
 
 /// Pastes at or above either threshold get stashed to a file
 /// instead of inlined into the buffer. The line threshold mirrors
@@ -63,6 +77,7 @@ pub fn init(allocator: std.mem.Allocator) Input {
 
 pub fn deinit(self: *Input) void {
     self.buf.deinit(self.allocator);
+    self.paste_buffer.deinit(self.allocator);
 }
 
 pub fn widget(self: *Input) vxfw.Widget {
@@ -80,7 +95,45 @@ fn eventHandler(
 ) anyerror!void {
     const self: *Input = @ptrCast(@alignCast(ptr));
     switch (event) {
-        .key_press => |key| try self.handleKey(ctx, key),
+        .paste_start => {
+            self.in_bracketed_paste = true;
+            self.paste_buffer.clearRetainingCapacity();
+            ctx.consumeAndRedraw();
+        },
+        .paste_end => {
+            self.in_bracketed_paste = false;
+            // Run the same stash-decision used for OSC52 pastes.
+            // Errors are non-fatal: a paste that fails to commit
+            // is dropped, and the buffer is cleared either way.
+            self.handlePaste(ctx, self.paste_buffer.items) catch |err| {
+                std.log.scoped(.tui_paste).warn(
+                    "bracketed-paste commit failed: {s}",
+                    .{@errorName(err)},
+                );
+            };
+            self.paste_buffer.clearRetainingCapacity();
+            ctx.consumeAndRedraw();
+        },
+        .key_press => |key| {
+            // During bracketed paste, every key_press is a byte of
+            // the pasted content, not user typing. Append to the
+            // accumulator; commit on `paste_end`.
+            if (self.in_bracketed_paste) {
+                if (key.text) |txt| {
+                    self.paste_buffer.appendSlice(self.allocator, txt) catch {};
+                } else if (key.codepoint == 13 or key.codepoint == 10) {
+                    // Newline keys mid-paste — terminals deliver
+                    // pasted line breaks as bare CR/LF without a
+                    // `text` field. Translate to '\n' so the
+                    // stash threshold and placeholder line count
+                    // match what was actually pasted.
+                    self.paste_buffer.append(self.allocator, '\n') catch {};
+                }
+                ctx.consumeAndRedraw();
+                return;
+            }
+            try self.handleKey(ctx, key);
+        },
         .paste => |text| {
             // OSC52 paste payload, allocated by vaxis's Parser via
             // the system_clipboard_allocator (the App's allocator,
