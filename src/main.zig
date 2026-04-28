@@ -680,23 +680,28 @@ fn runTuiLocal(arena: std.mem.Allocator, io: std.Io, init: std.process.Init, deb
     // `omkarbhad`) is technically resolvable here but reads as a
     // login id rather than a name.
     //
-    // The TUI runs on `page_allocator`, NOT the process arena.
+    // The TUI runs on libc's `c_allocator`, NOT the process arena.
     // The arena never reclaims memory (free is a no-op), so a
     // long session with thousands of streamed chunks, tool rows,
     // paste buffers, and per-agent pending-line keys would
-    // steadily climb until the process OOM'd. Field reports of
-    // "OOM after some agent action" trace back to that. We use
-    // `page_allocator` rather than `smp_allocator` because the
-    // SMP allocator routes large requests through PageAllocator
-    // anyway and we observed at least one startup OOM on macOS
-    // with smp_allocator that page_allocator survives — the
-    // small-allocation overhead is acceptable for an interactive
-    // TUI. The arena stays around for short-lived setup data the
-    // TUI doesn't manage itself (errno strings, transient JSON
-    // parsing buffers in the CLI entry path). Errors out of
-    // `tui.run` still report through the arena because the tty
-    // may be in a half-broken state.
-    tui.run(std.heap.page_allocator, io, .{
+    // steadily climb until the process OOM'd.
+    //
+    // Earlier attempts:
+    //   - smp_allocator: hit a startup OOM in at least one
+    //     terminal/macOS combo before the first frame.
+    //   - page_allocator: every alloc rounds up to one page
+    //     (16 KiB on Apple Silicon). Hundreds of tiny chunk
+    //     dupes during a streamed CV mid-message OOM'd a 16 GB
+    //     machine because each ~32-byte agent-name dupe
+    //     consumed a full page.
+    //
+    // c_allocator wraps libc malloc/free, which has a proper
+    // small-allocation fast path (arenas, size classes, free
+    // lists) and handles arbitrary sizes through mmap when
+    // requests get big. Tigerclaw already links libc. The arena
+    // stays around for short-lived setup data the TUI doesn't
+    // manage itself (errno strings on TUI bail).
+    tui.run(std.heap.c_allocator, io, .{
         .home = home,
         .user_name = "Omkar",
         .debug = debug,
