@@ -118,7 +118,7 @@ thinking: Thinking = .{},
 /// Hint strip above the input. Texts are short borrowed slices
 /// — owned by the widget when literal, owned by the Root when
 /// dynamic.
-hint: Hint = .{ .left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit", .right = "" },
+hint: Hint = .{ .left = "", .right = "" },
 /// Status bar below the input. Values reset to sensible defaults;
 /// the agent name lives in the model line so the workspace and
 /// sandbox columns stay focused on environment context.
@@ -430,7 +430,7 @@ fn onSubmit(ctx: ?*anyopaque, text: []const u8) void {
         self.endPendingReply();
         self.appendUserLine(text) catch {};
         self.ask_user_pending.store(false, .seq_cst);
-        self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
+        self.hint.left = "";
         return;
     }
 
@@ -2289,7 +2289,7 @@ fn eventHandler(
                     self.pending_reply = null;
                     self.endPendingReply();
                     if (!self.thinking.stopping) {
-                        self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
+                        self.hint.left = "";
                     }
                 }
                 ctx.consumeAndRedraw();
@@ -2760,7 +2760,7 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         if (self.pending_reply) |slot| self.allocator.free(slot);
         self.pending_reply = null;
         self.endPendingReply();
-        self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
+        self.hint.left = "";
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_usage)) {
         const p: *const UsagePayload = @ptrCast(@alignCast(ue.data.?));
@@ -2832,7 +2832,7 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         self.thinking.stopping = false;
         self.status_bar.turn_stopping = false;
         self.turn_started_ms = 0;
-        self.hint.left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit";
+        self.hint.left = "";
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_subturn_timeout)) {
         const data = ue.data orelse return;
