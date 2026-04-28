@@ -82,11 +82,26 @@ fn eventHandler(
     switch (event) {
         .key_press => |key| try self.handleKey(ctx, key),
         .paste => |text| {
-            // Bracketed-paste payloads land here as a single coalesced
-            // event (see vaxis Parser). Free the parser-allocated text
-            // when we're done with it; the buffer keeps its own copy.
-            defer self.allocator.free(text);
-            try self.handlePaste(ctx, text);
+            // OSC52 paste payload, allocated by vaxis's Parser via
+            // the system_clipboard_allocator (the App's allocator,
+            // which is the process arena in tigerclaw's case).
+            // We deliberately do NOT free it: in an arena `free` is
+            // a no-op, and forwarding through to the arena's free
+            // path on a corrupt slice (observed once during a giant
+            // multi-paste storm) is what the segfault crawled out
+            // of. The arena reclaims everything at process exit.
+            //
+            // We also guard handlePaste against obviously-bogus
+            // slices — the queue's tag should keep them clean, but
+            // a sanity check costs nothing and avoids dragging the
+            // whole TUI down on a one-in-a-thousand event-union
+            // mishap.
+            self.handlePaste(ctx, text) catch |err| {
+                std.log.scoped(.tui_paste).warn(
+                    "paste handler failed: {s}",
+                    .{@errorName(err)},
+                );
+            };
         },
         else => {},
     }
@@ -99,6 +114,19 @@ fn eventHandler(
 /// contents (or pass the path through to a tool like `read_file`).
 fn handlePaste(self: *Input, ctx: *vxfw.EventContext, text: []const u8) !void {
     if (text.len == 0) return;
+    // Sanity-check the slice before reading. A wildly-out-of-range
+    // pointer with a plausible-looking length is the symptom we saw
+    // in the field — most likely a torn read on the queued event
+    // union. Cap pastes at 16 MiB; anything bigger is almost
+    // certainly a corrupt slice or a hostile/runaway clipboard,
+    // and either way we don't want to walk it with `mem.count`.
+    if (text.len > 16 * 1024 * 1024) {
+        std.log.scoped(.tui_paste).warn(
+            "rejecting paste with implausible len={d}",
+            .{text.len},
+        );
+        return;
+    }
     const newlines = std.mem.count(u8, text, "\n");
     const should_stash = self.paste_dir != null and self.paste_io != null and
         (newlines >= PASTE_LINE_THRESHOLD or text.len >= PASTE_BYTE_THRESHOLD);
