@@ -34,6 +34,7 @@ const Input = @import("input.zig");
 const Thinking = @import("thinking.zig");
 const Hint = @import("hint.zig");
 const StatusBar = @import("status_bar.zig");
+const UpperStatusBar = @import("upper_status_bar.zig");
 const mention = @import("../mention.zig");
 
 /// Side-channel logger for the cross-agent dispatch state machine.
@@ -122,6 +123,12 @@ hint: Hint = .{ .left = "↑↓ scroll  ·  ctrl-b expand tools  ·  ctrl-c quit
 /// the agent name lives in the model line so the workspace and
 /// sandbox columns stay focused on environment context.
 status_bar: StatusBar = .{},
+/// Live upper status bar — pinned just above the input. Shows
+/// one row per agent that has a tool in flight (`tiger: running
+/// zig build`). Hidden when no tools are active so the input row
+/// hugs the chat. Populated per-frame from the running tool
+/// lines in `history`.
+upper_status_bar: UpperStatusBar = .{},
 /// Wall-clock instant the current turn started, in ms since
 /// the Unix epoch. 0 when no turn is in flight.
 turn_started_ms: i64 = 0,
@@ -2893,6 +2900,28 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     const thinking_rows: u16 = if (self.thinking.pending) 1 else 0;
     const hint_rows: u16 = if (self.hint.left.len > 0 or self.hint.right.len > 0) 1 else 0;
 
+    // Upper status bar — one entry per running tool. Built per
+    // frame from the live history so it stays in sync without
+    // duplicating bookkeeping. Hidden when nothing is in flight.
+    const upper_status_entries: []UpperStatusBar.Entry = blk: {
+        var collected: std.ArrayList(UpperStatusBar.Entry) = .empty;
+        for (self.history.items) |*line| {
+            if (line.role != .tool) continue;
+            if (line.tool_status != .running) continue;
+            const name = line.tool_name orelse continue;
+            const speaker = line.speaker orelse continue;
+            try collected.append(ctx.arena, .{
+                .agent = speaker,
+                .verb = UpperStatusBar.verbFor(name),
+                .target = line.tool_args orelse "",
+            });
+        }
+        break :blk collected.items;
+    };
+    const upper_status_rows: u16 = UpperStatusBar.rowsFor(upper_status_entries.len);
+    self.upper_status_bar.entries = upper_status_entries;
+    self.upper_status_bar.spinner_tick = self.thinking.spinner_tick;
+
     // Slash-command popup. Visible whenever the input buffer
     // starts with `/`. Items computed once per frame from the
     // arena so we don't allocate on the heap from drawFn.
@@ -2922,10 +2951,10 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     // above the chat. It now scrolls with history as `.banner` rows
     // injected once at startup, so the only top-stack row is the
     // chat surface itself.
-    const bottom_stack: u16 = thinking_rows + hint_rows + input_rows + status_rows + trailing_rows;
+    const bottom_stack: u16 = thinking_rows + hint_rows + upper_status_rows + input_rows + status_rows + trailing_rows;
     const history_rows: u16 = if (height > bottom_stack) height - bottom_stack else 0;
 
-    const children = try ctx.arena.alloc(vxfw.SubSurface, 6);
+    const children = try ctx.arena.alloc(vxfw.SubSurface, 7);
     const surface = try vxfw.Surface.initWithChildren(
         ctx.arena,
         self.widget(),
@@ -2974,6 +3003,18 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
         cur_row += hint_rows;
     }
 
+    // Upper status bar — live tool state, one row per agent that
+    // has a tool in flight. Hidden (zero height) when no tools
+    // are running, so the input snaps back up to the hint row.
+    {
+        const s = try self.upper_status_bar.widget().draw(ctx.withConstraints(
+            .{ .width = 0, .height = 0 },
+            .{ .width = width, .height = upper_status_rows },
+        ));
+        surface.children[3] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
+        cur_row += upper_status_rows;
+    }
+
     // Input panel spans full width, edge to edge. The visual
     // breathing room on the sides comes from the terminal window's
     // own padding, not from an explicit widget inset.
@@ -2982,7 +3023,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
             .{ .width = 0, .height = 0 },
             .{ .width = width, .height = input_rows },
         ));
-        surface.children[3] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
+        surface.children[4] = .{ .origin = .{ .row = cur_row, .col = 0 }, .surface = s, .z_index = 0 };
         cur_row += input_rows;
     }
 
@@ -3012,7 +3053,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
             .{ .width = 0, .height = 0 },
             .{ .width = width, .height = status_rows },
         ));
-        surface.children[4] = .{ .origin = .{ .row = status_origin, .col = 0 }, .surface = s, .z_index = 0 };
+        surface.children[5] = .{ .origin = .{ .row = status_origin, .col = 0 }, .surface = s, .z_index = 0 };
     }
 
     // Slash-command popup below the status bar. When the menu is
@@ -3023,7 +3064,7 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
             .{ .width = 0, .height = 0 },
             .{ .width = width, .height = menu_rows },
         ));
-        surface.children[5] = .{ .origin = .{ .row = status_origin + status_rows, .col = 0 }, .surface = s, .z_index = 0 };
+        surface.children[6] = .{ .origin = .{ .row = status_origin + status_rows, .col = 0 }, .surface = s, .z_index = 0 };
     }
 
     return surface;
