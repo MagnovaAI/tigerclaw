@@ -433,6 +433,17 @@ pub fn build(b: *std.Build) void {
     const clock_tests = b.addTest(.{ .root_module = clock_mod });
     test_step.dependOn(&b.addRunArtifact(clock_tests).step);
 
+    const session_key_mod = b.addModule("session_key", .{
+        .root_source_file = b.path("src/session/key.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tigerclaw_mod.addImport("session_key", session_key_mod);
+    exe_mod.addImport("session_key", session_key_mod);
+    unit_mod.addImport("session_key", session_key_mod);
+    const session_key_tests = b.addTest(.{ .root_module = session_key_mod });
+    test_step.dependOn(&b.addRunArtifact(session_key_tests).step);
+
     const ctx_types_mod = b.addModule("ctx_types", .{
         .root_source_file = b.path("src/context/types.zig"),
         .target = target,
