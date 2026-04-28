@@ -2022,17 +2022,21 @@ fn findSubturnSlot(
     target: []const u8,
     mention_idx: u8,
 ) ?*SubturnSlot {
+    _ = invoker;
     for (self.subturn_slots.items) |*slot| {
         if (slot.state != .in_flight) continue;
         if (slot.mention_idx != mention_idx) continue;
         if (!std.ascii.eqlIgnoreCase(slot.target, target)) continue;
-        // The invoker is implicit — there's only one fan-out tree
-        // in flight per user-turn — but matching it explicitly
-        // makes the lookup robust against any future change that
-        // allows nested invocations.
-        if (self.invoker_to_resume) |inv| {
-            if (!std.ascii.eqlIgnoreCase(inv, invoker)) continue;
-        }
+        // The earlier code also matched the slot's invoker against
+        // `invoker_to_resume`. That broke cascading sub-turns: when
+        // sage's reply mentioned @bolt, bolt's worker fired with
+        // invoker="sage", but `invoker_to_resume` was "tiger" (the
+        // top-of-tree). The lookup missed, the slot stayed
+        // `.in_flight` forever, and the upper status bar kept
+        // showing `bolt: thinking` long after bolt finished. The
+        // (target, mention_idx) pair already keys uniquely within
+        // a fan-out tree; the invoker check was redundant
+        // belt-and-braces that broke cascades.
         return slot;
     }
     return null;
