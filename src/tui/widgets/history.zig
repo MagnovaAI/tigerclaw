@@ -358,8 +358,23 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
 
     // First screen row that holds content. When total_rows < height
     // we leave the top of the pane blank so the newest line still
-    // sits at the bottom row.
-    const screen_first_row: u32 = if (viewport_bottom < height) height - viewport_bottom else 0;
+    // sits at the bottom row — that's the chat-log default.
+    //
+    // Exception: pre-conversation, when the only rows are the
+    // startup banner + welcome system line, anchor to the top so
+    // the wordmark reads as a header instead of floating at the
+    // bottom of an otherwise-empty pane. The first user/agent
+    // turn flips us back to bottom-anchored chat-log behaviour.
+    const has_chat = blk: {
+        for (self.lines) |*l| {
+            if (l.role == .user or l.role == .agent or l.role == .tool) break :blk true;
+        }
+        break :blk false;
+    };
+    const screen_first_row: u32 = if (viewport_bottom < height and has_chat)
+        height - viewport_bottom
+    else
+        0;
 
     // Pass 2: paint each visible row.
     var screen_row: u16 = @intCast(screen_first_row);
