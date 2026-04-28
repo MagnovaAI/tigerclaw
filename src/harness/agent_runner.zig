@@ -231,13 +231,53 @@ pub const ToolEventSink = *const fn (
     event: ToolEvent,
 ) void;
 
+/// How a turn entered the runner. The TUI uses this to discriminate
+/// `ue_done` events instead of inferring from a counter, since cross-agent
+/// auto-dispatch can have a sub-turn complete while a primary turn is still
+/// streaming.
+pub const DispatchKind = enum {
+    /// User-typed message (or runtime-equivalent first turn).
+    primary,
+    /// Auto-dispatched because another agent's reply mentioned this one.
+    /// `invoker` names the inviting agent.
+    subturn,
+    /// The invoker resuming after its sub-turns joined. Re-scans for new
+    /// mentions just like `primary`.
+    resume_,
+};
+
 pub const TurnRequest = struct {
     /// Opaque session identifier. Concrete impls may parse this into
     /// a (`agent_name`, `channel_id`, `conversation_key`) triple.
+    /// **Deprecated** — new code should set `conversation_id` and
+    /// `target_agent` directly. Routing layers will fall back to this
+    /// field while callers migrate.
     session_id: []const u8,
+    /// Conversation this turn belongs to. Defaults to `"default"` while
+    /// the TUI runs a single conversation; persistence and routing must
+    /// not assume this stays a literal.
+    conversation_id: []const u8 = "default",
+    /// Agent that should run the turn. When empty, routing falls back to
+    /// `session_id`.
+    target_agent: []const u8 = "",
     /// User-facing message; the runner is free to augment with
     /// system prompts, tool results, etc.
     input: []const u8,
+    /// Monotonic counter the UI bumps on every user submit. Echoed on
+    /// every event the runner posts back so the UI can drop stale
+    /// fragments after a reset (cancellations, sub-turn timeouts).
+    /// Zero means "not tagged" — runners must not invent values.
+    turn_epoch: u64 = 0,
+    /// Whether this turn is a primary, sub-turn, or resume. Used by the
+    /// TUI's auto-dispatch state machine; runners just echo it.
+    dispatch_kind: DispatchKind = .primary,
+    /// For `subturn`: the agent whose reply triggered this dispatch.
+    /// Null otherwise.
+    invoker: ?[]const u8 = null,
+    /// For `subturn`: the position of this mention in the invoker's
+    /// reply (left-to-right). The join step uses this to order sub-turn
+    /// replies deterministically. Zero for `primary`/`resume`.
+    mention_order_idx: u8 = 0,
     /// Optional per-turn text sink. When set, the runner fires
     /// `stream_sink(stream_sink_ctx, fragment)` for every text
     /// fragment the provider streams back. The slice is borrowed
@@ -263,6 +303,14 @@ pub const TurnResult = struct {
     /// zeros; impls that don't surface usage (mock, echo) leave it
     /// untouched and the consumer treats that as "unknown".
     usage: types.TokenUsage = .{},
+    /// Echoed from the originating `TurnRequest`. The UI uses these to
+    /// discriminate auto-dispatch events from primary ones and to drop
+    /// stale results after a `turn_epoch` reset.
+    turn_epoch: u64 = 0,
+    dispatch_kind: DispatchKind = .primary,
+    invoker: ?[]const u8 = null,
+    target_agent: []const u8 = "",
+    mention_order_idx: u8 = 0,
 };
 
 pub const TurnError = error{
@@ -344,7 +392,15 @@ fn mockRun(ctx: *anyopaque, req: TurnRequest) TurnError!TurnResult {
     // The mock does not allocate; it returns a slice that aliases the
     // input. The real impl will return an owned string; both shapes
     // fit `[]const u8` in `TurnResult`.
-    return .{ .output = req.input, .completed = true };
+    return .{
+        .output = req.input,
+        .completed = true,
+        .turn_epoch = req.turn_epoch,
+        .dispatch_kind = req.dispatch_kind,
+        .invoker = req.invoker,
+        .target_agent = if (req.target_agent.len != 0) req.target_agent else req.session_id,
+        .mention_order_idx = req.mention_order_idx,
+    };
 }
 
 fn mockCancel(_: *anyopaque, _: TurnId) void {}

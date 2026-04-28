@@ -262,7 +262,15 @@ const StubRunner = struct {
         self.last_session = req.session_id;
         self.last_input = req.input;
         if (self.fail) return agent_runner.TurnError.InternalError;
-        return .{ .output = self.canned_reply, .completed = true };
+        return .{
+            .output = self.canned_reply,
+            .completed = true,
+            .turn_epoch = req.turn_epoch,
+            .dispatch_kind = req.dispatch_kind,
+            .invoker = req.invoker,
+            .target_agent = if (req.target_agent.len != 0) req.target_agent else req.session_id,
+            .mention_order_idx = req.mention_order_idx,
+        };
     }
     fn cancelFn(_: *anyopaque, _: agent_runner.TurnId) void {}
     fn counterFn(ctx: *anyopaque) *agent_runner.InFlightCounter {

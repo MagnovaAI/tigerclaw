@@ -249,6 +249,11 @@ pub const RealRunner = struct {
             .output = final,
             .completed = out.reason == .model_finished,
             .usage = out.usage,
+            .turn_epoch = req.turn_epoch,
+            .dispatch_kind = req.dispatch_kind,
+            .invoker = req.invoker,
+            .target_agent = if (req.target_agent.len != 0) req.target_agent else req.session_id,
+            .mention_order_idx = req.mention_order_idx,
         };
     }
 
