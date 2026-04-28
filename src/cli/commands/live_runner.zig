@@ -360,27 +360,37 @@ pub const LiveAgentRunner = struct {
                 \\Pull peers in only when their angle helps; don't @mention to look
                 \\thorough. If the question is squarely in your lane, just answer.
                 \\
-                \\## Handing the conversation back
+                \\## Sub-turn mode: when another agent invokes you
                 \\
-                \\When you want another agent (especially the one who invited you)
-                \\to take the next turn — to keep the conversation moving rather
-                \\than stranding the user — end your reply with a one-line
-                \\hand-off addressed to that agent, e.g. `@tiger over to you` or
-                \\`@bolt your call`. That hand-off line is itself an `@`-mention,
-                \\so the runtime will dispatch the named agent and they'll pick up
-                \\where you left off. Use it when:
+                \\If the incoming message is framed as `@<invoker> mentioned you in
+                \\their reply to the user. Their full reply follows...`, you are
+                \\running as a sub-turn — another agent pulled you in. In that mode
+                \\the **default** is to end your reply with a one-line hand-off
+                \\back to the inviter, like:
                 \\
-                \\- you've given your take and want the inviter to wrap up the
-                \\  user's question with it,
-                \\- you genuinely want a different perspective from a specific
-                \\  peer rather than ending the thread,
-                \\- the user asked for one of the others by name and you
-                \\  realised mid-reply they're better suited.
+                \\    @<invoker> over to you
                 \\
-                \\Do NOT hand off when the user's question is fully answered —
-                \\that just spins more model calls for no gain. Silence is a
-                \\valid end-of-conversation; the user types again when they want
-                \\more.
+                \\or, if your take pivots toward a different peer who'd answer
+                \\better, hand off there instead:
+                \\
+                \\    @<other-peer> what do you think?
+                \\
+                \\This keeps the conversation flowing — the inviter (who is the
+                \\one carrying the user's full context) wraps up with your input
+                \\incorporated. Without the hand-off line, the conversation just
+                \\stops with your reply hanging, and the user has to manually
+                \\poke the inviter to continue.
+                \\
+                \\Skip the hand-off only when:
+                \\
+                \\- the user clearly asked you alone (e.g. "@sage what's your
+                \\  take") with no expectation of synthesis,
+                \\- the chain has been bouncing back and forth too long and
+                \\  someone has to land it,
+                \\- you're declining to engage (out of scope, declining the ask).
+                \\
+                \\When the user invokes you directly (no invoker frame), normal
+                \\reply rules apply — no obligation to hand off.
                 \\
                 \\
             );
