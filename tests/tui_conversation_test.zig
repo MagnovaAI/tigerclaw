@@ -35,13 +35,17 @@ fn makeCtx(allocator: std.mem.Allocator) vxfw.EventContext {
 
 fn postChunk(root: *Root, ctx: *vxfw.EventContext, text: []const u8) !void {
     const payload = try root.allocator.create(Root.ChunkPayload);
-    payload.* = .{ .text = try root.allocator.dupe(u8, text) };
+    payload.* = .{
+        .epoch = root.turn_epoch,
+        .text = try root.allocator.dupe(u8, text),
+    };
     try root.handleUserEvent(ctx, .{ .name = Root.ue_chunk, .data = payload });
 }
 
 fn postToolStart(root: *Root, ctx: *vxfw.EventContext, id: []const u8, name: []const u8) !void {
     const payload = try root.allocator.create(Root.ToolStartPayload);
     payload.* = .{
+        .epoch = root.turn_epoch,
         .id = try root.allocator.dupe(u8, id),
         .name = try root.allocator.dupe(u8, name),
         .args_summary = try root.allocator.dupe(u8, ""),
@@ -52,6 +56,7 @@ fn postToolStart(root: *Root, ctx: *vxfw.EventContext, id: []const u8, name: []c
 fn postToolDone(root: *Root, ctx: *vxfw.EventContext, id: []const u8, name: []const u8, output: []const u8) !void {
     const payload = try root.allocator.create(Root.ToolDonePayload);
     payload.* = .{
+        .epoch = root.turn_epoch,
         .id = try root.allocator.dupe(u8, id),
         .name = try root.allocator.dupe(u8, name),
         .output = try root.allocator.dupe(u8, output),
@@ -61,7 +66,9 @@ fn postToolDone(root: *Root, ctx: *vxfw.EventContext, id: []const u8, name: []co
 }
 
 fn postDone(root: *Root, ctx: *vxfw.EventContext) !void {
-    try root.handleUserEvent(ctx, .{ .name = Root.ue_done, .data = null });
+    const payload = try root.allocator.create(Root.EmptyPayload);
+    payload.* = .{ .epoch = root.turn_epoch };
+    try root.handleUserEvent(ctx, .{ .name = Root.ue_done, .data = payload });
 }
 
 test "tui: chunk-only turn appends a single agent line" {
@@ -174,6 +181,44 @@ test "tui: duplicate tool_start with same id is idempotent" {
 
     try testing.expectEqual(@as(usize, 1), root.history.items.len);
     try testing.expectEqual(tigerclaw.tui.Line.Role.tool, root.history.items[0].role);
+}
+
+/// Post a chunk stamped with an explicit epoch — used to simulate a
+/// late event from a cancelled or superseded turn. The handler is
+/// expected to drop and free it without touching history.
+fn postChunkAtEpoch(root: *Root, ctx: *vxfw.EventContext, text: []const u8, epoch: u64) !void {
+    const payload = try root.allocator.create(Root.ChunkPayload);
+    payload.* = .{
+        .epoch = epoch,
+        .text = try root.allocator.dupe(u8, text),
+    };
+    try root.handleUserEvent(ctx, .{ .name = Root.ue_chunk, .data = payload });
+}
+
+test "tui: stale chunk after epoch bump does not mutate history" {
+    var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    root.tool_output_enabled = true;
+    defer root.deinit();
+
+    var ctx = makeCtx(testing.allocator);
+    defer ctx.cmds.deinit(testing.allocator);
+
+    // Simulate a fresh user turn: bump epoch the way `beginTurn` does.
+    root.turn_epoch +%= 1;
+    const live_epoch = root.turn_epoch;
+
+    // A stale chunk from the *previous* turn arrives. It must be
+    // dropped silently — the leak detector catches the inner free,
+    // and the assertion below catches the would-be transcript bleed.
+    try postChunkAtEpoch(&root, &ctx, "stale text", live_epoch -% 1);
+    try testing.expectEqual(@as(usize, 0), root.history.items.len);
+
+    // A fresh chunk on the live epoch lands normally.
+    try postChunkAtEpoch(&root, &ctx, "live text", live_epoch);
+    try testing.expectEqual(@as(usize, 1), root.history.items.len);
+    try testing.expectEqualStrings("live text", root.history.items[0].text.items);
+
+    try postDone(&root, &ctx);
 }
 
 test "tui: empty turn (done with no chunks and no tools) leaves history empty" {

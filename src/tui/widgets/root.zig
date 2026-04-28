@@ -60,6 +60,13 @@ turn_started_ms: i64 = 0,
 /// every tool line so the renderer can group siblings into a
 /// single `├─` / `└─` tree per turn.
 current_turn_id: u32 = 0,
+/// Generation number bumped on every user submit. Worker threads
+/// stamp it on every event payload they post; the main loop drops
+/// any payload whose epoch differs from the current value. Without
+/// this, late events from a cancelled or superseded turn (slow
+/// provider reply, sub-turn timeout race) would mutate transcript
+/// state belonging to a fresh turn.
+turn_epoch: u64 = 0,
 /// Borrowed runner. Set by \`attachRunner\` before \`App.run\`;
 /// null during tests that don't spin up a real runner.
 runner: ?*harness.AgentRunner = null,
@@ -476,7 +483,14 @@ pub fn askUserPost(self: *Root, allocator: std.mem.Allocator, question: []const 
     const app = self.app orelse return error.NoApp;
     const payload = try allocator.create(AskUserPayload);
     errdefer allocator.destroy(payload);
-    payload.* = .{ .question = try allocator.dupe(u8, question) };
+    // Read `turn_epoch` directly from `Root` — this entry point is
+    // not threaded through `WorkerCtx`. Racing with a fresh user
+    // submit is fine: a stale epoch just means `dropStaleIfNeeded`
+    // discards the question on the receiving side.
+    payload.* = .{
+        .epoch = self.turn_epoch,
+        .question = try allocator.dupe(u8, question),
+    };
     const loop = app.loop orelse return error.NoLoop;
     loop.postEvent(.{ .app = .{ .name = ue_ask_user, .data = payload } });
 }
@@ -663,19 +677,34 @@ pub const ue_ask_user = "tui.ask_user";
 pub const ue_ask_user_cancel = "tui.ask_user_cancel";
 pub const ue_usage = "tui.usage";
 
-pub const ChunkPayload = struct { text: []u8 };
-pub const AskUserPayload = struct { question: []u8 };
-pub const ToolStartPayload = struct { id: []u8, name: []u8, args_summary: []u8 };
+// Every event payload carries the `turn_epoch` it was produced
+// under. The main-loop handler drops payloads whose epoch no longer
+// matches `Root.turn_epoch`, so a late chunk from a cancelled turn
+// can't bleed into a fresh transcript. `ue_done` (which posts a
+// null payload) is special-cased — see `EmptyPayload`.
+pub const ChunkPayload = struct { epoch: u64, text: []u8 };
+pub const AskUserPayload = struct { epoch: u64, question: []u8 };
+pub const ToolStartPayload = struct { epoch: u64, id: []u8, name: []u8, args_summary: []u8 };
 pub const ToolProgressPayload = struct {
+    epoch: u64,
     id: []u8,
     /// stdout=0, stderr=1. We don't render the two streams differently
     /// today, but the field is here so a future colour pass can use it.
     stream: u8,
     chunk: []u8,
 };
-pub const ToolDonePayload = struct { id: []u8, name: []u8, output: []u8, is_error: bool };
-pub const ErrorPayload = struct { message: []u8 };
-pub const UsagePayload = struct { ctx_used: u64 };
+pub const ToolDonePayload = struct {
+    epoch: u64,
+    id: []u8,
+    name: []u8,
+    output: []u8,
+    is_error: bool,
+};
+pub const ErrorPayload = struct { epoch: u64, message: []u8 };
+pub const UsagePayload = struct { epoch: u64, ctx_used: u64 };
+/// Carries just an epoch — used by `ue_done` so the handler can
+/// drop stale completions the same way it drops stale chunks.
+pub const EmptyPayload = struct { epoch: u64 };
 
 /// Context the worker thread carries. Allocated on heap;
 /// worker frees on exit.
@@ -685,6 +714,11 @@ const WorkerCtx = struct {
     app: *vxfw.App,
     message: []u8,
     session_id: []const u8,
+    /// Snapshot of `Root.turn_epoch` at spawn time. Stamped on
+    /// every payload this worker posts so stale events from a
+    /// cancelled or superseded turn can be discarded by the
+    /// main-loop handler without touching transcript state.
+    epoch: u64,
 };
 
 /// Case-insensitive lookup against the registered agent set.
@@ -750,6 +784,7 @@ fn beginTurnWithEcho(self: *Root, echo: []const u8, body: []const u8) !void {
     self.thinking.elapsed_ms = 0;
     self.turn_started_ms = vxfw.milliTimestamp();
     self.current_turn_id +%= 1;
+    self.turn_epoch +%= 1;
 
     // Note: we do NOT kick the tick chain via `app.loop.postEvent(.tick)`
     // here — App.run holds the queue mutex while iterating drained events,
@@ -771,6 +806,7 @@ fn beginTurnWithEcho(self: *Root, echo: []const u8, body: []const u8) !void {
         .app = app,
         .message = message_copy,
         .session_id = self.session_id,
+        .epoch = self.turn_epoch,
     };
     _ = runner;
 
@@ -792,7 +828,9 @@ fn workerMain(ctx: *WorkerCtx) void {
 
     const result = runner.run(.{
         .session_id = ctx.session_id,
+        .target_agent = ctx.session_id,
         .input = ctx.message,
+        .turn_epoch = ctx.epoch,
         .stream_sink = chunkSink,
         .stream_sink_ctx = @ptrCast(ctx),
         .tool_event_sink = toolEventSink,
@@ -813,7 +851,7 @@ fn workerMain(ctx: *WorkerCtx) void {
 
 fn postUsage(ctx: *WorkerCtx, ctx_used: u64) void {
     const payload = ctx.allocator.create(UsagePayload) catch return;
-    payload.* = .{ .ctx_used = ctx_used };
+    payload.* = .{ .epoch = ctx.epoch, .ctx_used = ctx_used };
     postUserEvent(ctx, ue_usage, payload);
 }
 
@@ -825,10 +863,13 @@ fn postUsage(ctx: *WorkerCtx, ctx_used: u64) void {
 fn chunkSink(sink_ctx: ?*anyopaque, fragment: []const u8) void {
     const ctx: *WorkerCtx = @ptrCast(@alignCast(sink_ctx.?));
     const payload = ctx.allocator.create(ChunkPayload) catch return;
-    payload.* = .{ .text = ctx.allocator.dupe(u8, fragment) catch {
-        ctx.allocator.destroy(payload);
-        return;
-    } };
+    payload.* = .{
+        .epoch = ctx.epoch,
+        .text = ctx.allocator.dupe(u8, fragment) catch {
+            ctx.allocator.destroy(payload);
+            return;
+        },
+    };
     postUserEvent(ctx, ue_chunk, payload);
 }
 
@@ -841,6 +882,7 @@ fn toolEventSink(
         .started => |s| {
             const payload = ctx.allocator.create(ToolStartPayload) catch return;
             payload.* = .{
+                .epoch = ctx.epoch,
                 .id = ctx.allocator.dupe(u8, s.id) catch {
                     ctx.allocator.destroy(payload);
                     return;
@@ -864,6 +906,7 @@ fn toolEventSink(
         .progress => |pr| {
             const payload = ctx.allocator.create(ToolProgressPayload) catch return;
             payload.* = .{
+                .epoch = ctx.epoch,
                 .id = ctx.allocator.dupe(u8, pr.id) catch {
                     ctx.allocator.destroy(payload);
                     return;
@@ -888,6 +931,7 @@ fn toolEventSink(
                 return;
             };
             payload.* = .{
+                .epoch = ctx.epoch,
                 .id = ctx.allocator.dupe(u8, f.id) catch {
                     ctx.allocator.free(preview);
                     ctx.allocator.destroy(payload);
@@ -909,15 +953,20 @@ fn toolEventSink(
 
 fn postError(ctx: *WorkerCtx, message: []const u8) void {
     const payload = ctx.allocator.create(ErrorPayload) catch return;
-    payload.* = .{ .message = ctx.allocator.dupe(u8, message) catch {
-        ctx.allocator.destroy(payload);
-        return;
-    } };
+    payload.* = .{
+        .epoch = ctx.epoch,
+        .message = ctx.allocator.dupe(u8, message) catch {
+            ctx.allocator.destroy(payload);
+            return;
+        },
+    };
     postUserEvent(ctx, ue_error, payload);
 }
 
 fn postDone(ctx: *WorkerCtx) void {
-    postUserEvent(ctx, ue_done, null);
+    const payload = ctx.allocator.create(EmptyPayload) catch return;
+    payload.* = .{ .epoch = ctx.epoch };
+    postUserEvent(ctx, ue_done, payload);
 }
 
 fn postUserEvent(ctx: *WorkerCtx, name: []const u8, data: ?*const anyopaque) void {
@@ -1184,7 +1233,67 @@ fn eventHandler(
     }
 }
 
+/// Drop and free a stale payload. Routed through a per-event-name
+/// switch because each payload owns different inner allocations;
+/// the leading `epoch: u64` field is what we use to detect stale,
+/// but freeing has to be type-aware. Returns `true` if the event was
+/// stale and consumed (caller must return); `false` to continue
+/// dispatching normally.
+fn dropStaleIfNeeded(self: *Root, ue: vxfw.UserEvent) bool {
+    // Every payload starts with `epoch: u64`. Cast through that
+    // common header to peek without knowing the concrete type; the
+    // free path below upcasts to the real type for inner cleanup.
+    const EpochHeader = struct { epoch: u64 };
+    const data = ue.data orelse return false;
+    const header: *const EpochHeader = @ptrCast(@alignCast(data));
+    if (header.epoch == self.turn_epoch) return false;
+
+    const a = self.allocator;
+    if (std.mem.eql(u8, ue.name, ue_chunk)) {
+        const p: *ChunkPayload = @ptrCast(@alignCast(@constCast(data)));
+        a.free(p.text);
+        a.destroy(p);
+    } else if (std.mem.eql(u8, ue.name, ue_tool_start)) {
+        const p: *ToolStartPayload = @ptrCast(@alignCast(@constCast(data)));
+        a.free(p.id);
+        a.free(p.name);
+        a.free(p.args_summary);
+        a.destroy(p);
+    } else if (std.mem.eql(u8, ue.name, ue_tool_progress)) {
+        const p: *ToolProgressPayload = @ptrCast(@alignCast(@constCast(data)));
+        a.free(p.id);
+        a.free(p.chunk);
+        a.destroy(p);
+    } else if (std.mem.eql(u8, ue.name, ue_tool_done)) {
+        const p: *ToolDonePayload = @ptrCast(@alignCast(@constCast(data)));
+        a.free(p.id);
+        a.free(p.name);
+        a.free(p.output);
+        a.destroy(p);
+    } else if (std.mem.eql(u8, ue.name, ue_ask_user)) {
+        const p: *AskUserPayload = @ptrCast(@alignCast(@constCast(data)));
+        a.free(p.question);
+        a.destroy(p);
+    } else if (std.mem.eql(u8, ue.name, ue_usage)) {
+        const p: *UsagePayload = @ptrCast(@alignCast(@constCast(data)));
+        a.destroy(p);
+    } else if (std.mem.eql(u8, ue.name, ue_error)) {
+        const p: *ErrorPayload = @ptrCast(@alignCast(@constCast(data)));
+        a.free(p.message);
+        a.destroy(p);
+    } else if (std.mem.eql(u8, ue.name, ue_done)) {
+        const p: *EmptyPayload = @ptrCast(@alignCast(@constCast(data)));
+        a.destroy(p);
+    } else {
+        // Unknown event with a payload — leak the bytes rather than
+        // free through the wrong type. Should not happen in practice.
+        return false;
+    }
+    return true;
+}
+
 pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent) !void {
+    if (dropStaleIfNeeded(self, ue)) return;
     if (std.mem.eql(u8, ue.name, ue_chunk)) {
         // Live tail policy: incoming chunks always snap the
         // viewport back to the bottom so the user never types into
@@ -1417,6 +1526,13 @@ pub fn handleUserEvent(self: *Root, ctx: *vxfw.EventContext, ue: vxfw.UserEvent)
         try self.appendLine(.system, line);
         ctx.redraw = true;
     } else if (std.mem.eql(u8, ue.name, ue_done)) {
+        // Free the empty epoch-tagged payload posted by `postDone`.
+        // Stale completions were already dropped by `dropStaleIfNeeded`
+        // above, so reaching here means the epoch matched.
+        if (ue.data) |data| {
+            const p: *EmptyPayload = @ptrCast(@alignCast(@constCast(data)));
+            self.allocator.destroy(p);
+        }
         // Re-parse every agent line we accumulated this turn as
         // markdown, swapping the raw text + null spans for the
         // walker's flat text + style spans. The history widget
