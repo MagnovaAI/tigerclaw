@@ -1275,9 +1275,11 @@ pub fn dispatchSubturn(
     mention_idx: u8,
     invoker_reply: []const u8,
 ) !void {
-    // Marker line so the user sees the escalation. Failures here
-    // are non-fatal — the dispatch should still go through.
-    self.appendSubturnMarker(invoker, target) catch {};
+    // No marker line — the sub-turn agent's reply lands with its
+    // own speaker pill, which is sufficient indication that another
+    // agent is now contributing. Earlier prototypes emitted a
+    // `↳ @invoker → @target` system row here; it read as debug
+    // noise rather than chat.
 
     // Resolve canonical target casing from the registered set so
     // routing matches `agent_registry`'s lookup key.
