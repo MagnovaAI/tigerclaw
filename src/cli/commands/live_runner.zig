@@ -27,6 +27,14 @@ const tool_web_search = @import("tool_web_search.zig");
 const tool_todo_write = @import("tool_todo_write.zig");
 const skills_mod = @import("../../skills/skills.zig");
 
+const ttft_log = std.log.scoped(.live_runner_ttft);
+
+fn monoNowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) *% std.time.ns_per_s +% @as(u64, @intCast(ts.nsec));
+}
+
 pub const LoadError = error{
     HomeMissing,
     ConfigMissing,
@@ -454,6 +462,10 @@ pub const LiveAgentRunner = struct {
 
         if (req.session_id.len == 0) return error.SessionMissing;
 
+        const turn_start_ns: u64 = monoNowNs();
+        var assemble_ns: u64 = 0;
+        var first_byte_ns: u64 = 0;
+
         // Fresh turn — clear any stale cancel flag from a prior
         // ESC that didn't get observed because the previous turn
         // already finished. Without this reset, a second user
@@ -532,6 +544,7 @@ pub const LiveAgentRunner = struct {
         // a reserve for the output — see `llm.model_context` — so a
         // 1M-window Opus session does not get clipped to a 64k slice
         // and a long Haiku session does not push past the 200k limit.
+        const assemble_t0: u64 = monoNowNs();
         const assembled = self.context_engine.engine().vtable.assemble(
             &context_bundle,
             self.context_engine.engine().ptr,
@@ -544,6 +557,7 @@ pub const LiveAgentRunner = struct {
             },
         ) catch return error.InternalError;
         defer self.context_engine.freeAssembleResult(assembled);
+        assemble_ns = monoNowNs() -% assemble_t0;
 
         // The messages list owns every Message — including its
         // content blocks and the inner slices each block points at.
@@ -591,6 +605,26 @@ pub const LiveAgentRunner = struct {
         // context-window footprint after this turn.
         var last_usage: types.TokenUsage = .{};
 
+        var ttft_ctx: TtftSinkCtx = .{
+            .inner = req.stream_sink,
+            .inner_ctx = req.stream_sink_ctx,
+            .turn_start_ns = turn_start_ns,
+            .first_byte_ns = &first_byte_ns,
+        };
+
+        // Early tool-start adapter. The provider fires this the
+        // moment it sees `content_block_start` for a tool_use — i.e.
+        // before the model finishes streaming its arguments. We
+        // forward to the upstream `tool_event_sink` so the TUI can
+        // render the tool row immediately. The runner's later
+        // `.started` fire (post-round, with full args_summary) is
+        // treated as an update on the TUI side: same id → refresh
+        // the existing row's args instead of creating a new one.
+        var early_ctx: EarlyToolStartCtx = .{
+            .upstream_sink = req.tool_event_sink,
+            .upstream_ctx = req.tool_event_sink_ctx,
+        };
+
         while (true) : (round += 1) {
             const chat_req: llm.provider.ChatRequest = .{
                 .messages = messages.items,
@@ -604,6 +638,8 @@ pub const LiveAgentRunner = struct {
                 .max_output_tokens = 8192,
                 .tools = &builtin_tools,
                 .cancel_token = &self.cancel_flag,
+                .tool_start_sink = if (req.tool_event_sink != null) earlyToolStartSink else null,
+                .tool_start_sink_ctx = &early_ctx,
             };
 
             // Route every provider call through `chatStream` so the
@@ -613,8 +649,9 @@ pub const LiveAgentRunner = struct {
             // fallback fires once at end-of-turn, same shape as the
             // old `chat` path.
             const resp = blk: {
-                if (req.stream_sink) |s| {
-                    break :blk owned.provider.chatStream(self.allocator, chat_req, s, req.stream_sink_ctx) catch |err| {
+                if (req.stream_sink) |_| {
+                    break :blk owned.provider.chatStream(self.allocator, chat_req, ttftSink, &ttft_ctx) catch |err| {
+                        const s = req.stream_sink.?;
                         // Surface the actual error name through the
                         // stream sink so the TUI shows what failed
                         // (Timeout, ConnectionRefused, etc.) instead
@@ -843,6 +880,11 @@ pub const LiveAgentRunner = struct {
                 }
                 self.tool_running.store(true, .release);
                 var tool_failed = false;
+                const progress_bridge: ?ToolProgressBridge = if (req.tool_event_sink) |s| .{
+                    .tool_id = tc.id,
+                    .sink = s,
+                    .ctx = req.tool_event_sink_ctx,
+                } else null;
                 const result_text = dispatchBuiltinTool(
                     self.allocator,
                     self.io,
@@ -852,6 +894,7 @@ pub const LiveAgentRunner = struct {
                     req.session_id,
                     tc.name,
                     tc.arguments_json,
+                    if (progress_bridge) |*b| b else null,
                 ) catch |e| blk: {
                     tool_failed = true;
                     break :blk std.fmt.allocPrint(
@@ -941,6 +984,18 @@ pub const LiveAgentRunner = struct {
         }
 
         self.last_output = final_text;
+
+        const total_ns = monoNowNs() -% turn_start_ns;
+        ttft_log.info(
+            "turn ttft: assemble={d}ms first_byte={d}ms total={d}ms rounds={d}",
+            .{
+                assemble_ns / std.time.ns_per_ms,
+                first_byte_ns / std.time.ns_per_ms,
+                total_ns / std.time.ns_per_ms,
+                round + 1,
+            },
+        );
+
         return .{
             .output = self.last_output,
             .completed = last_stop != .refusal,
@@ -971,6 +1026,42 @@ pub const LiveAgentRunner = struct {
         };
     }
 };
+
+const TtftSinkCtx = struct {
+    inner: ?harness.agent_runner.StreamSink,
+    inner_ctx: ?*anyopaque,
+    turn_start_ns: u64,
+    first_byte_ns: *u64,
+};
+
+fn ttftSink(ctx: ?*anyopaque, fragment: []const u8) void {
+    const self: *TtftSinkCtx = @ptrCast(@alignCast(ctx.?));
+    if (self.first_byte_ns.* == 0) {
+        self.first_byte_ns.* = monoNowNs() -% self.turn_start_ns;
+    }
+    if (self.inner) |s| s(self.inner_ctx, fragment);
+}
+
+/// Adapter that converts the provider's early `ToolStartSink`
+/// (fired on `content_block_start` for tool_use, before args finish
+/// streaming) into a `ToolEvent.started` on the runner's upstream
+/// sink. Tracks ids so the runner's post-round started fire — which
+/// previously was the only place we emitted .started — can skip ids
+/// the provider already announced, avoiding duplicate row creation
+/// in the TUI.
+const EarlyToolStartCtx = struct {
+    upstream_sink: ?harness.agent_runner.ToolEventSink,
+    upstream_ctx: ?*anyopaque,
+};
+
+fn earlyToolStartSink(ctx: ?*anyopaque, id: []const u8, name: []const u8) void {
+    const self: *EarlyToolStartCtx = @ptrCast(@alignCast(ctx.?));
+    const sink = self.upstream_sink orelse return;
+    sink(self.upstream_ctx, .{ .started = .{
+        .id = id,
+        .name = name,
+    } });
+}
 
 /// Build a heap-owned `types.Message` from a slice of borrowed
 /// `ContentBlock`s. Each inner allocation is duplicated into
@@ -1213,12 +1304,44 @@ fn classifyReadVariant(s: []const u8) @TypeOf(@as(harness.agent_runner.ReadFinis
     return .text;
 }
 
+/// Bridges `tool_bash.ProgressSink` callbacks into upstream
+/// `ToolEventSink.progress` events so live shell output reaches the
+/// TUI mid-dispatch instead of all-at-once at the end of the call.
+/// Borrowed for the duration of one tool call; no ownership.
+const ToolProgressBridge = struct {
+    tool_id: []const u8,
+    sink: harness.agent_runner.ToolEventSink,
+    ctx: ?*anyopaque,
+
+    fn forward(self: *const ToolProgressBridge, kind: tool_bash.ProgressKind, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        self.sink(self.ctx, .{ .progress = .{
+            .id = self.tool_id,
+            .stream = switch (kind) {
+                .stdout_chunk => .stdout,
+                .stderr_chunk => .stderr,
+            },
+            .chunk = bytes,
+        } });
+    }
+
+    fn bashSink(ctx: ?*anyopaque, kind: tool_bash.ProgressKind, bytes: []const u8) void {
+        const self: *const ToolProgressBridge = @ptrCast(@alignCast(ctx.?));
+        self.forward(kind, bytes);
+    }
+};
+
 /// Execute a built-in tool by name. Returns caller-owned text; errors
 /// bubble so the runner can record the failure as the tool result.
 ///
 /// `runner` is null only in unit tests for the stateless tools — every
 /// production path passes the live runner so per-session state (read
 /// dedup, todo lists) has somewhere to live.
+///
+/// `progress` is non-null when the caller wants live shell-output
+/// progress events forwarded as `ToolEvent.progress` to the TUI. Only
+/// the `bash` tool uses it today; other tools are sub-100ms-fast in
+/// practice and don't need a progress channel.
 fn dispatchBuiltinTool(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1228,6 +1351,7 @@ fn dispatchBuiltinTool(
     session_id: []const u8,
     name: []const u8,
     arguments_json: []const u8,
+    progress: ?*const ToolProgressBridge,
 ) ![]u8 {
     if (std.mem.eql(u8, name, "get_current_time")) {
         return renderCurrentTimeIso8601(allocator, clock.nowNs());
@@ -1252,7 +1376,9 @@ fn dispatchBuiltinTool(
                 .plan => return refuseSandbox(allocator, name, .plan, ""),
             }
         }
-        const out = try runBash(allocator, io, workspace_root, runner, arguments_json, null, null);
+        const sink: ?tool_bash.ProgressSink = if (progress != null) ToolProgressBridge.bashSink else null;
+        const sink_ctx: ?*anyopaque = if (progress) |p| @constCast(@as(*const anyopaque, @ptrCast(p))) else null;
+        const out = try runBash(allocator, io, workspace_root, runner, arguments_json, sink, sink_ctx);
         // Bash may have touched any file; drop the whole session's
         // read cache so the next read sees real content.
         if (runner) |r| r.read_state.invalidateSession(r.allocator, session_id);
@@ -2714,7 +2840,7 @@ test "renderCurrentTimeIso8601: fixed timestamp renders canonically" {
 
 test "dispatchBuiltinTool: get_current_time matches renderCurrentTimeIso8601" {
     var fc = clock_mod.FixedClock{ .value_ns = 1_609_556_645 * @as(i128, std.time.ns_per_s) };
-    const out = try dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "", null, "", "get_current_time", "{}");
+    const out = try dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "", null, "", "get_current_time", "{}", null);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("2021-01-02T03:04:05Z", out);
 }
@@ -2723,7 +2849,7 @@ test "dispatchBuiltinTool: unknown name returns UnknownTool" {
     var fc = clock_mod.FixedClock{ .value_ns = 0 };
     try testing.expectError(
         error.UnknownTool,
-        dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "", null, "", "no_such_tool", "{}"),
+        dispatchBuiltinTool(testing.allocator, undefined, fc.clock(), "", null, "", "no_such_tool", "{}", null),
     );
 }
 
