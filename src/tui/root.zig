@@ -402,6 +402,10 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
         break :blk cwd_buf[0..n];
     } else "";
 
+    // Pull cross-agent dispatch knobs from the user's config. Failure
+    // is silently absorbed — defaults stand and the TUI still boots.
+    const max_calls_opt = readAutoDispatchMaxCalls(allocator, io, opts.home);
+
     var root = RootWidget.init(allocator, .{
         .agent_name = default_agent,
         .model_line = model_line,
@@ -410,6 +414,7 @@ fn runVxfw(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
         .user_name = opts.user_name,
         .agent_names = agents.items(),
         .io = io,
+        .auto_dispatch_max_calls = max_calls_opt,
     });
     defer root.deinit();
     root.wireSubmit();
@@ -1761,6 +1766,44 @@ fn tickerMain(ctx: TickerCtx) void {
         // blocking the ticker on a stalled UI.
         _ = ctx.loop.tryPostEvent(.tick);
     }
+}
+
+/// Read `~/.tigerclaw/config.json` and return the
+/// `auto_dispatch_max_calls` field if present and in-range. Anything
+/// short of "well-formed JSON object with that key as a small unsigned
+/// integer" returns null — the caller falls back to the built-in
+/// default. Best-effort: missing files, parse errors, IO errors all
+/// collapse to null. We do not surface a system row for the failure
+/// path because the TUI hasn't booted yet at this point.
+fn readAutoDispatchMaxCalls(allocator: std.mem.Allocator, io: std.Io, home: []const u8) ?u8 {
+    if (home.len == 0) return null;
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.tigerclaw/config.json", .{home}) catch return null;
+
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+
+    var raw_buf: [4096]u8 = undefined;
+    var io_reader_buf: [256]u8 = undefined;
+    var reader = file.reader(io, &io_reader_buf);
+    const n = reader.interface.readSliceShort(&raw_buf) catch return null;
+    if (n == 0) return null;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_buf[0..n], .{}) catch return null;
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const v = obj.get("auto_dispatch_max_calls") orelse return null;
+    const n_i64 = switch (v) {
+        .integer => |i| i,
+        else => return null,
+    };
+    if (n_i64 < 1 or n_i64 > 64) return null;
+    return @intCast(n_i64);
 }
 
 // --- tests -----------------------------------------------------------------

@@ -187,6 +187,10 @@ pub const InitOptions = struct {
     /// driver's `AgentList`; lifetime exceeds the widget's.
     agent_names: []const []const u8 = &.{},
     io: ?std.Io = null,
+    /// Override the cross-agent auto-dispatch model-call cap. Null
+    /// keeps the built-in default (8). `tui.run` resolves this from
+    /// `~/.tigerclaw/config.json:auto_dispatch_max_calls` if present.
+    auto_dispatch_max_calls: ?u8 = null,
 };
 
 /// Wrapper around the shared `llm.model_context.maxContext` lookup
@@ -210,6 +214,7 @@ pub fn init(allocator: std.mem.Allocator, opts: InitOptions) Root {
         .home_dir = opts.home,
         .workspace_dir = opts.workspace,
         .io = opts.io,
+        .auto_dispatch_max_calls = opts.auto_dispatch_max_calls orelse 8,
         .status_bar = .{
             .agent_name = opts.agent_name,
             .model = opts.model_line,
@@ -1587,6 +1592,15 @@ fn onSubturnDone(self: *Root, p: *const DonePayload) !void {
 /// for known agent mentions and fan out one sub-turn per mention.
 /// `output` is `TurnResult.output` straight from the runner — never
 /// reconstructed from transcript text (D4).
+///
+/// Budget enforcement (D7): the auto-dispatch tree per user-turn
+/// can spend at most `auto_dispatch_max_calls` model calls across
+/// sub-turns and resumes. Each dispatch consumes one. When the
+/// caller's mention list would push us past the cap, we dispatch
+/// up to the remaining quota and append a system line listing the
+/// skipped mentions plus the remaining quota — and we still need
+/// to budget for the eventual resume, so the per-call check
+/// reserves one slot for it.
 fn scanAndFanOut(self: *Root, p: *const DonePayload) !void {
     // No agent set, no mentions to scan against. Common in tests.
     if (self.agent_names.len == 0) return;
@@ -1598,13 +1612,25 @@ fn scanAndFanOut(self: *Root, p: *const DonePayload) !void {
     defer self.allocator.free(matches);
     if (matches.len == 0) return;
 
-    // Step 5b: dispatch every matched mention as an in-flight sub-turn.
-    // Step 7 will gate this on `auto_dispatch_max_calls`; today we
-    // dispatch all of them.
+    // Reserve one budget slot for the resume that will fire after
+    // these sub-turns drain. Without this, we could dispatch N
+    // sub-turns up to the cap and then fail to resume the invoker —
+    // stranding the conversation halfway.
+    const used: u32 = self.auto_dispatch_calls;
+    const cap: u32 = self.auto_dispatch_max_calls;
+    if (used + 1 >= cap) {
+        // Not enough budget even for the resume; halt the whole
+        // fan-out and tell the user.
+        try self.appendBudgetHaltLine(matches, 0);
+        return;
+    }
+    const room_for_subturns: u32 = cap - used - 1; // reserve one for resume
+    const dispatch_count: usize = @min(matches.len, room_for_subturns);
+
     if (self.invoker_to_resume) |old| self.allocator.free(old);
     self.invoker_to_resume = try self.allocator.dupe(u8, invoker);
 
-    for (matches, 0..) |m, idx| {
+    for (matches[0..dispatch_count], 0..) |m, idx| {
         // `dispatchSubturn` increments `pending_subturns` and
         // appends the slot before spawning so a fast worker can't
         // race past us.
@@ -1618,8 +1644,45 @@ fn scanAndFanOut(self: *Root, p: *const DonePayload) !void {
                 .{ m.name, @errorName(e) },
             ) catch "! subturn dispatch failed";
             self.appendLine(.system, line) catch {};
+            continue;
         };
+        self.auto_dispatch_calls +%= 1;
     }
+
+    if (dispatch_count < matches.len) {
+        try self.appendBudgetHaltLine(matches, dispatch_count);
+    }
+}
+
+/// Emit a one-line system marker explaining the dispatch budget
+/// halt. `dispatched` is how many of `matches` we did fan out;
+/// the rest are listed as skipped.
+fn appendBudgetHaltLine(
+    self: *Root,
+    matches: []const mention.Match,
+    dispatched: usize,
+) !void {
+    var head_buf: [128]u8 = undefined;
+    const head = std.fmt.bufPrint(
+        &head_buf,
+        "! dispatch budget reached ({d}/{d}); skipped:",
+        .{ self.auto_dispatch_calls, self.auto_dispatch_max_calls },
+    ) catch "! dispatch budget reached; skipped:";
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(self.allocator);
+    try buf.appendSlice(self.allocator, head);
+    var first = true;
+    for (matches[dispatched..]) |m| {
+        if (first) {
+            try buf.appendSlice(self.allocator, " @");
+            first = false;
+        } else {
+            try buf.appendSlice(self.allocator, ", @");
+        }
+        try buf.appendSlice(self.allocator, m.name);
+    }
+    try self.appendLine(.system, buf.items);
 }
 
 pub fn widget(self: *Root) vxfw.Widget {
@@ -2826,6 +2889,41 @@ test "scanAndFanOut: empty output leaves state untouched" {
     try testing.expectEqual(@as(usize, 0), root.subturn_slots.items.len);
     try testing.expectEqual(@as(usize, 0), root.pending_subturns);
     try testing.expect(root.invoker_to_resume == null);
+}
+
+test "scanAndFanOut: budget halt skips dispatch when reserve exhausted" {
+    var root = Root.init(testing.allocator, .{ .agent_name = "tiger" });
+    defer root.deinit();
+    const known = [_][]const u8{ "tiger", "sage", "bolt" };
+    root.agent_names = &known;
+
+    // Set budget so the resume reserve already exhausts it (used+1 >= cap).
+    // With cap=1 and used=0: used+1 == cap → halt with zero dispatched.
+    root.auto_dispatch_max_calls = 1;
+    root.auto_dispatch_calls = 0;
+
+    const p: DonePayload = .{
+        .epoch = 0,
+        .dispatch_kind = .primary,
+        .invoker = null,
+        .target_agent = try testing.allocator.dupe(u8, "tiger"),
+        .mention_idx = 0,
+        .output = try testing.allocator.dupe(u8, "ping @sage @bolt"),
+    };
+    defer testing.allocator.free(p.target_agent);
+    defer testing.allocator.free(p.output);
+
+    try root.scanAndFanOut(&p);
+    try testing.expectEqual(@as(usize, 0), root.subturn_slots.items.len);
+    try testing.expectEqual(@as(usize, 0), root.pending_subturns);
+
+    // A halt system row must have been emitted listing both skipped names.
+    try testing.expect(root.history.items.len >= 1);
+    const last = root.history.items[root.history.items.len - 1];
+    try testing.expectEqual(tui.Line.Role.system, last.role);
+    try testing.expect(std.mem.indexOf(u8, last.text.items, "@sage") != null);
+    try testing.expect(std.mem.indexOf(u8, last.text.items, "@bolt") != null);
+    try testing.expect(std.mem.indexOf(u8, last.text.items, "budget reached") != null);
 }
 
 test "scanAndFanOut: no agent_names → no fan-out attempted" {
