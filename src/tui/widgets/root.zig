@@ -212,6 +212,11 @@ quit_requested: bool = false,
 /// Borrowed home dir, used by `/skills` to scan the skills root
 /// on demand (so newly-installed skills appear without restart).
 home_dir: []const u8 = "",
+/// Owned absolute path to the paste-stash directory under
+/// `<home>/.tigerclaw/pastes/`. Populated lazily on first attach
+/// since `init` doesn't have an allocator-friendly way to build it.
+/// Freed in `deinit`.
+paste_dir_owned: ?[]u8 = null,
 /// Borrowed workspace dir (process cwd at launch). `/lock` with
 /// no args defaults to this.
 workspace_dir: []const u8 = "",
@@ -306,6 +311,23 @@ pub fn init(allocator: std.mem.Allocator, opts: InitOptions) Root {
 pub fn attachRunner(self: *Root, runner: *harness.AgentRunner, app: *vxfw.App) void {
     self.runner = runner;
     self.app = app;
+
+    // Build `<home>/.tigerclaw/pastes` once and hand the borrowed
+    // slice to the input widget. Pastes only stash when this is
+    // set, so a missing home_dir silently falls back to inline
+    // pastes (no crash, just no on-disk stash).
+    if (self.paste_dir_owned == null and self.home_dir.len > 0) {
+        const path = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/.tigerclaw/pastes",
+            .{self.home_dir},
+        ) catch null;
+        if (path) |p| {
+            self.paste_dir_owned = p;
+            self.input.paste_dir = p;
+            self.input.paste_io = self.io;
+        }
+    }
 }
 
 /// Tell the status bar whether the gateway daemon is reachable.
@@ -341,6 +363,7 @@ pub fn deinit(self: *Root) void {
     self.subturn_slots.deinit(self.allocator);
     if (self.last_resume_body) |b| self.allocator.free(b);
     if (self.peer_chatter) |b| self.allocator.free(b);
+    if (self.paste_dir_owned) |p| self.allocator.free(p);
     self.input.deinit();
 }
 
@@ -1886,6 +1909,20 @@ fn eventHandler(
 ) anyerror!void {
     const self: *Root = @ptrCast(@alignCast(ptr));
     switch (event) {
+        // Bracketed paste — forward to the input widget so its
+        // stash-to-file logic kicks in. Without this branch the
+        // event drops on Root's floor and a megabyte of pasted
+        // text never reaches the buffer.
+        .paste => {
+            try self.input.widget().handleEvent(ctx, event);
+            return;
+        },
+        // Bracketing markers themselves carry no payload; consume
+        // them so they don't propagate further.
+        .paste_start, .paste_end => {
+            ctx.consumeAndRedraw();
+            return;
+        },
         .key_press => |key| {
             // Hard-quit chord: Ctrl-C / Ctrl-Q. Plain `q`
             // no longer quits now that the input box is live —

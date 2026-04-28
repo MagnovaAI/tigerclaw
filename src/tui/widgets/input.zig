@@ -36,6 +36,26 @@ buf: std.ArrayList(u8) = .empty,
 cursor: usize = 0,
 on_submit: ?SubmitFn = null,
 submit_ctx: ?*anyopaque = null,
+/// Directory where large pastes are stashed as `.txt` files. Set
+/// once at attach time (typically `~/.tigerclaw/pastes/`). When
+/// null, every paste is inlined regardless of size — pre-attach
+/// fallback only.
+paste_dir: ?[]const u8 = null,
+/// Zig 0.16 fs APIs all require an `Io` handle; the Input widget
+/// borrows the same one Root uses. Set in lockstep with
+/// `paste_dir` — paste stashing is gated on both being present.
+paste_io: ?std.Io = null,
+/// Monotonic per-session counter so successive stashes don't
+/// collide on identical wall-clock seconds.
+paste_counter: u32 = 0,
+
+/// Pastes at or above either threshold get stashed to a file
+/// instead of inlined into the buffer. The line threshold mirrors
+/// hermes-agent (5+ newlines) so multi-line code dumps collapse;
+/// the byte threshold catches single-line megablobs (minified JS,
+/// base64 data) before they explode the edit buffer.
+const PASTE_LINE_THRESHOLD: usize = 5;
+const PASTE_BYTE_THRESHOLD: usize = 4 * 1024;
 
 pub fn init(allocator: std.mem.Allocator) Input {
     return .{ .allocator = allocator };
@@ -61,8 +81,115 @@ fn eventHandler(
     const self: *Input = @ptrCast(@alignCast(ptr));
     switch (event) {
         .key_press => |key| try self.handleKey(ctx, key),
+        .paste => |text| {
+            // Bracketed-paste payloads land here as a single coalesced
+            // event (see vaxis Parser). Free the parser-allocated text
+            // when we're done with it; the buffer keeps its own copy.
+            defer self.allocator.free(text);
+            try self.handlePaste(ctx, text);
+        },
         else => {},
     }
+}
+
+/// Insert pasted text at the cursor. Large pastes are stashed to a
+/// `.txt` file under `paste_dir` and represented in the buffer as a
+/// short placeholder so the input row stays readable and the
+/// downstream prompt builder can swap the placeholder for the file
+/// contents (or pass the path through to a tool like `read_file`).
+fn handlePaste(self: *Input, ctx: *vxfw.EventContext, text: []const u8) !void {
+    if (text.len == 0) return;
+    const newlines = std.mem.count(u8, text, "\n");
+    const should_stash = self.paste_dir != null and self.paste_io != null and
+        (newlines >= PASTE_LINE_THRESHOLD or text.len >= PASTE_BYTE_THRESHOLD);
+
+    if (!should_stash) {
+        try self.buf.insertSlice(self.allocator, self.cursor, text);
+        self.cursor += text.len;
+        ctx.consumeAndRedraw();
+        return;
+    }
+
+    // Stash path: write the full payload to disk, insert a
+    // human-readable placeholder. On any I/O failure fall back to a
+    // truncated inline insert rather than swallowing the paste —
+    // losing the user's content silently is worse than a noisy edit
+    // buffer.
+    const placeholder = self.stashPaste(text, newlines) catch {
+        try self.buf.insertSlice(self.allocator, self.cursor, text);
+        self.cursor += text.len;
+        ctx.consumeAndRedraw();
+        return;
+    };
+    defer self.allocator.free(placeholder);
+    try self.buf.insertSlice(self.allocator, self.cursor, placeholder);
+    self.cursor += placeholder.len;
+    ctx.consumeAndRedraw();
+}
+
+/// Write `text` to a fresh file under `paste_dir` and return an
+/// owned placeholder string of the form
+/// `[Pasted text #N: L lines → /full/path]`. The caller owns the
+/// returned slice.
+fn stashPaste(self: *Input, text: []const u8, newlines: usize) ![]u8 {
+    const dir_path = self.paste_dir orelse return error.NoPasteDir;
+    const io = self.paste_io orelse return error.NoPasteIo;
+    self.paste_counter += 1;
+    const counter = self.paste_counter;
+
+    // Ensure the directory exists. `createDirPath` is idempotent
+    // and creates parents as needed, so a fresh ~/.tigerclaw works
+    // the first time the user pastes.
+    std.Io.Dir.cwd().createDirPath(io, dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    // Filename includes a wall-clock HHMMSS stamp so the user can
+    // recognise pastes by time when grepping the directory; the
+    // counter disambiguates when two pastes land in the same second.
+    const ts_secs_i: i64 = std.Io.Timestamp.now(io, .real).toSeconds();
+    const ts_secs: u64 = if (ts_secs_i < 0) 0 else @intCast(ts_secs_i);
+    const epoch = std.time.epoch.EpochSeconds{ .secs = ts_secs };
+    const day_secs = epoch.getDaySeconds();
+    const hh: u32 = day_secs.getHoursIntoDay();
+    const mm: u32 = day_secs.getMinutesIntoHour();
+    const ss: u32 = day_secs.getSecondsIntoMinute();
+
+    var name_buf: [64]u8 = undefined;
+    const filename = try std.fmt.bufPrint(
+        &name_buf,
+        "paste_{d}_{d:0>2}{d:0>2}{d:0>2}.txt",
+        .{ counter, hh, mm, ss },
+    );
+
+    var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const full_path = try std.fmt.bufPrint(
+        &full_path_buf,
+        "{s}/{s}",
+        .{ dir_path, filename },
+    );
+
+    // Open + write + close. `paste_dir` is always absolute when
+    // attached from Root, so cwd-relative `createFile` resolves to
+    // the right path.
+    var file = try std.Io.Dir.cwd().createFile(io, full_path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, text);
+
+    // Display line count is `newlines + 1` when the buffer doesn't
+    // end with a newline (visible content extends past the last \n)
+    // and `newlines` when it does — match how editors count.
+    const line_count = if (text.len > 0 and text[text.len - 1] != '\n')
+        newlines + 1
+    else
+        newlines;
+
+    return std.fmt.allocPrint(
+        self.allocator,
+        "[Pasted text #{d}: {d} lines → {s}]",
+        .{ counter, line_count, full_path },
+    );
 }
 
 fn handleKey(self: *Input, ctx: *vxfw.EventContext, key: vaxis.Key) !void {

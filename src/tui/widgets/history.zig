@@ -91,6 +91,28 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
     // every fresh user/agent turn following a tool block) so the
     // chat doesn't read as one dense wall. Tool lines stay tight
     // under the agent line they belong to.
+    // Precompute per-line indent. Tool rows have no speaker of
+    // their own; they hang under the agent (or user) line they
+    // belong to. Inherit that line's pill width as the indent so
+    // the limb (`└─ ●`) sits under the body column rather than at
+    // column 0. Walk forward, carrying the most recent pill width
+    // from any speaker'd line; reset on user lines (a fresh turn
+    // shouldn't inherit indent from a previous agent).
+    var indent_pill_cols: std.ArrayList(usize) = .empty;
+    try indent_pill_cols.resize(ctx.arena, self.lines.len);
+    var carry_pill_w: usize = 0;
+    for (self.lines, 0..) |line, idx| {
+        const own = pillCols(&line);
+        if (own > 0) {
+            carry_pill_w = own;
+            indent_pill_cols.items[idx] = own;
+        } else {
+            // System rows live in their own visual class — keep
+            // them flush left. Only tool rows inherit.
+            indent_pill_cols.items[idx] = if (line.role == .tool) carry_pill_w else 0;
+        }
+    }
+
     var prev_role: ?tui.Line.Role = null;
     for (self.lines, 0..) |line, idx| {
         // Inter-role gap. User lines bracket themselves with
@@ -104,7 +126,7 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
         }
         prev_role = line.role;
 
-        const pill_cols = pillCols(&line);
+        const pill_cols = indent_pill_cols.items[idx];
         const prefix_cols = pill_cols + measureCols(prefixFor(&line));
         const avail: usize = if (width > prefix_cols) width - prefix_cols else 1;
 
@@ -269,7 +291,7 @@ pub fn draw(self: *const History, ctx: vxfw.DrawContext) std.mem.Allocator.Error
         const base_style = styleFor(line.role);
         const parts = splitPrefix(line);
         const limb_bullet_cols = measureCols(parts.limb) + measureCols(parts.bullet);
-        const pill_w = pillCols(line);
+        const pill_w = indent_pill_cols.items[r.line_idx];
         const prefix_cols = pill_w + limb_bullet_cols;
 
         // First physical row of the line gets the speaker pill +
