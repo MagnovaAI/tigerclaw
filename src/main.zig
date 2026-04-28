@@ -680,19 +680,23 @@ fn runTuiLocal(arena: std.mem.Allocator, io: std.Io, init: std.process.Init, deb
     // `omkarbhad`) is technically resolvable here but reads as a
     // login id rather than a name.
     //
-    // The TUI runs on `smp_allocator`, NOT the process arena. The
-    // arena never reclaims memory (free is a no-op), so a long
-    // session with thousands of streamed chunks, tool rows, paste
-    // buffers, and per-agent pending-line keys would steadily
-    // climb until the process OOM'd. Field reports of "OOM after
-    // some agent action" trace back to that. smp_allocator frees
-    // on every `free` call, so the TUI's own `defer X.deinit(...)`
-    // and `free` paths actually reclaim. The arena stays around
-    // for short-lived setup data the TUI doesn't manage itself
-    // (errno strings, transient JSON parsing buffers in the CLI
-    // entry path). Errors out of `tui.run` still report through
-    // the arena because the tty may be in a half-broken state.
-    tui.run(std.heap.smp_allocator, io, .{
+    // The TUI runs on `page_allocator`, NOT the process arena.
+    // The arena never reclaims memory (free is a no-op), so a
+    // long session with thousands of streamed chunks, tool rows,
+    // paste buffers, and per-agent pending-line keys would
+    // steadily climb until the process OOM'd. Field reports of
+    // "OOM after some agent action" trace back to that. We use
+    // `page_allocator` rather than `smp_allocator` because the
+    // SMP allocator routes large requests through PageAllocator
+    // anyway and we observed at least one startup OOM on macOS
+    // with smp_allocator that page_allocator survives — the
+    // small-allocation overhead is acceptable for an interactive
+    // TUI. The arena stays around for short-lived setup data the
+    // TUI doesn't manage itself (errno strings, transient JSON
+    // parsing buffers in the CLI entry path). Errors out of
+    // `tui.run` still report through the arena because the tty
+    // may be in a half-broken state.
+    tui.run(std.heap.page_allocator, io, .{
         .home = home,
         .user_name = "Omkar",
         .debug = debug,
