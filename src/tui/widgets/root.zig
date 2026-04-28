@@ -2839,6 +2839,20 @@ fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.S
     const status_origin: u16 = height - trailing_rows - status_rows;
     self.status_bar.dispatch_used = self.auto_dispatch_calls;
     self.status_bar.dispatch_max = self.auto_dispatch_max_calls;
+    // Live agentic trackers: how many peer subturns are still in
+    // flight, and how many bytes of peer chatter are buffered for
+    // the next user submit. Both are silently-mutating state that
+    // we'd rather have visible at a glance than hidden behind a
+    // log line. Cap to u8/u32 — the counters never legitimately
+    // get that big.
+    self.status_bar.peers_active = blk: {
+        const n = self.pending_subturns;
+        break :blk if (n > std.math.maxInt(u8)) std.math.maxInt(u8) else @intCast(n);
+    };
+    self.status_bar.chatter_bytes = blk: {
+        const len = if (self.peer_chatter) |s| s.len else 0;
+        break :blk if (len > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(len);
+    };
     {
         const s = try self.status_bar.widget().draw(ctx.withConstraints(
             .{ .width = 0, .height = 0 },

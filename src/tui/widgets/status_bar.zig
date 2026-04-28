@@ -3,10 +3,13 @@
 //! Layout (pipe-separated cells, left-aligned, fills the row with
 //! the status background tint):
 //!
-//!   agent │ model │ <used>/<max> [bar] N% │ gateway: on │ N/M dispatch │ locked: a/b/c
+//!   agent │ model │ <used>/<max> [bar] N% │ gateway: on │ N/M dispatch │
+//!     N peers │ chatter: <bytes> │ turn: stopping │ locked: a/b/c
 //!
 //! The dispatch cell is hidden when no peer dispatches have fired
-//! this turn.
+//! this turn. The peers cell is hidden when no subturns are
+//! in flight. The chatter cell is hidden when no peer replies
+//! are buffered for the next user submit.
 //!
 //! The context cell collapses to just `<used>` when the model's
 //! max context is unknown. The sandbox cell renders as `unlocked`
@@ -43,6 +46,15 @@ sandbox_path: []const u8 = "",
 /// user can see how close they are without leaving the chat view.
 dispatch_used: u8 = 0,
 dispatch_max: u8 = 0,
+/// Number of subturns currently in flight (peers the active agent
+/// is waiting on). Hidden when zero — single-agent turns shouldn't
+/// see this cell at all. Distinct from `dispatch_used` (cumulative
+/// per-turn count); this one is the live count of pending replies.
+peers_active: u8 = 0,
+/// Bytes of buffered peer chatter waiting to be prepended to the
+/// next user submit. Hidden when zero. Surfaces silently-growing
+/// state so a runaway fan-out is visible at a glance.
+chatter_bytes: u32 = 0,
 
 pub fn widget(self: *const StatusBar) vxfw.Widget {
     return .{
@@ -150,6 +162,34 @@ pub fn draw(self: *const StatusBar, ctx: vxfw.DrawContext) std.mem.Allocator.Err
             .{ self.dispatch_used, self.dispatch_max },
         ) catch "?";
         col = writeText(ctx, surface, col, txt, cell_style, width);
+        col = writeSep(ctx, surface, col, sep_style, width);
+    }
+
+    // 5b. peers in flight: live count of subturns the active agent
+    // is waiting on. Hidden at zero so the bar stays quiet outside
+    // multi-agent fan-out. Caution-tinted whenever non-zero — any
+    // pending peer is something the user might want to wait on or
+    // cancel.
+    if (self.peers_active > 0) {
+        const txt = std.fmt.allocPrint(
+            ctx.arena,
+            "{d} peers",
+            .{self.peers_active},
+        ) catch "?";
+        col = writeText(ctx, surface, col, txt, caution_style, width);
+        col = writeSep(ctx, surface, col, sep_style, width);
+    }
+
+    // 5c. peer chatter buffered for the next user submit. Hidden at
+    // zero. Surfaces a silently-growing state so a runaway fan-out
+    // doesn't accumulate into a hidden multi-KB prepend.
+    if (self.chatter_bytes > 0) {
+        const txt = std.fmt.allocPrint(
+            ctx.arena,
+            "chatter: {s}",
+            .{formatTokensArena(ctx.arena, self.chatter_bytes) catch "?"},
+        ) catch "?";
+        col = writeText(ctx, surface, col, txt, value_style, width);
         col = writeSep(ctx, surface, col, sep_style, width);
     }
 
