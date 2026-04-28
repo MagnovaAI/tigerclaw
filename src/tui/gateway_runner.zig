@@ -19,6 +19,11 @@ pub const GatewayRunner = struct {
     in_flight: harness.agent_runner.InFlightCounter = .{},
     mutex: std.Io.Mutex = .init,
     current_session: ?[]u8 = null,
+    /// The most recent turn's accumulated assistant text. Freed and
+    /// replaced on every `run()`. Returned to the caller as
+    /// `TurnResult.output`; the contract (matching `LiveAgentRunner`)
+    /// is that the slice lives until the next `run()` invocation.
+    last_output: []u8 = &.{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -36,6 +41,7 @@ pub const GatewayRunner = struct {
 
     pub fn deinit(self: *GatewayRunner) void {
         self.clearCurrentSession();
+        if (self.last_output.len > 0) self.allocator.free(self.last_output);
     }
 
     pub fn runner(self: *GatewayRunner) harness.agent_runner.AgentRunner {
@@ -88,8 +94,12 @@ pub const GatewayRunner = struct {
         var sink_ctx = SinkCtx{
             .req = req,
             .parser = sse_client.Parser.init(self.allocator),
+            .output_alloc = self.allocator,
         };
         defer sink_ctx.parser.deinit();
+        // The accumulator is moved into `last_output` on success;
+        // on the error path we free it here.
+        errdefer sink_ctx.output.deinit(self.allocator);
 
         _ = http_client.sendStreaming(
             self.allocator,
@@ -106,9 +116,24 @@ pub const GatewayRunner = struct {
             .{},
         ) catch |err| return mapHttpError(err);
 
+        // Rotate the per-turn output buffer onto the runner. The
+        // previous turn's bytes go away here (matching the
+        // `LiveAgentRunner` contract that `output` lives until the
+        // next `run()` call).
+        if (self.last_output.len > 0) self.allocator.free(self.last_output);
+        self.last_output = sink_ctx.output.toOwnedSlice(self.allocator) catch &.{};
+
+        // Echo dispatch metadata so the TUI's auto-dispatch state
+        // machine can branch on `dispatch_kind` and resume by
+        // `(invoker, mention_idx, target)` triple.
         return .{
-            .output = "",
+            .output = self.last_output,
             .completed = sink_ctx.completed and !sink_ctx.failed,
+            .turn_epoch = req.turn_epoch,
+            .dispatch_kind = req.dispatch_kind,
+            .invoker = req.invoker,
+            .target_agent = if (req.target_agent.len != 0) req.target_agent else req.session_id,
+            .mention_order_idx = req.mention_order_idx,
         };
     }
 
@@ -196,6 +221,12 @@ fn cancelThreadMain(job: *CancelJob) void {
 const SinkCtx = struct {
     req: harness.agent_runner.TurnRequest,
     parser: sse_client.Parser,
+    /// Accumulator for streamed assistant text. Each `chunk` event
+    /// appends here; the final value is handed to the runner so the
+    /// TUI's auto-dispatch state machine can scan `TurnResult.output`
+    /// for cross-agent mentions.
+    output: std.ArrayList(u8) = .empty,
+    output_alloc: std.mem.Allocator,
     completed: bool = false,
     failed: bool = false,
 };
@@ -209,6 +240,13 @@ fn sinkEvent(ctx: ?*anyopaque, event: sse_client.Event) void {
     const self: *SinkCtx = @ptrCast(@alignCast(ctx.?));
     switch (event) {
         .chunk => |text| {
+            // Forward to the live UI sink for streaming display, AND
+            // append to the accumulator so the runner can return a
+            // complete `output` for the auto-dispatch mention scan.
+            // Allocation failure is silently dropped — the UI still
+            // renders correctly via the streaming sink, only the scan
+            // sees a truncated reply.
+            self.output.appendSlice(self.output_alloc, text) catch {};
             if (self.req.stream_sink) |sink| sink(self.req.stream_sink_ctx, text);
         },
         .tool_start => |tool| {
