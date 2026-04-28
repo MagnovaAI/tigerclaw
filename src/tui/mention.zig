@@ -77,6 +77,19 @@ pub fn parse(input: []const u8) Parsed {
 /// Self-mentions (where `name == invoker`) are skipped — an agent
 /// referring to itself shouldn't trigger a sub-turn.
 ///
+/// Two structural exclusions prevent the auto-dispatch loop from
+/// re-triggering on its own output:
+///
+///   - Content inside fenced code blocks (``` ... ```) is skipped.
+///     Models routinely paste shell snippets and config that contain
+///     `@email`-style strings; those are not dispatch requests.
+///   - Lines whose first non-whitespace token is `@<known>` followed
+///     by `:` (the synthetic resume-header format used by the
+///     auto-dispatch state machine) are skipped entirely. Without
+///     this, an agent quoting back its sub-turn replies — verbatim
+///     or with light editorializing — would re-trigger fan-out and
+///     burn the dispatch budget on a feedback loop.
+///
 /// Caller owns the returned slice (allocated from `gpa`); free with
 /// `gpa.free(result)`. Each `Match.name` is borrowed from `text`
 /// and lives as long as `text` does.
@@ -89,35 +102,104 @@ pub fn findAll(
     var out: std.ArrayList(Match) = .empty;
     errdefer out.deinit(gpa);
 
+    var in_fence = false;
+    var line_it = std.mem.splitScalar(u8, text, '\n');
+    while (line_it.next()) |line| {
+        if (isFenceLine(line)) {
+            in_fence = !in_fence;
+            continue;
+        }
+        if (in_fence) continue;
+        if (isSyntheticHeaderLine(line, known)) continue;
+
+        try scanLine(gpa, &out, line, known, invoker);
+    }
+
+    return out.toOwnedSlice(gpa);
+}
+
+/// True when `line` (after stripping leading whitespace) starts with
+/// three or more backticks. Matches the CommonMark fenced-code-block
+/// rule loosely enough for our needs: we don't care about info
+/// strings or the closing fence's length matching.
+fn isFenceLine(line: []const u8) bool {
     var i: usize = 0;
-    while (i < text.len) {
-        // Find next `@`.
-        const at_pos = std.mem.indexOfScalarPos(u8, text, i, '@') orelse break;
+    while (i < line.len and isSpace(line[i])) i += 1;
+    if (i + 2 >= line.len) return false;
+    return line[i] == '`' and line[i + 1] == '`' and line[i + 2] == '`';
+}
+
+/// True when `line` looks like a synthetic resume header — `@<known>`
+/// followed by `:` as the first non-whitespace token. The colon is
+/// what distinguishes a header (`@sage replied:`) from a normal
+/// inline mention (`I'll defer to @sage on this`).
+fn isSyntheticHeaderLine(line: []const u8, known: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < line.len and isSpace(line[i])) i += 1;
+    if (i >= line.len or line[i] != '@') return false;
+    const name_start = i + 1;
+    var j = name_start;
+    while (j < line.len and isNameChar(line[j])) j += 1;
+    if (j == name_start) return false;
+    const name = line[name_start..j];
+
+    // Must match a known agent — otherwise an unrelated `@foo:`
+    // shouldn't suppress an actual mention later in the line.
+    var matched = false;
+    for (known) |k| {
+        if (std.ascii.eqlIgnoreCase(k, name)) {
+            matched = true;
+            break;
+        }
+    }
+    if (!matched) return false;
+
+    // Header marker: optionally a single token like `replied`, then
+    // `:`. We accept both `@sage:` and `@sage replied:` since the
+    // resume body uses the latter; either shape signals a quote
+    // rather than a dispatch.
+    while (j < line.len and isSpace(line[j])) j += 1;
+    if (j < line.len and line[j] == ':') return true;
+    // Allow one bare alphabetic word (e.g. `replied`) before the colon.
+    var k2 = j;
+    while (k2 < line.len and isAlpha(line[k2])) k2 += 1;
+    if (k2 == j) return false;
+    while (k2 < line.len and isSpace(line[k2])) k2 += 1;
+    return k2 < line.len and line[k2] == ':';
+}
+
+fn scanLine(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(Match),
+    line: []const u8,
+    known: []const []const u8,
+    invoker: []const u8,
+) std.mem.Allocator.Error!void {
+    var i: usize = 0;
+    while (i < line.len) {
+        const at_pos = std.mem.indexOfScalarPos(u8, line, i, '@') orelse break;
 
         // Reject mid-token `@`. The character before must be
-        // whitespace, punctuation, or start-of-text — otherwise
+        // whitespace, punctuation, or start-of-line — otherwise
         // it's an email/handle inside other text and we ignore.
-        const at_is_word_start = at_pos == 0 or !isNameChar(text[at_pos - 1]);
+        const at_is_word_start = at_pos == 0 or !isNameChar(line[at_pos - 1]);
         if (!at_is_word_start) {
             i = at_pos + 1;
             continue;
         }
 
-        // Read the name body.
         var j = at_pos + 1;
-        while (j < text.len and isNameChar(text[j])) j += 1;
+        while (j < line.len and isNameChar(line[j])) j += 1;
         if (j == at_pos + 1) {
             i = at_pos + 1;
             continue;
         }
 
-        const name = text[at_pos + 1 .. j];
+        const name = line[at_pos + 1 .. j];
         i = j;
 
-        // Self-mention: skip.
         if (std.ascii.eqlIgnoreCase(name, invoker)) continue;
 
-        // Match against known agents.
         var resolved: ?[]const u8 = null;
         for (known) |k| {
             if (std.ascii.eqlIgnoreCase(k, name)) {
@@ -127,7 +209,6 @@ pub fn findAll(
         }
         const r = resolved orelse continue;
 
-        // Dedupe: skip if we've already recorded this name.
         var seen = false;
         for (out.items) |m| {
             if (std.ascii.eqlIgnoreCase(m.name, r)) {
@@ -139,8 +220,10 @@ pub fn findAll(
 
         try out.append(gpa, .{ .name = r });
     }
+}
 
-    return out.toOwnedSlice(gpa);
+fn isAlpha(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
 }
 
 fn isSpace(c: u8) bool {
@@ -264,6 +347,60 @@ test "findAll: empty text" {
 
 test "findAll: case-insensitive match resolves to known canonical" {
     const ms = try findAll(testing.allocator, "ping @SAGE", &known_set, "tiger");
+    defer testing.allocator.free(ms);
+    try testing.expectEqual(@as(usize, 1), ms.len);
+    try testing.expectEqualStrings("sage", ms[0].name);
+}
+
+test "findAll: mentions inside fenced code blocks are skipped" {
+    const text =
+        "see this snippet:\n" ++
+        "```\n" ++
+        "echo @sage > log\n" ++
+        "```\n" ++
+        "real ping: @bolt";
+    const ms = try findAll(testing.allocator, text, &known_set, "tiger");
+    defer testing.allocator.free(ms);
+    try testing.expectEqual(@as(usize, 1), ms.len);
+    try testing.expectEqualStrings("bolt", ms[0].name);
+}
+
+test "findAll: closing fence resumes scanning" {
+    const text =
+        "```\n@sage in fence\n```\n@bolt outside";
+    const ms = try findAll(testing.allocator, text, &known_set, "tiger");
+    defer testing.allocator.free(ms);
+    try testing.expectEqual(@as(usize, 1), ms.len);
+    try testing.expectEqualStrings("bolt", ms[0].name);
+}
+
+test "findAll: synthetic resume header is skipped entirely" {
+    const text =
+        "@sage replied:\nI think we should ask @bolt about this.\n" ++
+        "Here's my take.";
+    // The header line names sage and bolt; neither should re-trigger,
+    // because the line is identified as a synthetic header.
+    const ms = try findAll(testing.allocator, text, &known_set, "tiger");
+    defer testing.allocator.free(ms);
+    // The body line contains a fresh mention of @bolt — that should
+    // still match. We're skipping only the header line itself.
+    try testing.expectEqual(@as(usize, 1), ms.len);
+    try testing.expectEqualStrings("bolt", ms[0].name);
+}
+
+test "findAll: bare @name colon is also treated as header" {
+    const text = "@sage:\nfollow-up below\n@bolt now please";
+    const ms = try findAll(testing.allocator, text, &known_set, "tiger");
+    defer testing.allocator.free(ms);
+    try testing.expectEqual(@as(usize, 1), ms.len);
+    try testing.expectEqualStrings("bolt", ms[0].name);
+}
+
+test "findAll: unknown @foo: does not suppress a real mention on the line" {
+    // `@stranger:` is not a known agent, so it must NOT count as a
+    // synthetic header — otherwise an attacker could mask any line.
+    const text = "@stranger: please notify @sage";
+    const ms = try findAll(testing.allocator, text, &known_set, "tiger");
     defer testing.allocator.free(ms);
     try testing.expectEqual(@as(usize, 1), ms.len);
     try testing.expectEqualStrings("sage", ms[0].name);
