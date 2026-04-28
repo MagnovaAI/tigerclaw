@@ -123,6 +123,8 @@ pub fn serve(
             break;
         }
 
+        setNoDelay(stream.socket.handle);
+
         const job = allocator.create(ConnectionJob) catch |err| {
             stream.close(io);
             return err;
@@ -175,7 +177,12 @@ fn handleConnection(
     const started_ns = monotonicNowNs();
     const head_buf = try allocator.alloc(u8, opts.head_buffer_bytes);
     defer allocator.free(head_buf);
-    const out_buf = try allocator.alloc(u8, 4 * 1024);
+    // Small write buffer keeps `body.writer.flush()` actually
+    // pushing each SSE frame out to the socket. With a 4KB buffer
+    // the chunked-transfer writes for short frames stack until the
+    // buffer fills or the connection closes — turning live progress
+    // streams into a single end-of-turn burst.
+    const out_buf = try allocator.alloc(u8, 256);
     defer allocator.free(out_buf);
 
     var s_reader = stream.reader(io, head_buf);
@@ -366,6 +373,26 @@ pub fn installShutdownHandlers() void {
 
 fn handleSignal(_: std.c.SIG) callconv(.c) void {
     should_stop.store(true, .release);
+}
+
+/// Disable Nagle's algorithm on a connected client socket so each
+/// SSE frame we write hits the wire immediately instead of being
+/// coalesced with the next one. Without this, `body.writer.flush()`
+/// only drains userspace buffers — the kernel still holds bytes back
+/// up to ~200ms waiting for more data, which collapses live tool
+/// progress into one end-of-turn burst.
+fn setNoDelay(handle: std.posix.fd_t) void {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+    const on: c_int = 1;
+    // IPPROTO_TCP / TCP_NODELAY are stable across macOS and Linux;
+    // failure here is non-fatal — the connection just runs with
+    // Nagle on, which only hurts streaming UX.
+    std.posix.setsockopt(
+        handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        std.mem.asBytes(&on),
+    ) catch {};
 }
 
 /// Configure the listener socket so blocking `accept()` wakes every
