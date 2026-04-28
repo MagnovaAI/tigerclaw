@@ -1776,25 +1776,69 @@ fn dispatchResume(self: *Root, invoker: []const u8, body: []u8) !void {
 /// `dispatchResume` and `buildResumeBody` are kept around (currently
 /// dead at runtime) in case a future "synthesize for me" UX flag
 /// wants the old behavior back.
+/// Hard cap on the peer-chatter buffer. Without it, each fan-out
+/// round appends one `[<agent> said]\n<text>` block and the next
+/// user submit prepends the entire history of replies — a chatty
+/// 20-turn debate accumulates tens of KB that ride into every new
+/// turn. Cap at 32 KiB: enough for several full peer replies in a
+/// single turn, small enough that an unattended runaway can't
+/// silently push the request body into provider rate-limit
+/// territory. When the cap would be exceeded we drop oldest blocks
+/// FIFO; if even the new block alone overflows, it is truncated.
+const peer_chatter_cap: usize = 32 * 1024;
+
 /// Add a sub-turn reply to the pending peer-chatter buffer. Format
 /// each block as `[<agent> said]\n<text>` separated by a blank line.
 /// The buffer is consumed and cleared on the next user submit
-/// (`drainPeerChatter`).
+/// (`drainPeerChatter`). Total size is bounded by `peer_chatter_cap`.
 fn appendPeerChatter(self: *Root, agent: []const u8, text: []const u8) !void {
     if (text.len == 0) return;
+
+    // Build the new block first so we know its size.
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(self.allocator);
+    try block.appendSlice(self.allocator, "[");
+    try block.appendSlice(self.allocator, agent);
+    try block.appendSlice(self.allocator, " said]\n");
+    try block.appendSlice(self.allocator, text);
+
+    // Truncate the new block to the cap (with a "[...truncated]"
+    // marker) when it alone would overflow. The marker preserves
+    // semantic clarity downstream — the active agent sees that the
+    // peer's reply was longer than the buffer allowed.
+    const trunc_marker = "\n[...truncated]";
+    if (block.items.len > peer_chatter_cap) {
+        const keep_head = peer_chatter_cap - trunc_marker.len;
+        block.shrinkRetainingCapacity(keep_head);
+        try block.appendSlice(self.allocator, trunc_marker);
+    }
 
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(self.allocator);
 
     if (self.peer_chatter) |existing| {
-        try buf.appendSlice(self.allocator, existing);
-        try buf.appendSlice(self.allocator, "\n\n");
+        // Drop oldest blocks (FIFO) until appending the new block
+        // (plus its `\n\n` separator) fits within the cap. Blocks
+        // are separated by a blank line — find the first "\n\n["
+        // and slice from there. If the existing buffer can't be
+        // pruned to fit (single huge block), drop it entirely.
+        var keep: []const u8 = existing;
+        const sep_overhead = if (keep.len > 0) @as(usize, 2) else 0;
+        while (keep.len + sep_overhead + block.items.len > peer_chatter_cap and keep.len > 0) {
+            if (std.mem.indexOf(u8, keep, "\n\n[")) |idx| {
+                keep = keep[idx + 2 ..];
+            } else {
+                keep = "";
+                break;
+            }
+        }
+        if (keep.len > 0) {
+            try buf.appendSlice(self.allocator, keep);
+            try buf.appendSlice(self.allocator, "\n\n");
+        }
     }
 
-    try buf.appendSlice(self.allocator, "[");
-    try buf.appendSlice(self.allocator, agent);
-    try buf.appendSlice(self.allocator, " said]\n");
-    try buf.appendSlice(self.allocator, text);
+    try buf.appendSlice(self.allocator, block.items);
 
     if (self.peer_chatter) |old| self.allocator.free(old);
     self.peer_chatter = try buf.toOwnedSlice(self.allocator);
@@ -3520,4 +3564,64 @@ test "root: /tools without args enables output" {
     try testing.expect(root.tool_output_enabled);
     try testing.expect(root.history.items.len == 1);
     try testing.expectEqualStrings("tool output: on", root.history.items[0].text.items);
+}
+
+test "appendPeerChatter: small replies accumulate verbatim" {
+    var root = Root.init(testing.allocator, .{});
+    defer root.deinit();
+
+    try root.appendPeerChatter("sage", "first reply");
+    try root.appendPeerChatter("bolt", "second reply");
+
+    const buf = root.peer_chatter orelse return error.NoChatter;
+    try testing.expect(std.mem.indexOf(u8, buf, "[sage said]\nfirst reply") != null);
+    try testing.expect(std.mem.indexOf(u8, buf, "[bolt said]\nsecond reply") != null);
+    // Order preserved: sage block precedes bolt block.
+    const sage_pos = std.mem.indexOf(u8, buf, "[sage said]").?;
+    const bolt_pos = std.mem.indexOf(u8, buf, "[bolt said]").?;
+    try testing.expect(sage_pos < bolt_pos);
+}
+
+test "appendPeerChatter: oversized single block is truncated to cap" {
+    var root = Root.init(testing.allocator, .{});
+    defer root.deinit();
+
+    const huge = try testing.allocator.alloc(u8, 2 * peer_chatter_cap);
+    defer testing.allocator.free(huge);
+    @memset(huge, 'x');
+
+    try root.appendPeerChatter("sage", huge);
+
+    const buf = root.peer_chatter orelse return error.NoChatter;
+    try testing.expect(buf.len <= peer_chatter_cap);
+    try testing.expect(std.mem.endsWith(u8, buf, "[...truncated]"));
+}
+
+test "appendPeerChatter: oldest blocks dropped FIFO when cap exceeded" {
+    var root = Root.init(testing.allocator, .{});
+    defer root.deinit();
+
+    // Fill close to the cap with several distinguishable blocks, then
+    // append one more big enough to push out the oldest.
+    const block_size: usize = 8 * 1024;
+    const payload = try testing.allocator.alloc(u8, block_size);
+    defer testing.allocator.free(payload);
+
+    @memset(payload, 'a');
+    try root.appendPeerChatter("sage", payload);
+    @memset(payload, 'b');
+    try root.appendPeerChatter("bolt", payload);
+    @memset(payload, 'c');
+    try root.appendPeerChatter("tiger", payload);
+    @memset(payload, 'd');
+    try root.appendPeerChatter("sage", payload);
+    @memset(payload, 'e');
+    try root.appendPeerChatter("bolt", payload); // pushes total over cap
+
+    const buf = root.peer_chatter orelse return error.NoChatter;
+    try testing.expect(buf.len <= peer_chatter_cap);
+    // Newest block always preserved.
+    try testing.expect(std.mem.indexOf(u8, buf, "eeee") != null);
+    // Oldest block (all 'a') was dropped to make room.
+    try testing.expect(std.mem.indexOf(u8, buf, "aaaa") == null);
 }
