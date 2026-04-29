@@ -53,6 +53,26 @@ pub fn apply(s: *Settings, env: Lookup) ApplyError!void {
         s.monthly_budget_cents = std.fmt.parseInt(u64, v, 10) catch
             return error.InvalidEnvValue;
     }
+    if (env.get(prefix ++ "GATEWAY_URL")) |v| {
+        s.gateway.url = v;
+    }
+    if (env.get(prefix ++ "GATEWAY_TOKEN")) |v| {
+        s.gateway.token = v;
+    }
+    if (env.get(prefix ++ "PROVIDER")) |v| {
+        s.provider.name = v;
+    }
+    if (env.get(prefix ++ "MODEL")) |v| {
+        s.provider.model = v;
+    }
+    if (env.get(prefix ++ "AGENT_TIMEOUT_SECS")) |v| {
+        s.agent.timeout_secs = std.fmt.parseInt(u32, v, 10) catch
+            return error.InvalidEnvValue;
+    }
+    if (env.get(prefix ++ "AGENT_MAX_RETRIES")) |v| {
+        s.agent.max_retries = std.fmt.parseInt(u32, v, 10) catch
+            return error.InvalidEnvValue;
+    }
 }
 
 // --- test helpers ----------------------------------------------------------
@@ -135,6 +155,34 @@ test "apply: non-numeric integer fails with InvalidEnvValue" {
     var s = Settings{};
     var env = MapLookup{ .entries = &.{
         .{ .name = prefix ++ "MAX_TOOL_ITERATIONS", .value = "lots" },
+    } };
+    try testing.expectError(error.InvalidEnvValue, apply(&s, env.lookup()));
+}
+
+test "apply: GATEWAY_URL overrides gateway.url" {
+    var s = Settings{};
+    var env = MapLookup{ .entries = &.{
+        .{ .name = prefix ++ "GATEWAY_URL", .value = "http://localhost:9000" },
+    } };
+    try apply(&s, env.lookup());
+    try testing.expectEqualStrings("http://localhost:9000", s.gateway.url);
+}
+
+test "apply: PROVIDER and MODEL override provider fields" {
+    var s = Settings{};
+    var env = MapLookup{ .entries = &.{
+        .{ .name = prefix ++ "PROVIDER", .value = "anthropic" },
+        .{ .name = prefix ++ "MODEL", .value = "claude-opus-4-7" },
+    } };
+    try apply(&s, env.lookup());
+    try testing.expectEqualStrings("anthropic", s.provider.name);
+    try testing.expectEqualStrings("claude-opus-4-7", s.provider.model);
+}
+
+test "apply: AGENT_TIMEOUT_SECS non-numeric fails" {
+    var s = Settings{};
+    var env = MapLookup{ .entries = &.{
+        .{ .name = prefix ++ "AGENT_TIMEOUT_SECS", .value = "forever" },
     } };
     try testing.expectError(error.InvalidEnvValue, apply(&s, env.lookup()));
 }
