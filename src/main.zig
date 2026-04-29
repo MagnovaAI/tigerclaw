@@ -229,6 +229,10 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: unknown flag for setup\n");
             return 64;
         },
+        error.ChatUnknownFlag => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown flag for chat\n");
+            return 64;
+        },
     };
 
     switch (cmd) {
@@ -598,6 +602,48 @@ pub fn main(init: std.process.Init) !u8 {
                 error.WriteFailed => {
                     try stderr_w.interface.writeAll("tigerclaw: failed to write config file\n");
                     return 1;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        },
+        .chat => |args| {
+            var stdin_buf: [4096]u8 = undefined;
+            var stdin_r = std.Io.File.stdin().reader(io, &stdin_buf);
+            const color = std.c.isatty(std.posix.STDOUT_FILENO) != 0;
+            const opts: cli.commands.chat.Options = .{
+                .base_url = args.base_url,
+                .agent_name = args.agent_name,
+                .session_id = args.session_id,
+                .bearer = args.bearer,
+                .out = &stdout_w.interface,
+                .in = &stdin_r.interface,
+                .color = color,
+            };
+            cli.commands.chat.run(arena, io, opts) catch |err| switch (err) {
+                error.Interrupted => return 130,
+                error.GatewayDown => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway unreachable\n");
+                    return 69;
+                },
+                error.Unauthorized => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway rejected credentials\n");
+                    return 77;
+                },
+                error.BadRequest => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway rejected the request\n");
+                    return 65;
+                },
+                error.InternalError => {
+                    try stderr_w.interface.writeAll("tigerclaw: gateway internal error\n");
+                    return 70;
+                },
+                error.InvalidResponse => {
+                    try stderr_w.interface.writeAll("tigerclaw: invalid gateway response\n");
+                    return 70;
+                },
+                error.UrlTooLong => {
+                    try stderr_w.interface.writeAll("tigerclaw: base_url + session id too long\n");
+                    return 64;
                 },
                 error.OutOfMemory => return error.OutOfMemory,
             };

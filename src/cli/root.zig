@@ -29,6 +29,14 @@ pub const commands = struct {
     pub const debug = @import("commands/debug.zig");
     pub const uninstall = @import("commands/uninstall.zig");
     pub const setup = @import("commands/setup.zig");
+    pub const chat = @import("commands/chat.zig");
+};
+
+pub const ChatArgs = struct {
+    agent_name: []const u8 = "tiger",
+    base_url: []const u8 = "http://127.0.0.1:8765",
+    session_id: []const u8 = "tiger",
+    bearer: ?[]const u8 = null,
 };
 
 pub const version_string = version.string;
@@ -70,6 +78,7 @@ pub const Command = union(enum) {
     gateway_stop: commands.gateway.StopOptions,
     uninstall: commands.uninstall.Args,
     setup: commands.setup.Args,
+    chat: ChatArgs,
     unknown: []const u8,
 };
 
@@ -107,6 +116,7 @@ pub const ParseError = error{
     AgentMissingName,
     DoctorUnknownSubcommand,
     SetupUnknownFlag,
+    ChatUnknownFlag,
 };
 
 /// Top-level command table. Summaries feed the help screen and shell
@@ -123,6 +133,7 @@ pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "gateway", .summary = "Run the gateway daemon (or `gateway logs` to tail)" },
     .{ .name = "uninstall", .summary = "Remove the binary and the local state directory" },
     .{ .name = "setup", .summary = "Run the first-time setup wizard" },
+    .{ .name = "chat", .summary = "Interactive REPL with the gateway" },
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
     .{ .name = "doctor", .summary = "Print an environment report (or `doctor invariants`)" },
@@ -269,6 +280,36 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
             }
         }
         return .{ .setup = args };
+    }
+
+    if (std.mem.eql(u8, match.descriptor.name, "chat")) {
+        var args: ChatArgs = .{};
+        var i: usize = 1;
+        // Optional positional agent name as the first non-flag argument.
+        if (match.argv.len > 1 and match.argv[1].len > 0 and match.argv[1][0] != '-') {
+            args.agent_name = match.argv[1];
+            args.session_id = match.argv[1];
+            i = 2;
+        }
+        while (i < match.argv.len) : (i += 1) {
+            const flag = match.argv[i];
+            if (std.mem.eql(u8, flag, "--base-url")) {
+                if (i + 1 >= match.argv.len) return error.MissingFlagValue;
+                i += 1;
+                args.base_url = match.argv[i];
+            } else if (std.mem.eql(u8, flag, "-s") or std.mem.eql(u8, flag, "--session")) {
+                if (i + 1 >= match.argv.len) return error.MissingFlagValue;
+                i += 1;
+                args.session_id = match.argv[i];
+            } else if (std.mem.eql(u8, flag, "--bearer")) {
+                if (i + 1 >= match.argv.len) return error.MissingFlagValue;
+                i += 1;
+                args.bearer = match.argv[i];
+            } else {
+                return error.ChatUnknownFlag;
+            }
+        }
+        return .{ .chat = args };
     }
 
     return .{ .unknown = first };
