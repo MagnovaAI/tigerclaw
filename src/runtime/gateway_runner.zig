@@ -1,15 +1,16 @@
-//! TUI-side AgentRunner adapter that talks to the gateway over HTTP.
+//! AgentRunner adapter that talks to the gateway over HTTP.
 //!
-//! The TUI wants the same `AgentRunner` shape as the in-process
-//! runner, while the architecture wants every interactive surface to
-//! be a localhost gateway client. This adapter is the bridge: `run`
-//! POSTs to `/sessions/:id/turns`, parses the SSE frames, and forwards
-//! chunks/tool events into the existing TUI sinks.
+//! Lives in `src/runtime/` so any interactive surface (TUI, CLI chat,
+//! future web/IDE plugins) can construct it. The architecture wants
+//! every surface to be a localhost gateway client; this adapter is
+//! the shared bridge: `run` POSTs to `/sessions/:id/turns`, parses
+//! the SSE frames, and forwards chunks/tool events into the caller's
+//! sinks.
 
 const std = @import("std");
 const http_client = @import("../cli/commands/http_client.zig");
 const harness = @import("../harness/root.zig");
-const sse_client = @import("sse_client.zig");
+const sse_client = @import("../tui/sse_client.zig");
 
 pub const GatewayRunner = struct {
     allocator: std.mem.Allocator,
