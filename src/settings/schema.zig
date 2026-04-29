@@ -64,12 +64,30 @@ pub const Mode = enum {
     }
 };
 
+pub const Gateway = struct {
+    url: []const u8 = defaults.gateway_url,
+    token: []const u8 = defaults.gateway_token,
+};
+
+pub const Provider = struct {
+    name: []const u8 = defaults.provider,
+    model: []const u8 = defaults.model,
+};
+
+pub const AgentConfig = struct {
+    timeout_secs: u32 = defaults.agent_timeout_secs,
+    max_retries: u32 = defaults.agent_max_retries,
+};
+
 pub const Settings = struct {
     log_level: LogLevel = .info,
     mode: Mode = .run,
     max_tool_iterations: u32 = defaults.max_tool_iterations,
     max_history_messages: u32 = defaults.max_history_messages,
     monthly_budget_cents: u64 = defaults.monthly_budget_cents,
+    gateway: Gateway = .{},
+    provider: Provider = .{},
+    agent: AgentConfig = .{},
 };
 
 /// Returns a `Settings` populated with every default.
@@ -140,4 +158,30 @@ test "Settings: partial JSON fills missing fields with defaults" {
     try testing.expectEqual(LogLevel.debug, parsed.value.log_level);
     try testing.expectEqual(Mode.run, parsed.value.mode);
     try testing.expectEqual(defaults.max_tool_iterations, parsed.value.max_tool_iterations);
+}
+
+test "Settings: gateway/provider/agent JSON roundtrip" {
+    const s = Settings{
+        .gateway = .{ .url = "http://localhost:8765", .token = "tok123" },
+        .provider = .{ .name = "anthropic", .model = "claude-opus-4-7" },
+        .agent = .{ .timeout_secs = 30, .max_retries = 5 },
+    };
+    const bytes = try std.json.Stringify.valueAlloc(testing.allocator, s, .{});
+    defer testing.allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(Settings, testing.allocator, bytes, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("http://localhost:8765", parsed.value.gateway.url);
+    try testing.expectEqualStrings("tok123", parsed.value.gateway.token);
+    try testing.expectEqualStrings("anthropic", parsed.value.provider.name);
+    try testing.expectEqualStrings("claude-opus-4-7", parsed.value.provider.model);
+    try testing.expectEqual(@as(u32, 30), parsed.value.agent.timeout_secs);
+    try testing.expectEqual(@as(u32, 5), parsed.value.agent.max_retries);
+}
+
+test "Settings: partial JSON with gateway still fills agent defaults" {
+    const partial = "{\"gateway\":{\"url\":\"http://x\",\"token\":\"t\"}}";
+    const parsed = try std.json.parseFromSlice(Settings, testing.allocator, partial, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqualStrings("http://x", parsed.value.gateway.url);
+    try testing.expectEqual(defaults.agent_timeout_secs, parsed.value.agent.timeout_secs);
 }
