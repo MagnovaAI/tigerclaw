@@ -48,10 +48,12 @@ fn prompt(
         try w.print("{s}: ", .{label});
     }
 
-    // Read until newline, up to 4 KiB.
-    var buf: [4096]u8 = undefined;
-    const n = r.readLine(&buf) catch 0;
-    const line = std.mem.trimRight(u8, buf[0..n], "\r\n");
+    // Read until newline. On error or empty stream, fall back to default.
+    const raw = r.takeDelimiterExclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => return arena.dupe(u8, default),
+        else => return arena.dupe(u8, default),
+    };
+    const line = std.mem.trimEnd(u8, raw, "\r");
 
     if (line.len == 0) {
         return arena.dupe(u8, default);
@@ -71,23 +73,28 @@ fn promptSecret(
     try w.print("{s} (hidden): ", .{label});
 
     // Attempt to disable echo. Best-effort — ignore failures on non-TTYs.
-    var old_termios: std.posix.termios = undefined;
-    const is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
+    const is_tty = std.c.isatty(std.posix.STDIN_FILENO) != 0;
+    var old_termios: ?std.posix.termios = null;
     if (is_tty) {
-        if (std.posix.tcgetattr(std.posix.STDIN_FILENO, &old_termios)) |_| {
-            var raw = old_termios;
+        if (std.posix.tcgetattr(std.posix.STDIN_FILENO)) |t| {
+            old_termios = t;
+            var raw = t;
             raw.lflag.ECHO = false;
-            _ = std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw) catch {};
+            std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw) catch {};
         } else |_| {}
     }
 
-    var buf: [4096]u8 = undefined;
-    const n = r.readLine(&buf) catch 0;
-    const line = std.mem.trimRight(u8, buf[0..n], "\r\n");
+    const input = r.takeDelimiterExclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => "",
+        else => "",
+    };
+    const line = std.mem.trimEnd(u8, input, "\r");
 
     // Restore echo and print a newline (echo suppression swallowed it).
     if (is_tty) {
-        _ = std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, old_termios) catch {};
+        if (old_termios) |t| {
+            std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, t) catch {};
+        }
         try w.writeAll("\n");
     }
 
@@ -102,11 +109,13 @@ fn promptU32(
     label: []const u8,
     default: u32,
 ) !u32 {
-    var buf: [64]u8 = undefined;
     while (true) {
         try w.print("{s} [{d}]: ", .{ label, default });
-        const n = r.readLine(&buf) catch 0;
-        const line = std.mem.trimRight(u8, buf[0..n], "\r\n");
+        const raw = r.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => return default,
+            else => return default,
+        };
+        const line = std.mem.trimEnd(u8, raw, "\r");
         if (line.len == 0) return default;
         const v = std.fmt.parseInt(u32, line, 10) catch {
             try w.print("  (expected a positive integer, got '{s}')\n", .{line});
@@ -175,7 +184,7 @@ fn sectionAgent(
 
 fn loadExisting(io: std.Io, arena: std.mem.Allocator, path: []const u8) schema.Settings {
     // Attempt to open and read the file. Any failure → return defaults.
-    var dir = Io.Dir.openDirAbsolute(io, std.fs.path.dirname(path) orelse ".", .{}) catch
+    var dir = std.Io.Dir.openDirAbsolute(io, std.fs.path.dirname(path) orelse ".", .{}) catch
         return schema.defaultSettings();
     defer dir.close(io);
 
@@ -224,14 +233,16 @@ pub fn run(
     var settings: schema.Settings = existing;
 
     if (!args.non_interactive) {
-        settings.gateway = sectionGateway(arena, w, r, existing.gateway) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+        settings.gateway = sectionGateway(arena, w, r, existing.gateway) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return error.WriteFailed;
         };
-        settings.provider = sectionProvider(arena, w, r, existing.provider) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+        settings.provider = sectionProvider(arena, w, r, existing.provider) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return error.WriteFailed;
         };
-        settings.agent = sectionAgent(arena, w, r, existing.agent) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+        settings.agent = sectionAgent(arena, w, r, existing.agent) catch {
+            return error.WriteFailed;
         };
     }
 

@@ -204,6 +204,10 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr_w.interface.writeAll("tigerclaw: doctor [invariants]\n");
             return 64;
         },
+        error.SetupUnknownFlag => {
+            try stderr_w.interface.writeAll("tigerclaw: unknown flag for setup\n");
+            return 64;
+        },
     };
 
     switch (cmd) {
@@ -549,6 +553,32 @@ pub fn main(init: std.process.Init) !u8 {
                     return 1;
                 },
                 error.OutOfMemory, error.WriteFailed => return e,
+            };
+        },
+        .setup => |args| {
+            var stdin_buf: [256]u8 = undefined;
+            var stdin_r = std.Io.File.stdin().reader(io, &stdin_buf);
+            cli.commands.setup.run(
+                io,
+                arena,
+                &stdout_w.interface,
+                &stdin_r.interface,
+                args,
+                init.environ_map,
+            ) catch |err| switch (err) {
+                error.NoConfigPath => {
+                    try stderr_w.interface.writeAll("tigerclaw: cannot determine config path (set HOME or TIGERCLAW_CONFIG)\n");
+                    return 1;
+                },
+                error.InvalidConfig => {
+                    try stderr_w.interface.writeAll("tigerclaw: configuration validation failed\n");
+                    return 1;
+                },
+                error.WriteFailed => {
+                    try stderr_w.interface.writeAll("tigerclaw: failed to write config file\n");
+                    return 1;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
             };
         },
         .unknown => |flag| {

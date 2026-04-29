@@ -18,6 +18,7 @@ const std = @import("std");
 pub const run = @import("run.zig");
 pub const doctor = @import("doctor.zig");
 pub const list = @import("list.zig");
+pub const setup = @import("setup.zig");
 
 pub const RunOptions = run.RunOptions;
 pub const RunResult = run.RunResult;
@@ -30,4 +31,5 @@ test {
     std.testing.refAllDecls(@import("run.zig"));
     std.testing.refAllDecls(@import("doctor.zig"));
     std.testing.refAllDecls(@import("list.zig"));
+    std.testing.refAllDecls(@import("setup.zig"));
 }

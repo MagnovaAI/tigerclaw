@@ -28,6 +28,7 @@ pub const commands = struct {
     pub const diag = @import("commands/diag.zig");
     pub const debug = @import("commands/debug.zig");
     pub const uninstall = @import("commands/uninstall.zig");
+    pub const setup = @import("commands/setup.zig");
 };
 
 pub const version_string = version.string;
@@ -68,6 +69,7 @@ pub const Command = union(enum) {
     gateway_logs: commands.gateway.LogsOptions,
     gateway_stop: commands.gateway.StopOptions,
     uninstall: commands.uninstall.Args,
+    setup: commands.setup.Args,
     unknown: []const u8,
 };
 
@@ -104,6 +106,7 @@ pub const ParseError = error{
     GatewayInvalidPort,
     AgentMissingName,
     DoctorUnknownSubcommand,
+    SetupUnknownFlag,
 };
 
 /// Top-level command table. Summaries feed the help screen and shell
@@ -119,6 +122,7 @@ pub const command_table = [_]descriptor.CommandDescriptor{
     .{ .name = "debug", .summary = "Non-TUI entry points for stepping through the runtime under a debugger" },
     .{ .name = "gateway", .summary = "Run the gateway daemon (or `gateway logs` to tail)" },
     .{ .name = "uninstall", .summary = "Remove the binary and the local state directory" },
+    .{ .name = "setup", .summary = "Run the first-time setup wizard" },
     .{ .name = "version", .summary = "Print the version and exit" },
     .{ .name = "help", .summary = "Print this message" },
     .{ .name = "doctor", .summary = "Print an environment report (or `doctor invariants`)" },
@@ -247,6 +251,24 @@ pub fn parse(argv: []const []const u8) ParseError!Command {
             error.UnknownFlag => return error.UnknownFlag,
         };
         return .{ .uninstall = a };
+    }
+
+    if (std.mem.eql(u8, match.descriptor.name, "setup")) {
+        var args: commands.setup.Args = .{};
+        var i: usize = 1;
+        while (i < match.argv.len) : (i += 1) {
+            const flag = match.argv[i];
+            if (std.mem.eql(u8, flag, "--non-interactive") or std.mem.eql(u8, flag, "-y")) {
+                args.non_interactive = true;
+            } else if (std.mem.eql(u8, flag, "--config")) {
+                if (i + 1 >= match.argv.len) return error.MissingFlagValue;
+                i += 1;
+                args.config_path = match.argv[i];
+            } else {
+                return error.SetupUnknownFlag;
+            }
+        }
+        return .{ .setup = args };
     }
 
     return .{ .unknown = first };
