@@ -50,7 +50,7 @@ pub fn loadFromBytes(
 
     var issues: std.array_list.Aligned(validation.Issue, null) = .empty;
     defer issues.deinit(allocator);
-    issues.ensureTotalCapacity(allocator, 4) catch {
+    issues.ensureTotalCapacity(allocator, 8) catch {
         return error.InvalidSettings;
     };
     try validation.validate(allocator, parsed.value, &issues);
