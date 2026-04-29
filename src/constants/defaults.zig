@@ -22,6 +22,24 @@ pub const monthly_budget_cents: u64 = 0;
 /// Default harness mode slug.
 pub const mode_slug: []const u8 = "run";
 
+/// Default gateway base URL. Empty means "not configured".
+pub const gateway_url: []const u8 = "";
+
+/// Default gateway auth token. Empty means "not configured".
+pub const gateway_token: []const u8 = "";
+
+/// Default LLM provider slug. Empty means "not configured".
+pub const provider: []const u8 = "";
+
+/// Default model name within the chosen provider. Empty means "not configured".
+pub const model: []const u8 = "";
+
+/// Default agent turn timeout in seconds.
+pub const agent_timeout_secs: u32 = 60;
+
+/// Default max retries on transient provider errors.
+pub const agent_max_retries: u32 = 3;
+
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
@@ -41,6 +59,18 @@ test "defaults: mode_slug is one of the pinned harness modes" {
         }
     }
     try testing.expect(found);
+}
+
+test "defaults: gateway fields are empty strings" {
+    try testing.expectEqualStrings("", gateway_url);
+    try testing.expectEqualStrings("", gateway_token);
+    try testing.expectEqualStrings("", provider);
+    try testing.expectEqualStrings("", model);
+}
+
+test "defaults: agent tunables are non-zero" {
+    try testing.expect(agent_timeout_secs > 0);
+    try testing.expect(agent_max_retries > 0);
 }
 
 test "defaults: min_log_level_name is one of debug|info|warn|error" {
