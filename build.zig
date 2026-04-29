@@ -712,6 +712,7 @@ pub fn build(b: *std.Build) void {
         "e2e_gateway_roundtrip_test",
         "e2e_telegram_dispatch_test",
         "tui_conversation_test",
+        "setup_wizard_test",
     };
     for (integration_tests) |name| {
         const rel = b.fmt("tests/{s}.zig", .{name});
