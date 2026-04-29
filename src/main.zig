@@ -68,6 +68,27 @@ pub fn main(init: std.process.Init) !u8 {
         // TUI — no gateway daemon, no HTTP round-trip. The runner
         // lives inside the TUI's process and talks to the provider
         // directly.
+        //
+        // Before starting the TUI, verify that the user has a working
+        // configuration. If the config is missing or unconfigured we
+        // print a helpful hint and exit without entering the raw-terminal
+        // TUI — otherwise the user would see a blank screen with no
+        // obvious way to escape.
+        const gate = @import("tui/setup_gate.zig");
+        switch (gate.check(io, arena, init.environ_map)) {
+            .ready => {},
+            .setup_required => |reason| {
+                const msg = switch (reason) {
+                    .no_config_file => "No config file found.",
+                    .no_gateway_or_provider => "Config exists but no gateway or provider is set.",
+                };
+                try stderr_w.interface.print(
+                    "\n  \u{2717} {s}\n\n  Run: tigerclaw setup\n\n",
+                    .{msg},
+                );
+                return 1;
+            },
+        }
         return runTuiLocal(arena, io, init, debug_enabled);
     }
 
