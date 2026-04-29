@@ -18,6 +18,12 @@ pub const Patch = union(enum) {
     max_tool_iterations: u32,
     max_history_messages: u32,
     monthly_budget_cents: u64,
+    gateway_url: []const u8,
+    gateway_token: []const u8,
+    provider_name: []const u8,
+    provider_model: []const u8,
+    agent_timeout_secs: u32,
+    agent_max_retries: u32,
 };
 
 pub const ApplyError = validation.ValidationError;
@@ -36,6 +42,12 @@ pub fn apply(
         .max_tool_iterations => |v| next.max_tool_iterations = v,
         .max_history_messages => |v| next.max_history_messages = v,
         .monthly_budget_cents => |v| next.monthly_budget_cents = v,
+        .gateway_url => |v| next.gateway.url = v,
+        .gateway_token => |v| next.gateway.token = v,
+        .provider_name => |v| next.provider.name = v,
+        .provider_model => |v| next.provider.model = v,
+        .agent_timeout_secs => |v| next.agent.timeout_secs = v,
+        .agent_max_retries => |v| next.agent.max_retries = v,
     }
 
     var issues: std.array_list.Aligned(validation.Issue, null) = .empty;
@@ -93,4 +105,30 @@ test "apply: successive valid patches compose" {
     try testing.expectEqual(schema.LogLevel.warn, s.log_level);
     try testing.expectEqual(schema.Mode.bench, s.mode);
     try testing.expectEqual(@as(u32, 12), s.max_tool_iterations);
+}
+
+test "apply: gateway_url patch installs and validates" {
+    var c = Cache.init();
+    // gateway.token must also be set for validation to pass.
+    try apply(testing.allocator, &c, .{ .gateway_token = "secret" });
+    try apply(testing.allocator, &c, .{ .gateway_url = "https://api.example.com" });
+    try testing.expectEqualStrings("https://api.example.com", c.get().gateway.url);
+}
+
+test "apply: gateway_url with bad scheme fails validation" {
+    var c = Cache.init();
+    try testing.expectError(
+        error.InvalidSettings,
+        apply(testing.allocator, &c, .{ .gateway_url = "ftp://bad" }),
+    );
+    try testing.expectEqualStrings("", c.get().gateway.url);
+}
+
+test "apply: provider_name + provider_model patches compose" {
+    var c = Cache.init();
+    try apply(testing.allocator, &c, .{ .provider_name = "anthropic" });
+    try apply(testing.allocator, &c, .{ .provider_model = "claude-opus-4-7" });
+    try testing.expectEqualStrings("anthropic", c.get().provider.name);
+    try testing.expectEqualStrings("claude-opus-4-7", c.get().provider.model);
+    try testing.expectEqual(@as(u64, 2), c.generation);
 }
